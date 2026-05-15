@@ -18,6 +18,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from data.teacher_dataset_builder import build_records
 from model.config import ModelConfig
+from model.action_loss_utils import weighted_mean_action_squared_error
 from model.losses import summarize_losses, world_model_dit_loss
 from model.model import PrivilegedTeacherWorldModelDiT
 from train.train_teacher import TrajectoryDataset, collate_fn, move_batch_to_device
@@ -155,6 +156,7 @@ def dit_noise_distillation_loss(
     teacher_feat: torch.Tensor,
     expert_action: torch.Tensor,
     valid_mask: Optional[torch.Tensor],
+    cfg: ModelConfig,
 ) -> torch.Tensor:
     """Distill the DiT action head at the noise-prediction level.
 
@@ -186,7 +188,7 @@ def dit_noise_distillation_loss(
     with torch.no_grad():
         teacher_pred_noise = actor_t(flat_teacher_feat, xt, t)
 
-    per_item = F.mse_loss(student_pred_noise, teacher_pred_noise, reduction="none").mean(dim=-1)
+    per_item = weighted_mean_action_squared_error(student_pred_noise, teacher_pred_noise, cfg)
     if flat_mask is None:
         return per_item.mean()
     return (per_item * flat_mask).sum() / flat_mask.sum().clamp(min=1.0)
@@ -218,6 +220,7 @@ def self_distill_losses(
         teacher_feat=teacher_belief,
         expert_action=batch["expert_action"],
         valid_mask=valid_mask,
+        cfg=cfg,
     )
 
     total = (

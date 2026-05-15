@@ -9,7 +9,7 @@ from data.action_mapping import norm_action_to_physical
 from .config import ModelConfig
 from .encoders import CLIPTextEncoder, DINOv2ImageEncoder, PrivilegedEncoder
 from .fusion import CrossAttentionFusion
-from .heads import DiTActionHead, TeacherPredictionHeads
+from .heads import DiTActionHead, DirectActionHead, PrivilegedReconHead, TeacherPredictionHeads
 from .rssm import RSSM, RSSMState
 
 
@@ -26,6 +26,8 @@ class PrivilegedTeacherWorldModelDiT(nn.Module):
         self.rssm = RSSM(cfg)
         self.prediction_heads = TeacherPredictionHeads(cfg)
         self.actor = DiTActionHead(cfg)
+        self.direct_action = DirectActionHead(cfg)
+        self.privileged_recon = PrivilegedReconHead(cfg)
 
     def initial_state(self, batch_size: int, device: torch.device) -> RSSMState:
         return self.rssm.init_state(batch_size, device)
@@ -142,10 +144,15 @@ class PrivilegedTeacherWorldModelDiT(nn.Module):
             **prior_preds,
         }
         if expert_action is not None:
-            actor_out = self.actor.diffusion_loss(feat, expert_action, valid_mask=valid_mask)
-            out["action_loss"] = actor_out["loss"]
-            out["pred_action"] = actor_out["pred_action"]
-            out["pred_noise"] = actor_out["pred_noise"]
+            out["privileged_recon"] = self.privileged_recon(feat)
+            if self.cfg.use_diffusion_actor:
+                out["policy_action"] = self.actor.sample_training(
+                    feat,
+                    num_steps=self.cfg.action_sampling_steps,
+                    deterministic=True,
+                )
+            else:
+                out["policy_action"] = self.direct_action(feat)
         return out
 
     @torch.no_grad()
@@ -177,7 +184,12 @@ class PrivilegedTeacherWorldModelDiT(nn.Module):
         encoded = self.encode_sequence(images, text_tokens, privileged_seq, attention_mask)
         _, post = self.rssm.obs_step(rssm_state, prev_action, encoded["obs_embed"].squeeze(1))
         feat = self.rssm.get_feat(post)
-        action_norm = self.actor.sample(feat, num_steps=num_steps or self.cfg.action_sampling_steps, deterministic=deterministic)
+        if self.cfg.use_diffusion_actor:
+            action_norm = self.actor.sample(
+                feat, num_steps=num_steps or self.cfg.action_sampling_steps, deterministic=deterministic
+            )
+        else:
+            action_norm = self.direct_action(feat)
         action_physical = norm_action_to_physical(
             action_norm,
             max_vel=self.cfg.max_vel,

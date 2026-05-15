@@ -39,6 +39,8 @@ export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 GPU_ID_FOR_AIRSIM="${GPU_ID}"
 DEVICE="cuda"
 
+# Phase-A checkpoints (no DiT): append --force-direct-action to the python line below.
+
 # =========================
 # AirSim / online rollout
 # =========================

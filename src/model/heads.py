@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .action_loss_utils import weighted_mean_action_squared_error
 from .config import ModelConfig
 from .encoders import MLP
 
@@ -31,6 +32,40 @@ class TeacherPredictionHeads(nn.Module):
         return {
             "reward": self.reward(feat),
         }
+
+
+class DirectActionHead(nn.Module):
+    """MLP mapping RSSM feature to normalized expert action in [-1, 1]."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.net = MLP(
+            cfg.feature_dim,
+            cfg.head_hidden_dim,
+            cfg.action_dim,
+            num_layers=3,
+            dropout=cfg.dropout,
+        )
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self.net(feat))
+
+
+class PrivilegedReconHead(nn.Module):
+    """Decode privileged vector from RSSM feature (auxiliary reconstruction loss)."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.net = MLP(
+            cfg.feature_dim,
+            cfg.head_hidden_dim,
+            cfg.privileged_dim,
+            num_layers=3,
+            dropout=cfg.dropout,
+        )
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.net(feat)
 
 
 class SinusoidalTimestepEmbedding(nn.Module):
@@ -176,7 +211,7 @@ class DiTActionHead(nn.Module):
         noise = torch.randn_like(flat_action)
         xt = self.q_sample(flat_action, t, noise)
         pred_noise = self.forward(flat_feat, xt, t)
-        per_item = F.mse_loss(pred_noise, noise, reduction="none").mean(dim=-1)
+        per_item = weighted_mean_action_squared_error(pred_noise, noise, self.cfg)
 
         if flat_mask is not None:
             flat_mask = flat_mask.float()
@@ -192,6 +227,54 @@ class DiTActionHead(nn.Module):
 
     @torch.no_grad()
     def sample(self, feat: torch.Tensor, num_steps: Optional[int] = None, deterministic: bool = True) -> torch.Tensor:
+        if feat.ndim == 3:
+            flat_feat = feat.reshape(-1, feat.shape[-1])
+            original_shape = feat.shape[:-1]
+        elif feat.ndim == 2:
+            flat_feat = feat
+            original_shape = feat.shape[:-1]
+        else:
+            raise ValueError("feat must have shape [B, D] or [B, T, D].")
+
+        if deterministic:
+            x = torch.zeros(flat_feat.shape[0], self.action_dim, device=flat_feat.device)
+        else:
+            x = torch.randn(flat_feat.shape[0], self.action_dim, device=flat_feat.device)
+
+        steps = self.num_steps if num_steps is None else min(num_steps, self.num_steps)
+        start_t = self.num_steps - 1
+        stride = max(self.num_steps // steps, 1)
+        time_indices = list(range(start_t, -1, -stride))
+        if time_indices[-1] != 0:
+            time_indices.append(0)
+
+        for t_value in time_indices:
+            t = torch.full((x.shape[0],), t_value, device=x.device, dtype=torch.long)
+            pred_noise = self.forward(flat_feat, x, t)
+            x0 = self.predict_x0(x, t, pred_noise)
+            if t_value == 0:
+                x = x0
+                continue
+            alpha = self.alphas[t].view(-1, 1)
+            alpha_bar = self.alpha_bars[t].view(-1, 1)
+            beta = self.betas[t].view(-1, 1)
+            mean = (1.0 / torch.sqrt(alpha)) * (x - beta / torch.sqrt(1.0 - alpha_bar) * pred_noise)
+            if deterministic:
+                x = mean
+            else:
+                noise = torch.randn_like(x)
+                x = mean + torch.sqrt(beta) * noise
+
+        x = x.clamp(-1.0, 1.0)
+        return x.view(*original_shape, self.action_dim)
+
+    def sample_training(
+        self,
+        feat: torch.Tensor,
+        num_steps: Optional[int] = None,
+        deterministic: bool = True,
+    ) -> torch.Tensor:
+        """Same schedule as ``sample()`` but gradient-preserving (BC on sampled actions)."""
         if feat.ndim == 3:
             flat_feat = feat.reshape(-1, feat.shape[-1])
             original_shape = feat.shape[:-1]

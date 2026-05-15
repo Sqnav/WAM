@@ -37,6 +37,18 @@ except Exception:
     CLIPTokenizerFast = None
 
 
+def _str2bool(value: str | bool) -> bool:
+    """Parse shell / CLI strings into bool (e.g. true false 1 0 yes no)."""
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -291,6 +303,10 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
     order = [
         "total",
         "action",
+        "action_direct",
+        "action_diffusion_noise",
+        "action_x0",
+        "privileged_recon",
         "kl",
         "reward",
         "prior_reward",
@@ -406,6 +422,22 @@ def main() -> None:
     parser.add_argument("--finetune-clip-text", action="store_false", dest="freeze_clip_text")
     parser.add_argument("--freeze-dinov2", action="store_true", default=True)
     parser.add_argument("--finetune-dinov2", action="store_false", dest="freeze_dinov2")
+    # ----- Curriculum: 仅两个布尔（与 train_teacher.sh 对应）；KL/特权重建/直连动作三档均开启 -----
+    parser.add_argument(
+        "--train-reward-aux",
+        type=_str2bool,
+        default=True,
+        help="true/false: 后验+先验 reward MSE。false=方案A，true=方案B/C。",
+    )
+    parser.add_argument(
+        "--use-diffusion-actor",
+        type=_str2bool,
+        default=True,
+        help="true/false: DiT 扩散头与噪声/x0 损失。false=方案A/B 仅直连头；true=方案C。",
+    )
+    parser.add_argument("--direct-action-loss-weight", type=float, default=1.0)
+    parser.add_argument("--privileged-recon-loss-weight", type=float, default=1.0)
+    parser.add_argument("--x0-action-loss-weight", type=float, default=1.0)
     args = parser.parse_args()
 
     seed_everything(args.seed + _get_rank())
@@ -434,6 +466,14 @@ def main() -> None:
         action_sampling_steps=args.sampling_steps,
         max_vel=args.max_vel,
         max_yaw_rate=args.max_yaw_rate,
+        use_diffusion_actor=args.use_diffusion_actor,
+        train_kl=True,
+        train_reward_aux=args.train_reward_aux,
+        train_privileged_recon=True,
+        train_direct_action=True,
+        direct_action_loss_weight=args.direct_action_loss_weight,
+        privileged_recon_loss_weight=args.privileged_recon_loss_weight,
+        x0_action_loss_weight=args.x0_action_loss_weight,
     )
 
     scene_list = [s.strip() for s in args.scene_list.split(",") if s.strip()]
@@ -455,6 +495,11 @@ def main() -> None:
     train_records = records[val_n:] if val_n > 0 else records
     if _is_main_process():
         print(f"[dataset] total={len(records)}, train={len(train_records)}, val={len(val_records)}")
+        print(
+            "[cfg curriculum] "
+            f"方案: reward_aux={cfg.train_reward_aux} diffusion={cfg.use_diffusion_actor} | "
+            f"固定开启: kl={cfg.train_kl} privileged_recon={cfg.train_privileged_recon} direct_action={cfg.train_direct_action}"
+        )
 
     train_dataset = TrajectoryDataset(
         records=train_records,
@@ -540,7 +585,9 @@ def main() -> None:
     best_val = math.inf
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
-        _unwrap_model(model).load_state_dict(ckpt["model"])
+        missing, unexpected = _unwrap_model(model).load_state_dict(ckpt["model"], strict=False)
+        if _is_main_process() and (missing or unexpected):
+            print(f"[resume] load strict=False: missing={len(missing)} unexpected={len(unexpected)}")
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1

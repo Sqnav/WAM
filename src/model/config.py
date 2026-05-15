@@ -52,6 +52,8 @@ class ModelConfig:
     action_diffusion_steps: int = 20
     action_sampling_steps: int = 20
     action_loss_weight: float = 1.0
+    # MSE over action dims: yaw (norm space, index 3 when action_dim=4) vs vx,vy,vz.
+    action_yaw_loss_weight: float = 5.0
     max_vel: float = 1.0
     max_yaw_rate: float = 45.0
     max_speed_norm: float = 1.0
@@ -64,13 +66,25 @@ class ModelConfig:
     kl_warmup_steps: int = 10000
     kl_warmup_start: float = 0.0
 
-    
     reward_weight: float = 1.0
     done_weight: float = 1.0
 
     # Additional prior auxiliary loss. This forces the action-conditioned prior
     # to predict task variables, instead of relying only on posterior features.
     prior_loss_weight: float = 0.5
+
+    # ----- Curriculum（train_teacher 通常只用 train_reward_aux + use_diffusion_actor 两档）-----
+    # train_kl 在方案 A 起即开启（与直连/特权重建一起约束 RSSM）；也可用 checkpoint 覆盖。
+    use_diffusion_actor: bool = True
+    train_kl: bool = True
+    train_reward_aux: bool = True
+    train_privileged_recon: bool = True
+    train_direct_action: bool = True
+
+    direct_action_loss_weight: float = 1.0
+    privileged_recon_loss_weight: float = 1.0
+    # x0 loss: MSE between one-step predicted clean action and expert (only when use_diffusion_actor).
+    x0_action_loss_weight: float = 1.0
 
     @property
     def feature_dim(self) -> int:

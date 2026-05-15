@@ -468,6 +468,8 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
             "max_speed_norm": args.max_speed_norm,
         }
     )
+    if getattr(args, "force_direct_action", False):
+        cfg_kwargs["use_diffusion_actor"] = False
     return ModelConfig(**cfg_kwargs)
 
 
@@ -1347,6 +1349,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--force-direct-action",
+        action="store_true",
+        default=False,
+        help="At inference use the MLP direct action head (phase-A checkpoints); overrides cfg.use_diffusion_actor from checkpoint.",
+    )
     return parser.parse_args()
 
 
