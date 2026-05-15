@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# checkpoints / weights
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.safetensors
+
+# logs
+logs/
+lightning_logs/
+wandb/
+runs/
+tensorboard/
+
+# datasets / outputs
+data/
+datasets/
+outputs/
+results/
+validation/
+test_results/
+
+# system
+.DS_Store
+.vscode/
+.idea/
