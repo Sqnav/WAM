@@ -43,23 +43,67 @@ def _weighted_aux_total(losses: Dict[str, torch.Tensor], cfg: ModelConfig, prefi
     return cfg.reward_weight * losses[f"{prefix}reward"]
 
 
+def _get_kl_weight(
+    cfg: ModelConfig,
+    global_step: Optional[int] = None,
+) -> float:
+    final_kl_weight = float(getattr(cfg, "kl_weight", 1.0))
+    warmup_steps = int(getattr(cfg, "kl_warmup_steps", 0))
+    warmup_start = float(getattr(cfg, "kl_warmup_start", 0.0))
+
+    if global_step is None or warmup_steps <= 0:
+        return final_kl_weight
+
+    progress = min(max(float(global_step) / float(warmup_steps), 0.0), 1.0)
+    scale = warmup_start + (1.0 - warmup_start) * progress
+    return final_kl_weight * scale
+
+
 def world_model_dit_loss(
     outputs: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
     cfg: ModelConfig,
     valid_mask: Optional[torch.Tensor] = None,
+    global_step: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     priors = outputs["priors"]
     posts = outputs["posts"]
 
     losses: Dict[str, torch.Tensor] = {}
-    losses["kl"] = masked_mean(kl_normal(posts["mean"], posts["std"], priors["mean"], priors["std"]), valid_mask)
 
-    losses.update(_prediction_losses(outputs, batch, cfg, valid_mask, output_prefix="", loss_prefix=""))
-    losses.update(_prediction_losses(outputs, batch, cfg, valid_mask, output_prefix="prior_", loss_prefix="prior_"))
+    losses["kl"] = masked_mean(
+        kl_normal(posts["mean"], posts["std"], priors["mean"], priors["std"]),
+        valid_mask,
+    )
+
+    losses.update(
+        _prediction_losses(
+            outputs,
+            batch,
+            cfg,
+            valid_mask,
+            output_prefix="",
+            loss_prefix="",
+        )
+    )
+
+    losses.update(
+        _prediction_losses(
+            outputs,
+            batch,
+            cfg,
+            valid_mask,
+            output_prefix="prior_",
+            loss_prefix="prior_",
+        )
+    )
 
     if "action_loss" not in outputs:
-        raise KeyError("outputs must contain action_loss. Pass expert_action to model.forward during training/evaluation.")
+        raise KeyError(
+            "outputs must contain action_loss. "
+            "Pass expert_action to model.forward during training/evaluation."
+        )
+
     action_loss = outputs["action_loss"]
     if action_loss.ndim > 0:
         action_loss = action_loss.mean()
@@ -68,8 +112,11 @@ def world_model_dit_loss(
     posterior_aux = _weighted_aux_total(losses, cfg, prefix="")
     prior_aux = _weighted_aux_total(losses, cfg, prefix="prior_")
 
+    kl_weight = _get_kl_weight(cfg, global_step=global_step)
+    losses["kl_weight"] = losses["kl"].new_tensor(kl_weight)
+
     total = (
-        cfg.kl_weight * losses["kl"]
+        kl_weight * losses["kl"]
         + posterior_aux
         + cfg.prior_loss_weight * prior_aux
         + cfg.action_loss_weight * losses["action"]
@@ -80,7 +127,6 @@ def world_model_dit_loss(
 
     losses["total"] = total
     return losses
-
 
 @torch.no_grad()
 def summarize_losses(losses: Dict[str, torch.Tensor]) -> Dict[str, float]:

@@ -57,13 +57,16 @@ class ModelConfig:
     max_speed_norm: float = 1.0
 
     # Loss weights
-    kl_weight: float = 1.0
+    kl_weight: float = 0.05
+
+    # KL warmup：从 kl_warmup_start * kl_weight 线性升到 kl_weight
+    # 设为 0 表示不使用 warmup，直接使用 kl_weight
+    kl_warmup_steps: int = 10000
+    kl_warmup_start: float = 0.0
+
+    
     reward_weight: float = 1.0
     done_weight: float = 1.0
-    collision_weight: float = 1.0
-    visibility_weight: float = 1.0
-    direction_weight: float = 1.0
-    distance_weight: float = 1.0
 
     # Additional prior auxiliary loss. This forces the action-conditioned prior
     # to predict task variables, instead of relying only on posterior features.

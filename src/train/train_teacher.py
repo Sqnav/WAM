@@ -569,7 +569,15 @@ def main() -> None:
                         valid_mask=batch["valid_mask"],
                         done=batch.get("done"),
                     )
-                    losses = world_model_dit_loss(outputs, batch, cfg, valid_mask=batch["valid_mask"])
+                    global_step = epoch * len(train_loader) + step
+
+                    losses = world_model_dit_loss(
+                        outputs,
+                        batch,
+                        cfg,
+                        valid_mask=batch["valid_mask"],
+                        global_step=global_step,
+                    )
                     loss = losses["total"]
 
                 scaler.scale(loss).backward()
