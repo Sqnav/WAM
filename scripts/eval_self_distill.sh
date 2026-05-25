@@ -38,6 +38,11 @@ GPU_ID="0"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 GPU_ID_FOR_AIRSIM="${GPU_ID}"
 DEVICE="cuda"
+PRIVILEGED_FUSION_MODE="concat"
+USE_TARGET_VISUAL_GUIDANCE=false
+USE_ATTENTION_HEATMAP=true
+VISUAL_GUIDANCE_FOV_DEG="90.0"
+ATTENTION_HEATMAP_SIGMA="0.08"
 
 # =========================
 # AirSim / online rollout
@@ -48,6 +53,9 @@ SIM_SERVER_PORT=30000
 mkdir -p "${OUTPUT_DIR}"
 echo "[eval] checkpoint=${CHECKPOINT}"
 echo "[eval] scenes=${SCENE_LIST} range=${TRAJECTORY_RANGE}"
+echo "[eval] privileged_input=disabled"
+echo "[eval] privileged_fusion=${PRIVILEGED_FUSION_MODE}"
+echo "[eval] visual_guidance=${USE_TARGET_VISUAL_GUIDANCE} heatmap=${USE_ATTENTION_HEATMAP}"
 
 # Single process: do NOT use torchrun, DDP, DataParallel, or ThreadPoolExecutor here.
 "${PYTHON_BIN}" -m eval.online_eval_teacher \
@@ -61,4 +69,9 @@ echo "[eval] scenes=${SCENE_LIST} range=${TRAJECTORY_RANGE}"
   --sim-server-host "${SIM_SERVER_HOST}" \
   --sim-server-port "${SIM_SERVER_PORT}" \
   --gpu-id "${GPU_ID_FOR_AIRSIM}" \
-  --device "${DEVICE}"
+  --device "${DEVICE}" \
+  --use-target-visual-guidance "${USE_TARGET_VISUAL_GUIDANCE}" \
+  --use-attention-heatmap "${USE_ATTENTION_HEATMAP}" \
+  --visual-guidance-fov-deg "${VISUAL_GUIDANCE_FOV_DEG}" \
+  --attention-heatmap-sigma "${ATTENTION_HEATMAP_SIGMA}" \
+  --privileged-fusion-mode "${PRIVILEGED_FUSION_MODE}"

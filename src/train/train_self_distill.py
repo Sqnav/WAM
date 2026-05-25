@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
 import json
 import math
 import os
@@ -81,24 +82,56 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
         "total",
         "sup_total",
         "feat_distill",
+        "action_distill",
         "dit_noise_distill",
         "sup_action",
         "sup_kl",
-        "sup_reward",
-        "sup_prior_reward",
+        "sup_privileged",
+        "sup_prior_privileged",
+        "sup_rollout_privileged",
     ]
     parts = []
     for key in order:
         if key in metrics:
-            parts.append(f"{key}={metrics[key]:.6f}")
+            parts.append(f"{key}={metrics[key]:.4f}")
     for key in sorted(metrics.keys()):
         if key not in order:
-            parts.append(f"{key}={metrics[key]:.6f}")
+            parts.append(f"{key}={metrics[key]:.4f}")
     return " | ".join(parts)
 
 
-def make_cfg(args: argparse.Namespace) -> ModelConfig:
-    return ModelConfig(
+def _str2bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
+
+
+def _load_checkpoint_cfg(ckpt_path: str) -> Dict[str, Any]:
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    out = dict(ckpt["cfg"]) if isinstance(ckpt, dict) and isinstance(ckpt.get("cfg"), dict) else {}
+    if isinstance(ckpt, dict) and "action_sequence_horizon" not in out:
+        state = ckpt.get("model", {}) or {}
+        token = state.get("actor.action_token_embed")
+        if token is None:
+            token = state.get("module.actor.action_token_embed")
+        if token is not None and getattr(token, "ndim", 0) == 3:
+            action_dim = int(out.get("action_dim", ModelConfig().action_dim))
+            out["action_sequence_horizon"] = max(int(token.shape[1]) // max(action_dim, 1), 1)
+    return out
+
+
+def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] = None) -> ModelConfig:
+    valid_fields = {f.name for f in fields(ModelConfig)}
+    cfg_kwargs = {k: v for k, v in (checkpoint_cfg or {}).items() if k in valid_fields}
+
+    # Runtime/path arguments stay script-controlled, while WAM switches and loss
+    # weights are inherited from the teacher checkpoint by default.
+    cfg_kwargs.update(
         image_size=args.image_size,
         dinov2_model_name=args.dinov2_model_name,
         dinov2_freeze=args.freeze_dinov2,
@@ -110,7 +143,21 @@ def make_cfg(args: argparse.Namespace) -> ModelConfig:
         action_sampling_steps=args.sampling_steps,
         max_vel=args.max_vel,
         max_yaw_rate=args.max_yaw_rate,
+        max_speed_norm=args.max_speed_norm,
     )
+    if args.privileged_fusion_mode is not None:
+        cfg_kwargs["privileged_fusion_mode"] = str(args.privileged_fusion_mode)
+    if args.action_sequence_horizon is not None:
+        cfg_kwargs["action_sequence_horizon"] = int(args.action_sequence_horizon)
+    if args.use_target_visual_guidance is not None:
+        cfg_kwargs["use_target_visual_guidance"] = bool(args.use_target_visual_guidance)
+    if args.use_attention_heatmap is not None:
+        cfg_kwargs["use_attention_heatmap"] = bool(args.use_attention_heatmap)
+    if args.visual_guidance_fov_deg is not None:
+        cfg_kwargs["visual_guidance_fov_deg"] = float(args.visual_guidance_fov_deg)
+    if args.attention_heatmap_sigma is not None:
+        cfg_kwargs["attention_heatmap_sigma"] = float(args.attention_heatmap_sigma)
+    return ModelConfig(**cfg_kwargs)
 
 
 def load_model_state(model: torch.nn.Module, ckpt_path: str, strict: bool = True) -> Dict[str, Any]:
@@ -168,8 +215,20 @@ def dit_noise_distillation_loss(
         raise ValueError("expert_action must have shape [B, T, A].")
     batch, seq_len, action_dim = expert_action.shape
     device = expert_action.device
+    horizon = max(int(getattr(cfg, "action_sequence_horizon", 1)), 1)
 
-    flat_action = expert_action.reshape(batch * seq_len, action_dim)
+    if horizon > 1:
+        seq_targets = []
+        for k in range(horizon):
+            seq_targets.append(
+                torch.cat(
+                    [expert_action[:, k:], expert_action[:, -1:].expand(-1, k, -1)],
+                    dim=1,
+                )
+            )
+        expert_action = torch.stack(seq_targets, dim=2).reshape(batch, seq_len, horizon * action_dim)
+
+    flat_action = expert_action.reshape(batch * seq_len, -1)
     flat_student_feat = student_feat.reshape(batch * seq_len, student_feat.size(-1))
     flat_teacher_feat = teacher_feat.reshape(batch * seq_len, teacher_feat.size(-1))
 
@@ -194,6 +253,36 @@ def dit_noise_distillation_loss(
     return (per_item * flat_mask).sum() / flat_mask.sum().clamp(min=1.0)
 
 
+def action_distillation_loss(
+    student_out: Dict[str, torch.Tensor],
+    teacher_out: Dict[str, torch.Tensor],
+    valid_mask: Optional[torch.Tensor],
+    cfg: ModelConfig,
+) -> torch.Tensor:
+    student_action = student_out.get("policy_action_sequence")
+    teacher_action = teacher_out.get("policy_action_sequence")
+    device = next(iter(student_out["posts"].values())).device
+    dtype = next(iter(student_out["posts"].values())).dtype
+    if student_action is not None and teacher_action is not None:
+        with torch.no_grad():
+            target = teacher_action.detach()
+        terms = []
+        for k in range(student_action.size(2)):
+            per_t = weighted_mean_action_squared_error(student_action[:, :, k], target[:, :, k], cfg).unsqueeze(-1)
+            terms.append(masked_mean(per_t, valid_mask))
+        return torch.stack(terms).mean()
+
+    student_action = student_out.get("policy_action")
+    teacher_action = teacher_out.get("policy_action")
+    if student_action is None or teacher_action is None:
+        return torch.zeros((), device=device, dtype=dtype)
+
+    with torch.no_grad():
+        target = teacher_action.detach()
+    per_t = weighted_mean_action_squared_error(student_action, target, cfg).unsqueeze(-1)
+    return masked_mean(per_t, valid_mask)
+
+
 def self_distill_losses(
     student_out: Dict[str, torch.Tensor],
     teacher_out: Dict[str, torch.Tensor],
@@ -213,23 +302,30 @@ def self_distill_losses(
         teacher_belief = rssm_belief_feat(teacher_out)
 
     feat_loss = masked_mse_lastdim(student_belief, teacher_belief, valid_mask)
-    dit_loss = dit_noise_distillation_loss(
-        student_model=student_model,
-        teacher_model=teacher_model,
-        student_feat=student_belief,
-        teacher_feat=teacher_belief,
-        expert_action=batch["expert_action"],
-        valid_mask=valid_mask,
-        cfg=cfg,
-    )
+    action_loss = action_distillation_loss(student_out, teacher_out, valid_mask, cfg)
+
+    if args.dit_noise_distill_weight > 0.0 and cfg.use_diffusion_actor:
+        dit_loss = dit_noise_distillation_loss(
+            student_model=student_model,
+            teacher_model=teacher_model,
+            student_feat=student_belief,
+            teacher_feat=teacher_belief,
+            expert_action=batch["expert_action"],
+            valid_mask=valid_mask,
+            cfg=cfg,
+        )
+    else:
+        dit_loss = torch.zeros((), device=feat_loss.device, dtype=feat_loss.dtype)
 
     total = (
         args.sup_weight * sup["total"]
         + args.feat_distill_weight * feat_loss
+        + args.action_distill_weight * action_loss
         + args.dit_noise_distill_weight * dit_loss
     )
 
     losses["feat_distill"] = feat_loss
+    losses["action_distill"] = action_loss
     losses["dit_noise_distill"] = dit_loss
     losses["total"] = total
     return losses
@@ -262,7 +358,8 @@ def evaluate_distill(
             privileged=batch["privileged"],
             prev_actions=batch["prev_actions"],
             attention_mask=batch["attention_mask"],
-            expert_action=None,
+            attention_heatmaps=batch.get("attention_heatmaps"),
+            expert_action=batch["expert_action"],
             valid_mask=batch["valid_mask"],
             done=batch.get("done"),
         )
@@ -273,6 +370,7 @@ def evaluate_distill(
             privileged=batch["privileged"],
             prev_actions=batch["prev_actions"],
             attention_mask=batch["attention_mask"],
+            attention_heatmaps=batch.get("attention_heatmaps"),
             expert_action=batch["expert_action"],
             valid_mask=batch["valid_mask"],
             done=batch.get("done"),
@@ -308,29 +406,37 @@ def build_loaders(
         Path(args.dataset_root),
         scene_list,
         args.trajectory_range.strip(),
-        max_vel=args.max_vel,
-        max_yaw_rate=args.max_yaw_rate,
+        max_vel=cfg.max_vel,
+        max_yaw_rate=cfg.max_yaw_rate,
+        max_speed_norm=cfg.max_speed_norm,
     )
     if not records:
         raise RuntimeError("No trajectory selected. Check --scene-list / --trajectory-range.")
 
     rng = random.Random(args.split_seed)
     rng.shuffle(records)
-    val_n = max(1, int(len(records) * args.val_ratio)) if len(records) > 1 else 0
+    val_n = int(len(records) * args.val_ratio)
+    if args.val_ratio > 0.0 and len(records) > 1:
+        val_n = max(1, val_n)
+    val_n = min(val_n, max(len(records) - 1, 0))
     val_records = records[:val_n]
     train_records = records[val_n:] if val_n > 0 else records
 
     train_dataset = TrajectoryDataset(
         records=train_records,
-        image_size=args.image_size,
+        image_size=cfg.image_size,
         seq_len=args.seq_len,
-        privileged_dim=args.privileged_dim,
-        action_dim=args.action_dim,
+        privileged_dim=cfg.privileged_dim,
+        action_dim=cfg.action_dim,
         direction_bins=cfg.direction_bins,
         distance_bins=cfg.distance_bins,
         tokenizer_name=args.tokenizer_name,
         text_context_length=cfg.text_context_length,
         random_crop=True,
+        use_target_visual_guidance=cfg.use_target_visual_guidance,
+        use_attention_heatmap=cfg.use_attention_heatmap,
+        visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
+        attention_heatmap_sigma=cfg.attention_heatmap_sigma,
     )
 
     train_sampler = (
@@ -352,23 +458,29 @@ def build_loaders(
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
         collate_fn=collate_fn,
     )
     train_loader.sampler_for_epoch = train_sampler  # type: ignore[attr-defined]
 
     val_loader = None
-    if (not use_ddp) or _is_main_process():
+    if val_records and ((not use_ddp) or _is_main_process()):
         val_dataset = TrajectoryDataset(
             records=val_records,
-            image_size=args.image_size,
+            image_size=cfg.image_size,
             seq_len=args.seq_len,
-            privileged_dim=args.privileged_dim,
-            action_dim=args.action_dim,
+            privileged_dim=cfg.privileged_dim,
+            action_dim=cfg.action_dim,
             direction_bins=cfg.direction_bins,
             distance_bins=cfg.distance_bins,
             tokenizer_name=args.tokenizer_name,
             text_context_length=cfg.text_context_length,
             random_crop=False,
+            use_target_visual_guidance=cfg.use_target_visual_guidance,
+            use_attention_heatmap=cfg.use_attention_heatmap,
+            visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
+            attention_heatmap_sigma=cfg.attention_heatmap_sigma,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -376,6 +488,8 @@ def build_loaders(
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
+            persistent_workers=args.num_workers > 0,
+            prefetch_factor=2 if args.num_workers > 0 else None,
             collate_fn=collate_fn,
         )
 
@@ -407,8 +521,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-dim", type=int, default=4)
     parser.add_argument("--max-vel", type=float, default=_DEFAULT_CFG.max_vel)
     parser.add_argument("--max-yaw-rate", type=float, default=_DEFAULT_CFG.max_yaw_rate)
+    parser.add_argument("--max-speed-norm", type=float, default=_DEFAULT_CFG.max_speed_norm)
+    parser.add_argument("--action-sequence-horizon", type=int, default=None)
     parser.add_argument("--diffusion-steps", type=int, default=20)
     parser.add_argument("--sampling-steps", type=int, default=20)
+    parser.add_argument(
+        "--privileged-fusion-mode",
+        type=str,
+        default=None,
+        choices=["attention", "concat"],
+        help="Override teacher checkpoint cfg.privileged_fusion_mode. Default uses checkpoint cfg.",
+    )
+    parser.add_argument("--use-target-visual-guidance", type=_str2bool, default=None)
+    parser.add_argument("--use-attention-heatmap", type=_str2bool, default=None)
+    parser.add_argument("--visual-guidance-fov-deg", type=float, default=None)
+    parser.add_argument("--attention-heatmap-sigma", type=float, default=None)
 
     # Training config
     parser.add_argument("--batch-size", type=int, default=1)
@@ -429,13 +556,14 @@ def parse_args() -> argparse.Namespace:
     # Distillation weights. Keep the first version clean.
     parser.add_argument("--sup-weight", type=float, default=1.0)
     parser.add_argument("--feat-distill-weight", type=float, default=0.1)
-    parser.add_argument("--dit-noise-distill-weight", type=float, default=0.5)
+    parser.add_argument("--action-distill-weight", type=float, default=0.5)
+    parser.add_argument("--dit-noise-distill-weight", type=float, default=0.0)
 
     # Student initialization
     parser.add_argument(
         "--init-student-from-teacher",
         action="store_true",
-        default=True,
+        default=False,
         help="Initialize student from teacher checkpoint before self-distillation.",
     )
     parser.add_argument(
@@ -465,31 +593,47 @@ def main() -> None:
     else:
         device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    cfg = make_cfg(args)
+    teacher_cfg = _load_checkpoint_cfg(args.teacher_ckpt)
+    cfg = make_cfg(args, teacher_cfg)
 
     train_loader, val_loader, total_n, train_n, val_n = build_loaders(args, cfg, use_ddp=use_ddp)
     train_sampler = getattr(train_loader, "sampler_for_epoch", None)
 
     if _is_main_process():
-        print(f"[dataset] total={total_n}, train={train_n}, val={val_n}")
-        print(f"[distill] sup={args.sup_weight}, feat={args.feat_distill_weight}, dit_noise={args.dit_noise_distill_weight}")
+        if val_n > 0:
+            print(f"[dataset] total={total_n}, train={train_n}, val={val_n}")
+        else:
+            print(f"[dataset] total={total_n}, train={train_n}")
+        print(
+            f"[cfg] use_diffusion_actor={cfg.use_diffusion_actor}, "
+            f"privileged_input=disabled, fusion={cfg.privileged_fusion_mode}, "
+            f"train_next_privileged={cfg.train_next_privileged}, train_rollout={cfg.train_rollout}"
+        )
+        print(
+            f"[distill] sup={args.sup_weight}, feat={args.feat_distill_weight}, "
+            f"action={args.action_distill_weight}, dit_noise={args.dit_noise_distill_weight}"
+        )
 
     teacher = PrivilegedTeacherWorldModelDiT(cfg).to(device)
-    load_model_state(teacher, args.teacher_ckpt, strict=True)
+    load_model_state(teacher, args.teacher_ckpt, strict=False)
     freeze_model(teacher)
     if _is_main_process():
         print(f"[teacher] loaded frozen teacher: {args.teacher_ckpt}")
 
     student = PrivilegedTeacherWorldModelDiT(cfg).to(device)
     if args.init_student_from_teacher:
-        load_model_state(student, args.teacher_ckpt, strict=True)
+        load_model_state(student, args.teacher_ckpt, strict=False)
         if _is_main_process():
             print("[student] initialized from teacher checkpoint")
     else:
         if _is_main_process():
             print("[student] random initialization")
 
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        [p for p in student.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
@@ -513,7 +657,7 @@ def main() -> None:
             student,
             device_ids=[_get_local_rank()],
             output_device=_get_local_rank(),
-            find_unused_parameters=True,
+            find_unused_parameters=False,
             broadcast_buffers=False,
         )
         if _is_main_process():
@@ -550,7 +694,8 @@ def main() -> None:
                         privileged=batch["privileged"],
                         prev_actions=batch["prev_actions"],
                         attention_mask=batch["attention_mask"],
-                        expert_action=None,
+                        attention_heatmaps=batch.get("attention_heatmaps"),
+                        expert_action=batch["expert_action"],
                         valid_mask=batch["valid_mask"],
                         done=batch.get("done"),
                     )
@@ -561,6 +706,7 @@ def main() -> None:
                     privileged=batch["privileged"],
                     prev_actions=batch["prev_actions"],
                     attention_mask=batch["attention_mask"],
+                    attention_heatmaps=batch.get("attention_heatmaps"),
                     expert_action=batch["expert_action"],
                     valid_mask=batch["valid_mask"],
                     done=batch.get("done"),
@@ -590,10 +736,11 @@ def main() -> None:
             avg = {k: v / (step + 1) for k, v in running.items()}
             if tqdm is not None and _is_main_process():
                 train_iter.set_postfix(
-                    total=f"{avg.get('total', 0.0):.6f}",
-                    sup=f"{avg.get('sup_total', 0.0):.6f}",
-                    feat=f"{avg.get('feat_distill', 0.0):.6f}",
-                    dit=f"{avg.get('dit_noise_distill', 0.0):.6f}",
+                    total=f"{avg.get('total', 0.0):.4f}",
+                    sup=f"{avg.get('sup_total', 0.0):.4f}",
+                    feat=f"{avg.get('feat_distill', 0.0):.4f}",
+                    action=f"{avg.get('action_distill', 0.0):.4f}",
+                    dit=f"{avg.get('dit_noise_distill', 0.0):.4f}",
                 )
             elif _is_main_process() and (step + 1) % 20 == 0:
                 print(f"[Epoch {epoch:03d} | Step {step + 1:05d}] {_format_metrics(avg)}")

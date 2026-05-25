@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 
+from data.visual_guidance import make_attention_heatmap
 from data.teacher_dataset_builder import build_records
 from model.config import ModelConfig
 from model.losses import summarize_losses, world_model_dit_loss
@@ -58,9 +59,9 @@ def seed_everything(seed: int) -> None:
 class TrajectoryDataset(Dataset):
     REQUIRED_KEYS = [
         "privileged",
+        "next_privileged",
         "prev_actions",
         "expert_action",
-        "reward",
     ]
 
     def __init__(
@@ -75,6 +76,10 @@ class TrajectoryDataset(Dataset):
         tokenizer_name: Optional[str] = None,
         text_context_length: int = 77,
         random_crop: bool = True,
+        use_target_visual_guidance: bool = False,
+        use_attention_heatmap: bool = True,
+        visual_guidance_fov_deg: float = 90.0,
+        attention_heatmap_sigma: float = 0.08,
     ) -> None:
         self.records = records
         self.seq_len = seq_len
@@ -84,6 +89,10 @@ class TrajectoryDataset(Dataset):
         self.distance_bins = distance_bins
         self.text_context_length = text_context_length
         self.random_crop = random_crop
+        self.use_target_visual_guidance = bool(use_target_visual_guidance)
+        self.use_attention_heatmap = bool(use_attention_heatmap)
+        self.visual_guidance_fov_deg = float(visual_guidance_fov_deg)
+        self.attention_heatmap_sigma = float(attention_heatmap_sigma)
         self.transform = transforms.Compose(
             [
                 transforms.Resize((image_size, image_size)),
@@ -257,22 +266,35 @@ class TrajectoryDataset(Dataset):
             self.action_dim,
             "prev_actions",
         )
+        next_privileged = self._ensure_2d(
+            self._require_tensor_field(record, "next_privileged", torch.float32, index),
+            seq_len,
+            self.privileged_dim,
+            "next_privileged",
+        )
         expert_action = self._ensure_2d(
             self._require_tensor_field(record, "expert_action", torch.float32, index),
             seq_len,
             self.action_dim,
             "expert_action",
         )
-        reward = self._ensure_2d(self._require_tensor_field(record, "reward", torch.float32, index), seq_len, 1, "reward")
         item: Dict[str, Optional[torch.Tensor]] = {
             "images": images.float(),
             "text_tokens": text["text_tokens"].long(),  # type: ignore[union-attr]
             "attention_mask": None if text["attention_mask"] is None else text["attention_mask"].long(),
             "privileged": privileged.float(),
+            "next_privileged": next_privileged.float(),
             "prev_actions": prev_actions.float(),
             "expert_action": expert_action.float(),
-            "reward": reward.float(),
         }
+        if self.use_target_visual_guidance:
+            if self.use_attention_heatmap:
+                item["attention_heatmaps"] = make_attention_heatmap(
+                    privileged.float(),
+                    image_hw=(images.shape[-2], images.shape[-1]),
+                    fov_deg=self.visual_guidance_fov_deg,
+                    sigma=self.attention_heatmap_sigma,
+                )
         return self._crop_or_pad(item)
 
 
@@ -303,22 +325,39 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
     order = [
         "total",
         "action",
-        "action_direct",
-        "action_diffusion_noise",
-        "action_x0",
-        "privileged_recon",
         "kl",
-        "reward",
-        "prior_reward",
+        "privileged",
+        "prior_privileged",
+        "rollout_privileged",
     ]
     parts = []
     for key in order:
         if key in metrics:
-            parts.append(f"{key}={metrics[key]:.6f}")
+            parts.append(f"{key}={metrics[key]:.4f}")
     for key in sorted(metrics.keys()):
         if key not in order:
-            parts.append(f"{key}={metrics[key]:.6f}")
+            parts.append(f"{key}={metrics[key]:.4f}")
     return " | ".join(parts)
+
+
+def _tqdm_train_postfix(avg: Dict[str, float]) -> Dict[str, str]:
+    """All running-average loss keys for tqdm, four decimal places, stable order."""
+    order = [
+        "total",
+        "action",
+        "kl",
+        "privileged",
+        "prior_privileged",
+        "rollout_privileged",
+    ]
+    out: Dict[str, str] = {}
+    for key in order:
+        if key in avg:
+            out[key] = f"{avg[key]:.4f}"
+    for key in sorted(avg.keys()):
+        if key not in out:
+            out[key] = f"{avg[key]:.4f}"
+    return out
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -373,6 +412,7 @@ def evaluate(model: PrivilegedTeacherWorldModelDiT, loader: DataLoader, cfg: Mod
             privileged=batch["privileged"],
             prev_actions=batch["prev_actions"],
             attention_mask=batch["attention_mask"],
+            attention_heatmaps=batch.get("attention_heatmaps"),
             expert_action=batch["expert_action"],
             valid_mask=batch["valid_mask"],
             done=batch.get("done"),
@@ -394,6 +434,7 @@ def main() -> None:
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--max-vel", type=float, default=_DEFAULT_CFG.max_vel, help="Physical max velocity for action normalization.")
     parser.add_argument("--max-yaw-rate", type=float, default=_DEFAULT_CFG.max_yaw_rate, help="Physical max yaw rate for action normalization.")
+    parser.add_argument("--max-speed-norm", type=float, default=_DEFAULT_CFG.max_speed_norm, help="Physical speed-norm cap used both in training targets and online action execution.")
     parser.add_argument("--save-dir", type=str, required=True)
     parser.add_argument("--tokenizer-name", type=str, default=LOCAL_CLIP_MODEL_PATH)
     parser.add_argument("--clip-text-model-name", type=str, default=LOCAL_CLIP_MODEL_PATH)
@@ -409,6 +450,7 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--action-sequence-horizon", type=int, default=_DEFAULT_CFG.action_sequence_horizon)
     parser.add_argument("--diffusion-steps", type=int, default=20)
     parser.add_argument("--sampling-steps", type=int, default=20)
     parser.add_argument("--resume", type=str, default=None)
@@ -422,22 +464,32 @@ def main() -> None:
     parser.add_argument("--finetune-clip-text", action="store_false", dest="freeze_clip_text")
     parser.add_argument("--freeze-dinov2", action="store_true", default=True)
     parser.add_argument("--finetune-dinov2", action="store_false", dest="freeze_dinov2")
-    # ----- Curriculum: 仅两个布尔（与 train_teacher.sh 对应）；KL/特权重建/直连动作三档均开启 -----
-    parser.add_argument(
-        "--train-reward-aux",
-        type=_str2bool,
-        default=True,
-        help="true/false: 后验+先验 reward MSE。false=方案A，true=方案B/C。",
-    )
     parser.add_argument(
         "--use-diffusion-actor",
         type=_str2bool,
         default=True,
-        help="true/false: DiT 扩散头与噪声/x0 损失。false=方案A/B 仅直连头；true=方案C。",
+        help="true/false: true=DiT diffusion denoising actor；false=MLP direct action head。",
     )
+    parser.add_argument(
+        "--privileged-fusion-mode",
+        type=str,
+        default=_DEFAULT_CFG.privileged_fusion_mode,
+        choices=["attention", "concat"],
+        help="attention=null target token participates in cross-attention；concat=append null target embedding after image/text fusion。",
+    )
+    parser.add_argument("--train-next-privileged", type=_str2bool, default=_DEFAULT_CFG.train_next_privileged)
+    parser.add_argument("--train-rollout", type=_str2bool, default=_DEFAULT_CFG.train_rollout)
+    parser.add_argument("--next-privileged-loss-weight", type=float, default=_DEFAULT_CFG.next_privileged_loss_weight)
+    parser.add_argument("--prior-privileged-loss-weight", type=float, default=_DEFAULT_CFG.prior_privileged_loss_weight)
+    parser.add_argument("--rollout-loss-weight", type=float, default=_DEFAULT_CFG.rollout_loss_weight)
+    parser.add_argument("--rollout-horizon", type=int, default=_DEFAULT_CFG.rollout_horizon)
     parser.add_argument("--direct-action-loss-weight", type=float, default=1.0)
-    parser.add_argument("--privileged-recon-loss-weight", type=float, default=1.0)
+    parser.add_argument("--action-yaw-loss-weight", type=float, default=_DEFAULT_CFG.action_yaw_loss_weight)
     parser.add_argument("--x0-action-loss-weight", type=float, default=1.0)
+    parser.add_argument("--use-target-visual-guidance", type=_str2bool, default=_DEFAULT_CFG.use_target_visual_guidance)
+    parser.add_argument("--use-attention-heatmap", type=_str2bool, default=_DEFAULT_CFG.use_attention_heatmap)
+    parser.add_argument("--visual-guidance-fov-deg", type=float, default=_DEFAULT_CFG.visual_guidance_fov_deg)
+    parser.add_argument("--attention-heatmap-sigma", type=float, default=_DEFAULT_CFG.attention_heatmap_sigma)
     args = parser.parse_args()
 
     seed_everything(args.seed + _get_rank())
@@ -462,17 +514,28 @@ def main() -> None:
         clip_text_freeze=args.freeze_clip_text,
         privileged_dim=args.privileged_dim,
         action_dim=args.action_dim,
+        action_sequence_horizon=args.action_sequence_horizon,
         action_diffusion_steps=args.diffusion_steps,
         action_sampling_steps=args.sampling_steps,
         max_vel=args.max_vel,
         max_yaw_rate=args.max_yaw_rate,
+        max_speed_norm=args.max_speed_norm,
+        privileged_fusion_mode=args.privileged_fusion_mode,
+        use_target_visual_guidance=args.use_target_visual_guidance,
+        use_attention_heatmap=args.use_attention_heatmap,
+        visual_guidance_fov_deg=args.visual_guidance_fov_deg,
+        attention_heatmap_sigma=args.attention_heatmap_sigma,
         use_diffusion_actor=args.use_diffusion_actor,
         train_kl=True,
-        train_reward_aux=args.train_reward_aux,
-        train_privileged_recon=True,
         train_direct_action=True,
+        train_next_privileged=args.train_next_privileged,
+        train_rollout=args.train_rollout,
+        next_privileged_loss_weight=args.next_privileged_loss_weight,
+        prior_privileged_loss_weight=args.prior_privileged_loss_weight,
+        rollout_loss_weight=args.rollout_loss_weight,
+        rollout_horizon=args.rollout_horizon,
         direct_action_loss_weight=args.direct_action_loss_weight,
-        privileged_recon_loss_weight=args.privileged_recon_loss_weight,
+        action_yaw_loss_weight=args.action_yaw_loss_weight,
         x0_action_loss_weight=args.x0_action_loss_weight,
     )
 
@@ -485,22 +548,32 @@ def main() -> None:
         args.trajectory_range.strip(),
         max_vel=args.max_vel,
         max_yaw_rate=args.max_yaw_rate,
+        max_speed_norm=args.max_speed_norm,
     )
     if not records:
         raise RuntimeError("No trajectory selected. Check --scene-list / --trajectory-range.")
     rng = random.Random(args.split_seed)
     rng.shuffle(records)
-    val_n = max(1, int(len(records) * args.val_ratio)) if len(records) > 1 else 0
+    val_n = int(len(records) * args.val_ratio)
+    if args.val_ratio > 0.0 and len(records) > 1:
+        val_n = max(1, val_n)
+    val_n = min(val_n, max(len(records) - 1, 0))
     val_records = records[:val_n]
     train_records = records[val_n:] if val_n > 0 else records
     if _is_main_process():
-        print(f"[dataset] total={len(records)}, train={len(train_records)}, val={len(val_records)}")
+        if val_records:
+            print(f"[dataset] total={len(records)}, train={len(train_records)}, val={len(val_records)}")
+        else:
+            print(f"[dataset] total={len(records)}, train={len(train_records)}")
         print(
             "[cfg curriculum] "
-            f"方案: reward_aux={cfg.train_reward_aux} diffusion={cfg.use_diffusion_actor} | "
-            f"固定开启: kl={cfg.train_kl} privileged_recon={cfg.train_privileged_recon} direct_action={cfg.train_direct_action}"
+            f"diffusion={cfg.use_diffusion_actor} | "
+            f"privileged_input=disabled fusion={cfg.privileged_fusion_mode} | "
+            f"固定开启: kl={cfg.train_kl} direct_action={cfg.train_direct_action} | "
+            f"action_w={cfg.direct_action_loss_weight} yaw_w={cfg.action_yaw_loss_weight} | "
+            f"WAM: next_privileged={cfg.train_next_privileged} rollout={cfg.train_rollout} | "
+            f"visual_guidance={cfg.use_target_visual_guidance} heatmap={cfg.use_attention_heatmap}"
         )
-
     train_dataset = TrajectoryDataset(
         records=train_records,
         image_size=args.image_size,
@@ -512,6 +585,10 @@ def main() -> None:
         tokenizer_name=args.tokenizer_name,
         text_context_length=cfg.text_context_length,
         random_crop=True,
+        use_target_visual_guidance=cfg.use_target_visual_guidance,
+        use_attention_heatmap=cfg.use_attention_heatmap,
+        visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
+        attention_heatmap_sigma=cfg.attention_heatmap_sigma,
     )
     train_sampler = (
         DistributedSampler(
@@ -531,30 +608,38 @@ def main() -> None:
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
         collate_fn=collate_fn,
     )
 
-    val_dataset = TrajectoryDataset(
-        records=val_records,
-        image_size=args.image_size,
-        seq_len=args.seq_len,
-        privileged_dim=args.privileged_dim,
-        action_dim=args.action_dim,
-        direction_bins=cfg.direction_bins,
-        distance_bins=cfg.distance_bins,
-        tokenizer_name=args.tokenizer_name,
-        text_context_length=cfg.text_context_length,
-        random_crop=False,
-    )
     # For simplicity: run validation only on rank0 under DDP.
     val_loader = None
-    if (not use_ddp) or _is_main_process():
+    if val_records and ((not use_ddp) or _is_main_process()):
+        val_dataset = TrajectoryDataset(
+            records=val_records,
+            image_size=args.image_size,
+            seq_len=args.seq_len,
+            privileged_dim=args.privileged_dim,
+            action_dim=args.action_dim,
+            direction_bins=cfg.direction_bins,
+            distance_bins=cfg.distance_bins,
+            tokenizer_name=args.tokenizer_name,
+            text_context_length=cfg.text_context_length,
+            random_crop=False,
+            use_target_visual_guidance=cfg.use_target_visual_guidance,
+            use_attention_heatmap=cfg.use_attention_heatmap,
+            visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
+            attention_heatmap_sigma=cfg.attention_heatmap_sigma,
+        )
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
+            persistent_workers=args.num_workers > 0,
+            prefetch_factor=2 if args.num_workers > 0 else None,
             collate_fn=collate_fn,
         )
 
@@ -564,7 +649,7 @@ def main() -> None:
             model,
             device_ids=[_get_local_rank()],
             output_device=_get_local_rank(),
-            find_unused_parameters=True,
+            find_unused_parameters=False,
             broadcast_buffers=False,
         )
         if _is_main_process():
@@ -577,7 +662,11 @@ def main() -> None:
         else:
             print(f"[train] Device: {device}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
@@ -593,16 +682,23 @@ def main() -> None:
         start_epoch = ckpt["epoch"] + 1
         best_val = ckpt.get("best_val", best_val)
 
+    total_pbar = None
+    if tqdm is not None and _is_main_process():
+        total_steps = max(args.epochs - start_epoch, 0) * max(len(train_loader), 1)
+        total_pbar = tqdm(
+            total=total_steps,
+            desc=f"train {start_epoch:03d}->{args.epochs - 1:03d}",
+            leave=True,
+            dynamic_ncols=True,
+        )
+
     try:
         for epoch in range(start_epoch, args.epochs):
             model.train()
             running: Dict[str, float] = {}
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
-            train_iter = train_loader
-            if tqdm is not None and _is_main_process():
-                train_iter = tqdm(train_loader, desc=f"Epoch {epoch:03d} train", leave=False, dynamic_ncols=True)
-            for step, batch in enumerate(train_iter):
+            for step, batch in enumerate(train_loader):
                 batch = move_batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
@@ -612,18 +708,16 @@ def main() -> None:
                         privileged=batch["privileged"],
                         prev_actions=batch["prev_actions"],
                         attention_mask=batch["attention_mask"],
+                        attention_heatmaps=batch.get("attention_heatmaps"),
                         expert_action=batch["expert_action"],
                         valid_mask=batch["valid_mask"],
                         done=batch.get("done"),
                     )
-                    global_step = epoch * len(train_loader) + step
-
                     losses = world_model_dit_loss(
                         outputs,
                         batch,
                         cfg,
                         valid_mask=batch["valid_mask"],
-                        global_step=global_step,
                     )
                     loss = losses["total"]
 
@@ -638,12 +732,10 @@ def main() -> None:
                     running[k] = running.get(k, 0.0) + v
 
                 avg = {k: v / (step + 1) for k, v in running.items()}
-                if tqdm is not None and _is_main_process():
-                    train_iter.set_postfix(
-                        total=f"{avg.get('total', 0.0):.6f}",
-                        action=f"{avg.get('action', 0.0):.6f}",
-                        kl=f"{avg.get('kl', 0.0):.6f}",
-                    )
+                if total_pbar is not None:
+                    postfix = {"epoch": f"{epoch:03d}", **_tqdm_train_postfix(avg)}
+                    total_pbar.set_postfix(**postfix)
+                    total_pbar.update(1)
                 elif _is_main_process() and (step + 1) % 20 == 0:
                     print(f"[Epoch {epoch:03d} | Step {step + 1:05d}] {_format_metrics(avg)}")
 
@@ -678,6 +770,8 @@ def main() -> None:
             if use_ddp:
                 dist.barrier()
     finally:
+        if total_pbar is not None:
+            total_pbar.close()
         if use_ddp and _ddp_is_initialized():
             dist.destroy_process_group()
 

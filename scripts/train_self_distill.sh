@@ -7,7 +7,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "$script_dir/../.." && pwd)"
 DATASET_ROOT="$root_dir/Dataset"
-TEACHER_CKPT="$root_dir/save_teacher_dit/best.pt"
+TEACHER_CKPT="$root_dir/save_teacher_dit_noDIT/best.pt"
 SAVE_DIR="$root_dir/save_self_distill"
 
 # ==========================================
@@ -56,24 +56,35 @@ NUM_WORKERS="4"
 SEQ_LEN="16"
 IMAGE_SIZE="224"
 MAX_VEL="1.0"
-MAX_YAW_RATE="45.0"
+MAX_YAW_RATE="15.0"
+MAX_SPEED_NORM="1.0"
+ACTION_SEQUENCE_HORIZON="3"
 DIFFUSION_STEPS="20"
 SAMPLING_STEPS="20"
 MASTER_PORT="29503"
+PRIVILEGED_FUSION_MODE="concat"
+USE_TARGET_VISUAL_GUIDANCE=false
+USE_ATTENTION_HEATMAP=true
+VISUAL_GUIDANCE_FOV_DEG="90.0"
+ATTENTION_HEATMAP_SIGMA="0.08"
 
-# Clean first-version self-distillation:
-# supervised world-model/DiT loss + posterior RSSM belief distillation + DiT noise distillation
+# Self-distillation:
+# supervised WAM loss + posterior RSSM belief distillation + teacher action distillation.
+# DiT noise distillation is only useful when the teacher/student use the diffusion actor.
 SUP_WEIGHT="1.0"
 FEAT_DISTILL_WEIGHT="0.1"
-DIT_NOISE_DISTILL_WEIGHT="0.5"
+ACTION_DISTILL_WEIGHT="0.5"
+DIT_NOISE_DISTILL_WEIGHT="0.0"
 
-INIT_STUDENT_FROM_TEACHER="1"
+INIT_STUDENT_FROM_TEACHER="0"
 
 mkdir -p "${SAVE_DIR}"
 
 extra_args=()
 
-if [[ "${INIT_STUDENT_FROM_TEACHER}" == "0" || "${INIT_STUDENT_FROM_TEACHER}" == "false" || "${INIT_STUDENT_FROM_TEACHER}" == "False" ]]; then
+if [[ "${INIT_STUDENT_FROM_TEACHER}" == "1" || "${INIT_STUDENT_FROM_TEACHER}" == "true" || "${INIT_STUDENT_FROM_TEACHER}" == "True" ]]; then
+  extra_args+=(--init-student-from-teacher)
+elif [[ "${INIT_STUDENT_FROM_TEACHER}" == "0" || "${INIT_STUDENT_FROM_TEACHER}" == "false" || "${INIT_STUDENT_FROM_TEACHER}" == "False" ]]; then
   extra_args+=(--student-init-random)
 fi
 
@@ -91,7 +102,10 @@ echo "NUM_GPUS             : ${NUM_GPUS}"
 echo "batch_size/GPU       : ${BATCH_SIZE}"
 echo "epochs               : ${EPOCHS}"
 echo "lr                   : ${LR}"
-echo "loss weights         : sup=${SUP_WEIGHT}, feat=${FEAT_DISTILL_WEIGHT}, dit_noise=${DIT_NOISE_DISTILL_WEIGHT}"
+echo "privileged_input : disabled"
+echo "privileged_fusion    : ${PRIVILEGED_FUSION_MODE}"
+echo "visual_guidance      : ${USE_TARGET_VISUAL_GUIDANCE}, heatmap=${USE_ATTENTION_HEATMAP}"
+echo "loss weights         : sup=${SUP_WEIGHT}, feat=${FEAT_DISTILL_WEIGHT}, action=${ACTION_DISTILL_WEIGHT}, dit_noise=${DIT_NOISE_DISTILL_WEIGHT}"
 echo "============================================================"
 
 common_args=(
@@ -107,6 +121,13 @@ common_args=(
   --seq-len "${SEQ_LEN}"
   --max-vel "${MAX_VEL}"
   --max-yaw-rate "${MAX_YAW_RATE}"
+  --max-speed-norm "${MAX_SPEED_NORM}"
+  --action-sequence-horizon "${ACTION_SEQUENCE_HORIZON}"
+  --privileged-fusion-mode "${PRIVILEGED_FUSION_MODE}"
+  --use-target-visual-guidance "${USE_TARGET_VISUAL_GUIDANCE}"
+  --use-attention-heatmap "${USE_ATTENTION_HEATMAP}"
+  --visual-guidance-fov-deg "${VISUAL_GUIDANCE_FOV_DEG}"
+  --attention-heatmap-sigma "${ATTENTION_HEATMAP_SIGMA}"
   --diffusion-steps "${DIFFUSION_STEPS}"
   --sampling-steps "${SAMPLING_STEPS}"
   --freeze-dinov2
@@ -117,6 +138,7 @@ common_args=(
   --num-workers "${NUM_WORKERS}"
   --sup-weight "${SUP_WEIGHT}"
   --feat-distill-weight "${FEAT_DISTILL_WEIGHT}"
+  --action-distill-weight "${ACTION_DISTILL_WEIGHT}"
   --dit-noise-distill-weight "${DIT_NOISE_DISTILL_WEIGHT}"
   "${extra_args[@]}"
 )
@@ -131,4 +153,3 @@ if [[ "${NUM_GPUS}" -gt 1 ]]; then
 else
   "${PYTHON_BIN}" "${common_args[@]}"
 fi
-

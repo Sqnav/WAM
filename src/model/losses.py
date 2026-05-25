@@ -25,41 +25,32 @@ def kl_normal(mean_q: torch.Tensor, std_q: torch.Tensor, mean_p: torch.Tensor, s
     return kl.sum(dim=-1)
 
 
-def _prediction_losses(
-    outputs: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-    cfg: ModelConfig,
+def action_sequence_loss(
+    pred_sequence: torch.Tensor,
+    expert_action: torch.Tensor,
     valid_mask: Optional[torch.Tensor],
-    output_prefix: str = "",
-    loss_prefix: str = "",
-) -> Dict[str, torch.Tensor]:
-    losses: Dict[str, torch.Tensor] = {}
-
-    reward_target = batch["reward"].float()
-    losses[f"{loss_prefix}reward"] = masked_mean(
-        (outputs[f"{output_prefix}reward"] - reward_target).pow(2), valid_mask
-    )
-    return losses
-
-
-def _weighted_aux_total(losses: Dict[str, torch.Tensor], cfg: ModelConfig, prefix: str = "") -> torch.Tensor:
-    return cfg.reward_weight * losses[f"{prefix}reward"]
-
-
-def _get_kl_weight(
     cfg: ModelConfig,
-    global_step: Optional[int] = None,
-) -> float:
-    final_kl_weight = float(getattr(cfg, "kl_weight", 1.0))
-    warmup_steps = int(getattr(cfg, "kl_warmup_steps", 0))
-    warmup_start = float(getattr(cfg, "kl_warmup_start", 0.0))
+) -> torch.Tensor:
+    if pred_sequence.ndim != 4:
+        raise ValueError("pred_sequence must have shape [B, T, H, A].")
+    if expert_action.ndim != 3:
+        raise ValueError("expert_action must have shape [B, T, A].")
 
-    if global_step is None or warmup_steps <= 0:
-        return final_kl_weight
-
-    progress = min(max(float(global_step) / float(warmup_steps), 0.0), 1.0)
-    scale = warmup_start + (1.0 - warmup_start) * progress
-    return final_kl_weight * scale
+    valid = valid_mask.float() if valid_mask is not None else torch.ones_like(expert_action[..., 0])
+    horizon = pred_sequence.size(2)
+    terms = []
+    for k in range(horizon):
+        target = torch.cat(
+            [expert_action[:, k:], expert_action[:, -1:].expand(-1, k, -1)],
+            dim=1,
+        )
+        if k == 0:
+            mask = valid
+        else:
+            mask = torch.cat([valid[:, k:], torch.zeros_like(valid[:, :k])], dim=1)
+        per_t = weighted_mean_action_squared_error(pred_sequence[:, :, k], target.float(), cfg).unsqueeze(-1)
+        terms.append(masked_mean(per_t, mask))
+    return torch.stack(terms).mean()
 
 
 def world_model_dit_loss(
@@ -67,7 +58,6 @@ def world_model_dit_loss(
     batch: Dict[str, torch.Tensor],
     cfg: ModelConfig,
     valid_mask: Optional[torch.Tensor] = None,
-    global_step: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     priors = outputs["priors"]
     posts = outputs["posts"]
@@ -75,9 +65,9 @@ def world_model_dit_loss(
     dtype = posts["mean"].dtype
 
     train_kl = bool(getattr(cfg, "train_kl", True))
-    train_reward_aux = bool(getattr(cfg, "train_reward_aux", True))
-    train_privileged_recon = bool(getattr(cfg, "train_privileged_recon", True))
     train_direct_action = bool(getattr(cfg, "train_direct_action", True))
+    train_next_privileged = bool(getattr(cfg, "train_next_privileged", False))
+    train_rollout = bool(getattr(cfg, "train_rollout", False))
 
     losses: Dict[str, torch.Tensor] = {}
 
@@ -89,59 +79,84 @@ def world_model_dit_loss(
     else:
         losses["kl"] = torch.zeros((), device=device, dtype=dtype)
 
-    if train_reward_aux:
-        losses.update(
-            _prediction_losses(outputs, batch, cfg, valid_mask, output_prefix="", loss_prefix="")
-        )
-        losses.update(
-            _prediction_losses(
-                outputs, batch, cfg, valid_mask, output_prefix="prior_", loss_prefix="prior_"
-            )
-        )
+    z = torch.zeros((), device=device, dtype=dtype)
+    if not train_next_privileged:
+        losses["privileged"] = z
+        losses["prior_privileged"] = z
     else:
-        z = torch.zeros((), device=device, dtype=dtype)
-        losses["reward"] = z
-        losses["prior_reward"] = z
+        if "privileged" not in losses:
+            losses["privileged"] = masked_mean(
+                (outputs["privileged"] - batch["next_privileged"].float()).pow(2),
+                valid_mask,
+            )
+        if "prior_privileged" not in losses:
+            losses["prior_privileged"] = masked_mean(
+                (outputs["prior_privileged"] - batch["next_privileged"].float()).pow(2),
+                valid_mask,
+            )
 
     expert_action = batch["expert_action"]
 
-    if train_privileged_recon and "privileged_recon" in outputs:
-        priv_tgt = batch["privileged"].float()
-        pr = outputs["privileged_recon"]
-        losses["privileged_recon"] = masked_mean(
-            (pr - priv_tgt).pow(2).mean(dim=-1, keepdim=True),
+    if train_direct_action and "policy_diffusion_loss" in outputs:
+        losses["action"] = outputs["policy_diffusion_loss"]
+        if float(getattr(cfg, "x0_action_loss_weight", 0.0)) > 0.0 and "policy_action_sequence" in outputs:
+            losses["x0_action"] = action_sequence_loss(
+                outputs["policy_action_sequence"],
+                expert_action.float(),
+                valid_mask,
+                cfg,
+            )
+        else:
+            losses["x0_action"] = torch.zeros((), device=device, dtype=dtype)
+    elif train_direct_action and "policy_action_sequence" in outputs:
+        losses["action"] = action_sequence_loss(
+            outputs["policy_action_sequence"],
+            expert_action.float(),
             valid_mask,
+            cfg,
         )
-    else:
-        losses["privileged_recon"] = torch.zeros((), device=device, dtype=dtype)
-
-    if train_direct_action and "policy_action" in outputs:
+        losses["x0_action"] = torch.zeros((), device=device, dtype=dtype)
+    elif train_direct_action and "policy_action" in outputs:
         pred = outputs["policy_action"]
         tgt = expert_action.float()
         per_t = weighted_mean_action_squared_error(pred, tgt, cfg).unsqueeze(-1)
-        losses["action_direct"] = masked_mean(per_t, valid_mask)
+        losses["action"] = masked_mean(per_t, valid_mask)
+        losses["x0_action"] = torch.zeros((), device=device, dtype=dtype)
     else:
-        losses["action_direct"] = torch.zeros((), device=device, dtype=dtype)
+        losses["action"] = torch.zeros((), device=device, dtype=dtype)
+        losses["x0_action"] = torch.zeros((), device=device, dtype=dtype)
 
-    losses["action_diffusion_noise"] = torch.zeros((), device=device, dtype=dtype)
-    losses["action_x0"] = torch.zeros((), device=device, dtype=dtype)
+    if train_rollout and "rollout_privileged" in outputs:
+        rollout_pred = outputs["rollout_privileged"]
+        privileged = batch["privileged"].float()
+        valid = valid_mask.float() if valid_mask is not None else torch.ones_like(privileged[..., 0])
+        horizon = rollout_pred.size(2)
+        terms = []
+        for k in range(horizon):
+            target = torch.cat([privileged[:, k + 1 :], privileged[:, -1:].expand(-1, k + 1, -1)], dim=1)
+            mask = torch.cat([valid[:, k + 1 :], torch.zeros_like(valid[:, : k + 1])], dim=1)
+            terms.append(masked_mean((rollout_pred[:, :, k] - target).pow(2), mask))
+        losses["rollout_privileged"] = torch.stack(terms).mean()
+    else:
+        losses["rollout_privileged"] = torch.zeros((), device=device, dtype=dtype)
 
-    # 教师训练：DiT 时不再把噪声预测 / x0 辅助项计入 total，仅对采样动作做 BC（见 policy_action）。
-    losses["action"] = losses["action_direct"]
+    # DiT actor uses the standard diffusion denoising objective as
+    # losses["action"]; an optional x0 reconstruction term keeps the sampled
+    # clean trajectory aligned with expert actions.
 
-    kl_weight = _get_kl_weight(cfg, global_step=global_step)
-    losses["kl_weight"] = losses["kl"].new_tensor(kl_weight)
+    kl_w = float(cfg.kl_weight)
 
     total = torch.zeros((), device=device, dtype=dtype)
     if train_kl:
-        total = total + kl_weight * losses["kl"]
-    if train_reward_aux:
-        total = total + _weighted_aux_total(losses, cfg, prefix="")
-        total = total + cfg.prior_loss_weight * _weighted_aux_total(losses, cfg, prefix="prior_")
-    if train_privileged_recon and "privileged_recon" in outputs:
-        total = total + float(cfg.privileged_recon_loss_weight) * losses["privileged_recon"]
+        total = total + kl_w * losses["kl"]
+    if train_next_privileged:
+        total = total + float(cfg.next_privileged_loss_weight) * losses["privileged"]
+        total = total + float(cfg.prior_privileged_loss_weight) * losses["prior_privileged"]
     if train_direct_action and "policy_action" in outputs:
-        total = total + float(cfg.direct_action_loss_weight) * losses["action_direct"]
+        total = total + float(cfg.direct_action_loss_weight) * losses["action"]
+        total = total + float(getattr(cfg, "x0_action_loss_weight", 0.0)) * losses["x0_action"]
+    if train_rollout and "rollout_privileged" in outputs:
+        total = total + float(cfg.rollout_loss_weight) * losses["rollout_privileged"]
 
     if total.ndim > 0:
         total = total.mean()

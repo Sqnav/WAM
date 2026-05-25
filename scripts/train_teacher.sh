@@ -7,9 +7,37 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "$script_dir/../.." && pwd)"
 dataset_root="$root_dir/Dataset"
-save_dir="$root_dir/save_teacher_dit"
+save_dir="$root_dir/save_teacher_dit_noDIT"
 
-epochs="50"
+epochs="100"
+batch_size="4"
+seq_len="16"
+val_ratio="0.0"
+max_yaw_rate="15.0"
+max_speed_norm="1.0"
+action_sequence_horizon="3"
+num_workers="8"
+
+# =========================
+# Visual target guidance switches
+# global image is always kept; this adds an optional target heatmap cue.
+# =========================
+USE_TARGET_VISUAL_GUIDANCE=false
+USE_ATTENTION_HEATMAP=true
+VISUAL_GUIDANCE_FOV_DEG="90.0"
+ATTENTION_HEATMAP_SIGMA="0.08"
+
+# =========================
+# WAM auxiliary switches
+# =========================
+TRAIN_NEXT_PRIVILEGED=true
+TRAIN_ROLLOUT=true
+next_privileged_loss_weight="1.0"
+prior_privileged_loss_weight="0.2"
+direct_action_loss_weight="2.0"
+action_yaw_loss_weight="10.0"
+rollout_loss_weight="0.2"
+rollout_horizon="3"
 # ==========================================
 # Dataset selection
 # ==========================================
@@ -17,18 +45,12 @@ scene_list="City_1,City_2,City_3"
 trajectory_range="1-450"
 
 # =========================
-# 训练方案（下面两行直接写 true / false）
-# KL、特权重建、策略监督 三档均开启；无 DiT 用 MLP，有 DiT 时对采样动作 vs 专家做 BC（总 loss 不含扩散噪声/x0）。
+# 训练方案（下面一行直接写 true / false）
+# KL、策略监督、WAM 辅助由上面开关控制；无 DiT 用 MLP，有 DiT 时使用扩散噪声预测训练。
 # =========================
-# 方案 A: TRAIN_REWARD_AUX=false  USE_DIFFUSION_ACTOR=false
-#   → KL + MLP 与专家 + privileged_recon（无 reward 辅助、无 DiT）
-# 方案 B: TRAIN_REWARD_AUX=true   USE_DIFFUSION_ACTOR=false
-#   → 方案 A + 后验/先验 reward
-# 方案 C: USE_DIFFUSION_ACTOR=true（TRAIN_REWARD_AUX 建议 true）
-#   → 方案 B + DiT 采样 BC（推理与训练用 DiT；总 loss 不加噪声/x0 项）
 # 在脚本里直接改成 true 或 false（小写）
-TRAIN_REWARD_AUX=true
-USE_DIFFUSION_ACTOR=true
+USE_DIFFUSION_ACTOR=false
+PRIVILEGED_FUSION_MODE="concat"
 
 # =========================
 # Environment
@@ -46,7 +68,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 # =========================
 # GPU selection
 # =========================
-GPU_IDS="${GPU_IDS:-0,1,2,3}"
+GPU_IDS="${GPU_IDS:-2,3}"
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 
 # DDP debug: 需要定位 unused parameter 时可在外部设为 DETAIL
@@ -63,6 +85,10 @@ print(max(len(g), 1))
 PY
 )"
 
+echo "[train_teacher] use_diffusion_actor=${USE_DIFFUSION_ACTOR} privileged_input=disabled privileged_fusion_mode=${PRIVILEGED_FUSION_MODE}"
+echo "[train_teacher] action_sequence_horizon=${action_sequence_horizon} rollout_loss_weight=${rollout_loss_weight}"
+echo "[train_teacher] visual_guidance=${USE_TARGET_VISUAL_GUIDANCE} heatmap=${USE_ATTENTION_HEATMAP}"
+
 # Launch training with DDP. Do not use DataParallel here.
 "${PYTHON_BIN}" -m torch.distributed.run \
   --standalone \
@@ -74,6 +100,25 @@ PY
   --trajectory-range "${trajectory_range}" \
   --save-dir "${save_dir}" \
   --epochs "${epochs}" \
+  --batch-size "${batch_size}" \
+  --seq-len "${seq_len}" \
+  --val-ratio "${val_ratio}" \
+  --max-yaw-rate "${max_yaw_rate}" \
+  --max-speed-norm "${max_speed_norm}" \
+  --action-sequence-horizon "${action_sequence_horizon}" \
+  --num-workers "${num_workers}" \
+  --train-next-privileged "${TRAIN_NEXT_PRIVILEGED}" \
+  --train-rollout "${TRAIN_ROLLOUT}" \
+  --next-privileged-loss-weight "${next_privileged_loss_weight}" \
+  --prior-privileged-loss-weight "${prior_privileged_loss_weight}" \
+  --direct-action-loss-weight "${direct_action_loss_weight}" \
+  --action-yaw-loss-weight "${action_yaw_loss_weight}" \
+  --rollout-loss-weight "${rollout_loss_weight}" \
+  --rollout-horizon "${rollout_horizon}" \
+  --use-target-visual-guidance "${USE_TARGET_VISUAL_GUIDANCE}" \
+  --use-attention-heatmap "${USE_ATTENTION_HEATMAP}" \
+  --visual-guidance-fov-deg "${VISUAL_GUIDANCE_FOV_DEG}" \
+  --attention-heatmap-sigma "${ATTENTION_HEATMAP_SIGMA}" \
   --multi-gpu \
-  --train-reward-aux "${TRAIN_REWARD_AUX}" \
+  --privileged-fusion-mode "${PRIVILEGED_FUSION_MODE}" \
   --use-diffusion-actor "${USE_DIFFUSION_ACTOR}"

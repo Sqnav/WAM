@@ -26,11 +26,11 @@ class TeacherPredictionHeads(nn.Module):
         super().__init__()
         feat_dim = cfg.feature_dim
         hidden = cfg.head_hidden_dim
-        self.reward = ScalarHead(feat_dim, hidden, out_dim=1, dropout=cfg.dropout)
+        self.privileged = ScalarHead(feat_dim, hidden, out_dim=cfg.privileged_dim, dropout=cfg.dropout)
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
         return {
-            "reward": self.reward(feat),
+            "privileged": self.privileged(feat),
         }
 
 
@@ -49,23 +49,6 @@ class DirectActionHead(nn.Module):
 
     def forward(self, feat: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.net(feat))
-
-
-class PrivilegedReconHead(nn.Module):
-    """Decode privileged vector from RSSM feature (auxiliary reconstruction loss)."""
-
-    def __init__(self, cfg: ModelConfig) -> None:
-        super().__init__()
-        self.net = MLP(
-            cfg.feature_dim,
-            cfg.head_hidden_dim,
-            cfg.privileged_dim,
-            num_layers=3,
-            dropout=cfg.dropout,
-        )
-
-    def forward(self, feat: torch.Tensor) -> torch.Tensor:
-        return self.net(feat)
 
 
 class SinusoidalTimestepEmbedding(nn.Module):
@@ -121,11 +104,13 @@ class DiTActionHead(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.action_dim = cfg.action_dim
+        self.action_horizon = max(int(getattr(cfg, "action_sequence_horizon", 1)), 1)
+        self.output_dim = self.action_dim * self.action_horizon
         self.hidden_dim = cfg.action_dit_hidden_dim
         self.num_steps = cfg.action_diffusion_steps
 
         self.scalar_embed = nn.Linear(1, self.hidden_dim)
-        self.action_token_embed = nn.Parameter(torch.zeros(1, cfg.action_dim, self.hidden_dim))
+        self.action_token_embed = nn.Parameter(torch.zeros(1, self.output_dim, self.hidden_dim))
         self.cond_proj = nn.Sequential(
             nn.Linear(cfg.feature_dim, self.hidden_dim),
             nn.SiLU(),
@@ -162,12 +147,21 @@ class DiTActionHead(nn.Module):
 
     def forward(self, feat: torch.Tensor, noisy_action: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         original_shape = noisy_action.shape
-        if noisy_action.ndim == 3:
+        if noisy_action.ndim == 4:
+            batch = noisy_action.shape[0] * noisy_action.shape[1]
+            noisy_action = noisy_action.reshape(batch, self.output_dim)
+            feat = feat.reshape(batch, feat.shape[-1])
+        elif noisy_action.ndim == 3:
             batch = noisy_action.shape[0] * noisy_action.shape[1]
             noisy_action = noisy_action.reshape(batch, noisy_action.shape[-1])
             feat = feat.reshape(batch, feat.shape[-1])
         elif noisy_action.ndim != 2:
-            raise ValueError("noisy_action must have shape [B, A] or [B, T, A].")
+            raise ValueError("noisy_action must have shape [B, A], [B, T, A], or [B, T, H, A].")
+        if noisy_action.shape[-1] != self.output_dim:
+            raise ValueError(
+                f"DiT noisy_action last dimension must be H*action_dim={self.output_dim}, "
+                f"got {noisy_action.shape[-1]}."
+            )
 
         t = self._expand_time(t, noisy_action)
         cond = self.cond_proj(feat) + self.time_embed(t)
@@ -195,17 +189,43 @@ class DiTActionHead(nn.Module):
         valid_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         device = expert_action.device
-        if expert_action.ndim == 3:
+        original_action_shape = expert_action.shape
+        if expert_action.ndim == 3 and expert_action.shape[-1] == self.action_dim:
+            seq_targets = []
+            for k in range(self.action_horizon):
+                seq_targets.append(
+                    torch.cat(
+                        [expert_action[:, k:], expert_action[:, -1:].expand(-1, k, -1)],
+                        dim=1,
+                    )
+                )
+            expert_action = torch.stack(seq_targets, dim=2)
+
+        if expert_action.ndim == 4:
+            batch = expert_action.shape[0] * expert_action.shape[1]
+            flat_action = expert_action.reshape(batch, self.output_dim)
+            flat_feat = feat.reshape(batch, feat.shape[-1])
+            flat_mask = None if valid_mask is None else valid_mask.reshape(batch)
+        elif expert_action.ndim == 3:
             batch = expert_action.shape[0] * expert_action.shape[1]
             flat_action = expert_action.reshape(batch, expert_action.shape[-1])
             flat_feat = feat.reshape(batch, feat.shape[-1])
             flat_mask = None if valid_mask is None else valid_mask.reshape(batch)
         elif expert_action.ndim == 2:
-            flat_action = expert_action
+            if expert_action.shape[-1] == self.action_dim:
+                expert_action = expert_action.unsqueeze(1).expand(-1, self.action_horizon, -1)
+                flat_action = expert_action.reshape(expert_action.shape[0], self.output_dim)
+            else:
+                flat_action = expert_action
             flat_feat = feat
             flat_mask = valid_mask
         else:
-            raise ValueError("expert_action must have shape [B, A] or [B, T, A].")
+            raise ValueError("expert_action must have shape [B, A], [B, T, A], or [B, T, H, A].")
+        if flat_action.shape[-1] != self.output_dim:
+            raise ValueError(
+                f"DiT expert_action last dimension must be H*action_dim={self.output_dim}, "
+                f"got {flat_action.shape[-1]}."
+            )
 
         t = torch.randint(0, self.num_steps, (flat_action.shape[0],), device=device)
         noise = torch.randn_like(flat_action)
@@ -220,7 +240,10 @@ class DiTActionHead(nn.Module):
             loss = per_item.mean()
 
         pred_x0 = self.predict_x0(xt, t, pred_noise)
-        if expert_action.ndim == 3:
+        if len(original_action_shape) == 3 and original_action_shape[-1] == self.action_dim:
+            pred_x0 = pred_x0.view(*original_action_shape[:2], self.action_horizon, self.action_dim)
+            pred_noise = pred_noise.view(*original_action_shape[:2], self.action_horizon, self.action_dim)
+        elif expert_action.ndim in (3, 4):
             pred_x0 = pred_x0.view_as(expert_action)
             pred_noise = pred_noise.view_as(expert_action)
         return {"loss": loss, "pred_action": pred_x0, "pred_noise": pred_noise}
@@ -236,10 +259,9 @@ class DiTActionHead(nn.Module):
         else:
             raise ValueError("feat must have shape [B, D] or [B, T, D].")
 
-        if deterministic:
-            x = torch.zeros(flat_feat.shape[0], self.action_dim, device=flat_feat.device)
-        else:
-            x = torch.randn(flat_feat.shape[0], self.action_dim, device=flat_feat.device)
+        # Diffusion sampling starts from Gaussian noise. ``deterministic`` only
+        # controls whether additional reverse-process noise is injected.
+        x = torch.randn(flat_feat.shape[0], self.output_dim, device=flat_feat.device)
 
         steps = self.num_steps if num_steps is None else min(num_steps, self.num_steps)
         start_t = self.num_steps - 1
@@ -266,52 +288,4 @@ class DiTActionHead(nn.Module):
                 x = mean + torch.sqrt(beta) * noise
 
         x = x.clamp(-1.0, 1.0)
-        return x.view(*original_shape, self.action_dim)
-
-    def sample_training(
-        self,
-        feat: torch.Tensor,
-        num_steps: Optional[int] = None,
-        deterministic: bool = True,
-    ) -> torch.Tensor:
-        """Same schedule as ``sample()`` but gradient-preserving (BC on sampled actions)."""
-        if feat.ndim == 3:
-            flat_feat = feat.reshape(-1, feat.shape[-1])
-            original_shape = feat.shape[:-1]
-        elif feat.ndim == 2:
-            flat_feat = feat
-            original_shape = feat.shape[:-1]
-        else:
-            raise ValueError("feat must have shape [B, D] or [B, T, D].")
-
-        if deterministic:
-            x = torch.zeros(flat_feat.shape[0], self.action_dim, device=flat_feat.device)
-        else:
-            x = torch.randn(flat_feat.shape[0], self.action_dim, device=flat_feat.device)
-
-        steps = self.num_steps if num_steps is None else min(num_steps, self.num_steps)
-        start_t = self.num_steps - 1
-        stride = max(self.num_steps // steps, 1)
-        time_indices = list(range(start_t, -1, -stride))
-        if time_indices[-1] != 0:
-            time_indices.append(0)
-
-        for t_value in time_indices:
-            t = torch.full((x.shape[0],), t_value, device=x.device, dtype=torch.long)
-            pred_noise = self.forward(flat_feat, x, t)
-            x0 = self.predict_x0(x, t, pred_noise)
-            if t_value == 0:
-                x = x0
-                continue
-            alpha = self.alphas[t].view(-1, 1)
-            alpha_bar = self.alpha_bars[t].view(-1, 1)
-            beta = self.betas[t].view(-1, 1)
-            mean = (1.0 / torch.sqrt(alpha)) * (x - beta / torch.sqrt(1.0 - alpha_bar) * pred_noise)
-            if deterministic:
-                x = mean
-            else:
-                noise = torch.randn_like(x)
-                x = mean + torch.sqrt(beta) * noise
-
-        x = x.clamp(-1.0, 1.0)
-        return x.view(*original_shape, self.action_dim)
+        return x.view(*original_shape, self.action_horizon, self.action_dim)

@@ -9,10 +9,10 @@ from .config import ModelConfig
 
 
 class CrossAttentionFusion(nn.Module):
-    """Fuse visual tokens with text tokens and privileged teacher information.
+    """Fuse visual tokens with text tokens and a non-privileged null target token.
 
     The previous low-dimensional state input has been removed. Visual tokens are
-    queries; text tokens and privileged token are key/value context.
+    queries; text tokens and the null target token are key/value context.
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
@@ -21,6 +21,16 @@ class CrossAttentionFusion(nn.Module):
         self.image_proj = nn.Linear(cfg.image_encoder_dim, cfg.fusion_dim)
         self.text_proj = nn.Linear(cfg.text_width, cfg.fusion_dim)
         self.priv_proj = nn.Linear(cfg.fusion_dim, cfg.fusion_dim)
+        self.privileged_fusion_mode = str(getattr(cfg, "privileged_fusion_mode", "attention")).strip().lower()
+        if self.privileged_fusion_mode not in {"attention", "concat"}:
+            raise ValueError("cfg.privileged_fusion_mode must be 'attention' or 'concat'.")
+        self.concat_proj = nn.Sequential(
+            nn.LayerNorm(cfg.fusion_dim * 2),
+            nn.Linear(cfg.fusion_dim * 2, cfg.fusion_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.fusion_dim, cfg.fusion_dim),
+        )
 
         self.query_norm = nn.LayerNorm(cfg.fusion_dim)
         self.context_norm = nn.LayerNorm(cfg.fusion_dim)
@@ -54,7 +64,10 @@ class CrossAttentionFusion(nn.Module):
         queries = self.image_proj(image_tokens)
         txt = self.text_proj(text_tokens)
         priv = self.priv_proj(privileged_token).unsqueeze(1)
-        context = torch.cat([txt, priv], dim=1)
+        if self.privileged_fusion_mode == "attention":
+            context = torch.cat([txt, priv], dim=1)
+        else:
+            context = txt
 
         context_norm = self.context_norm(context)
         attn_out, _ = self.cross_attn(
@@ -67,4 +80,6 @@ class CrossAttentionFusion(nn.Module):
         fused_tokens = fused_tokens + self.ffn(self.ffn_norm(fused_tokens))
         fused_tokens = self.out_norm(fused_tokens)
         fused_embed = fused_tokens[:, 0]
+        if self.privileged_fusion_mode == "concat":
+            fused_embed = fused_embed + self.concat_proj(torch.cat([fused_embed, priv.squeeze(1)], dim=-1))
         return fused_embed, fused_tokens

@@ -23,8 +23,17 @@ from PIL import Image
 from scipy.spatial.transform import Rotation as R
 from torchvision import transforms
 
+from data.visual_guidance import make_attention_heatmap
 from model.config import ModelConfig
 from model.model import PrivilegedTeacherWorldModelDiT
+
+try:
+    from data.instruction_generator import EPISODE_INSTRUCTION
+except Exception:  # pragma: no cover
+    EPISODE_INSTRUCTION = (
+        "The target is the black UAV initially located near the image center. "
+        "Keep tracking the same UAV throughout the episode."
+    )
 
 try:
     from transformers import CLIPTokenizerFast
@@ -54,6 +63,17 @@ DEFAULT_MODEL_CFG = ModelConfig()
 # -----------------------------
 # Generic helpers
 # -----------------------------
+
+
+def _str2bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -253,7 +273,7 @@ def _load_instruction_series(dataset_dir: Path, uav_payload: Dict[str, Any]) -> 
                             out.append(item[k])
                             break
             if out:
-                return out
+                return [out[0]]
         frames = data.get("trajectory") or data.get("frames")
         if isinstance(frames, list):
             out = []
@@ -264,7 +284,7 @@ def _load_instruction_series(dataset_dir: Path, uav_payload: Dict[str, Any]) -> 
                 if isinstance(text, str):
                     out.append(text)
             if out:
-                return out
+                return [out[0]]
 
     frames = uav_payload.get("trajectory")
     if isinstance(frames, list):
@@ -275,8 +295,8 @@ def _load_instruction_series(dataset_dir: Path, uav_payload: Dict[str, Any]) -> 
                 if isinstance(text, str):
                     out.append(text)
         if out:
-            return out
-    return None
+            return [out[0]]
+    return [EPISODE_INSTRUCTION]
 
 
 def _load_target_trajectory(dataset_dir: Path, uav_frames: List[Dict[str, Any]]) -> np.ndarray:
@@ -453,6 +473,11 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
     field_names = {f.name for f in dataclasses.fields(ModelConfig)}
     raw_cfg = ckpt.get("cfg", {}) or {}
     cfg_kwargs = {k: v for k, v in raw_cfg.items() if k in field_names}
+    if "action_sequence_horizon" not in cfg_kwargs:
+        state = _strip_module_prefix(ckpt.get("model", {}) or {})
+        token = state.get("actor.action_token_embed")
+        if token is not None and getattr(token, "ndim", 0) == 3:
+            cfg_kwargs["action_sequence_horizon"] = max(int(token.shape[1]) // max(int(args.action_dim), 1), 1)
     cfg_kwargs.update(
         {
             "image_size": args.image_size,
@@ -468,6 +493,30 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
             "max_speed_norm": args.max_speed_norm,
         }
     )
+    if getattr(args, "use_diffusion_actor", None) is not None:
+        cfg_kwargs["use_diffusion_actor"] = bool(args.use_diffusion_actor)
+    if getattr(args, "privileged_fusion_mode", None) is not None:
+        cfg_kwargs["privileged_fusion_mode"] = str(args.privileged_fusion_mode)
+    if getattr(args, "dit_candidate_selection", None) is not None:
+        cfg_kwargs["dit_candidate_selection"] = bool(args.dit_candidate_selection)
+    if getattr(args, "dit_candidate_count", None) is not None:
+        cfg_kwargs["dit_candidate_count"] = int(args.dit_candidate_count)
+    if getattr(args, "dit_candidate_lateral_weight", None) is not None:
+        cfg_kwargs["dit_candidate_lateral_weight"] = float(args.dit_candidate_lateral_weight)
+    if getattr(args, "dit_candidate_vertical_weight", None) is not None:
+        cfg_kwargs["dit_candidate_vertical_weight"] = float(args.dit_candidate_vertical_weight)
+    if getattr(args, "dit_candidate_distance_weight", None) is not None:
+        cfg_kwargs["dit_candidate_distance_weight"] = float(args.dit_candidate_distance_weight)
+    if getattr(args, "dit_candidate_smooth_weight", None) is not None:
+        cfg_kwargs["dit_candidate_smooth_weight"] = float(args.dit_candidate_smooth_weight)
+    if getattr(args, "use_target_visual_guidance", None) is not None:
+        cfg_kwargs["use_target_visual_guidance"] = bool(args.use_target_visual_guidance)
+    if getattr(args, "use_attention_heatmap", None) is not None:
+        cfg_kwargs["use_attention_heatmap"] = bool(args.use_attention_heatmap)
+    if getattr(args, "visual_guidance_fov_deg", None) is not None:
+        cfg_kwargs["visual_guidance_fov_deg"] = float(args.visual_guidance_fov_deg)
+    if getattr(args, "attention_heatmap_sigma", None) is not None:
+        cfg_kwargs["attention_heatmap_sigma"] = float(args.attention_heatmap_sigma)
     if getattr(args, "force_direct_action", False):
         cfg_kwargs["use_diffusion_actor"] = False
     return ModelConfig(**cfg_kwargs)
@@ -493,6 +542,14 @@ def load_model(args: argparse.Namespace, device: torch.device) -> Tuple[Privileg
         print(f"[warn] unexpected keys when loading checkpoint: {unexpected}")
     model.eval()
     print(f"[model] loaded checkpoint: {ckpt_path}")
+    print(
+        f"[model] privileged_input=disabled, "
+        f"privileged_fusion_mode={cfg.privileged_fusion_mode}, "
+        f"use_diffusion_actor={cfg.use_diffusion_actor}, "
+        f"dit_candidate_selection={cfg.dit_candidate_selection}, "
+        f"dit_candidate_count={cfg.dit_candidate_count}, "
+        f"visual_guidance={cfg.use_target_visual_guidance}"
+    )
     return model, cfg
 
 
@@ -532,6 +589,60 @@ def _quat_to_airsim_quat(quat_xyzw: np.ndarray):
         z_val=float(quat_xyzw[2]),
         w_val=float(quat_xyzw[3]),
     )
+
+
+def _wxyz_quat_to_airsim_quat(quat_wxyz: Sequence[float]):
+    import airsim
+
+    return airsim.Quaternionr(
+        w_val=float(quat_wxyz[0]),
+        x_val=float(quat_wxyz[1]),
+        y_val=float(quat_wxyz[2]),
+        z_val=float(quat_wxyz[3]),
+    )
+
+
+def _yaw_to_airsim_quat(yaw_rad: float):
+    quat_xyzw = R.from_euler("xyz", [0.0, 0.0, float(yaw_rad)], degrees=False).as_quat()
+    return _quat_to_airsim_quat(quat_xyzw)
+
+
+def set_vehicle_pose_static(
+    executor,
+    position_airsim: np.ndarray,
+    quat,
+    retries: int = 3,
+    tol_xy: float = 0.3,
+    tol_z: float = 0.3,
+) -> Dict[str, Any]:
+    """Set UAV pose while paused without advancing physics frames."""
+    import airsim
+
+    pos = np.asarray(position_airsim, dtype=np.float32).reshape(3)
+    executor._safe_sim_pause(True)
+    last_state = None
+    for _ in range(int(retries)):
+        executor.client.simSetVehiclePose(
+            airsim.Pose(
+                airsim.Vector3r(float(pos[0]), float(pos[1]), float(pos[2])),
+                quat,
+            ),
+            ignore_collision=True,
+            vehicle_name=executor.uav_vehicle_name,
+        )
+        last_state = executor.get_uav_state()
+        actual = np.asarray(last_state["position"], dtype=np.float32)
+        err_xy = float(np.linalg.norm(actual[:2] - pos[:2]))
+        err_z = float(abs(actual[2] - pos[2]))
+        if err_xy <= float(tol_xy) and err_z <= float(tol_z):
+            return last_state
+    if last_state is not None:
+        actual = np.asarray(last_state["position"], dtype=np.float32)
+        raise RuntimeError(
+            f"static pose set failed: target=({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f}), "
+            f"actual=({actual[0]:.2f},{actual[1]:.2f},{actual[2]:.2f})"
+        )
+    raise RuntimeError("static pose set failed: no UAV state returned")
 
 
 def _get_yaw_from_state(uav_state: Dict[str, Any]) -> float:
@@ -619,7 +730,11 @@ def apply_action_by_pose(
     rot = R.from_quat([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
 
     action = np.asarray(action_physical, dtype=np.float32).copy()
-    body_ned = np.asarray([action[0], action[1], -action[2]], dtype=np.float32)
+    # The dataset action z comes from TrajectoryExecutor._world_to_body_frame(),
+    # which already uses AirSim's body-frame z sign after its saved-coordinate
+    # conversion. Execute it directly here; flipping it again makes vertical
+    # tracking diverge.
+    body_ned = np.asarray([action[0], action[1], action[2]], dtype=np.float32)
     step_norm = float(np.linalg.norm(body_ned) * dt)
     if max_step_norm > 0 and step_norm > max_step_norm:
         body_ned *= float(max_step_norm / max(step_norm, 1e-6))
@@ -633,35 +748,25 @@ def apply_action_by_pose(
     new_quat_xyzw = new_rot.as_quat()
 
     quat = _quat_to_airsim_quat(new_quat_xyzw)
-    ok, verify_pos, pos_error, err_xy, err_z = executor._set_vehicle_pose_paused(
-        float(new_pos[0]),
-        float(new_pos[1]),
-        float(new_pos[2]),
+    return set_vehicle_pose_static(
+        executor,
+        new_pos,
         quat,
         retries=3,
         tol_xy=0.8,
         tol_z=0.8,
     )
-    if not ok:
-        raise RuntimeError(
-            f"pose action failed: target=({new_pos[0]:.2f},{new_pos[1]:.2f},{new_pos[2]:.2f}), "
-            f"actual=({verify_pos[0]:.2f},{verify_pos[1]:.2f},{verify_pos[2]:.2f}), "
-            f"err={pos_error:.2f}m xy={err_xy:.2f} z={err_z:.2f}"
-        )
-    executor._step_if_needed(1)
-    return executor.get_uav_state()
 
 
 def apply_action_by_velocity(executor, action_physical: np.ndarray, dt: float) -> Dict[str, Any]:
     import airsim
 
     action = np.asarray(action_physical, dtype=np.float32)
-    # AirSim body-frame z is down, while the model/data action z is up.
     executor._safe_sim_pause(False)
     executor.client.moveByVelocityBodyFrameAsync(
         float(action[0]),
         float(action[1]),
-        float(-action[2]),
+        float(action[2]),
         float(dt),
         yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=float(action[3])),
         vehicle_name=executor.uav_vehicle_name,
@@ -935,6 +1040,18 @@ def run_online_trajectory(
     except Exception:
         pass
     executor._ensure_uav_flying_state()
+    init_yaw = math.atan2(
+        float(traj.target_traj_airsim[0][1] - traj.uav_start_airsim[1]),
+        float(traj.target_traj_airsim[0][0] - traj.uav_start_airsim[0]),
+    )
+    set_vehicle_pose_static(
+        executor,
+        traj.uav_start_airsim,
+        _yaw_to_airsim_quat(init_yaw),
+        retries=3,
+        tol_xy=0.8,
+        tol_z=0.8,
+    )
 
     num_steps = traj.num_frames if args.max_steps <= 0 else min(traj.num_frames, args.max_steps)
     rssm_state = None
@@ -951,6 +1068,7 @@ def run_online_trajectory(
     action_abs_err: List[float] = []
     action_mse: List[float] = []
     prev_uav_after_pos: Optional[np.ndarray] = None
+    prev_uav_after_state: Optional[Dict[str, Any]] = None
 
     iterator: Iterable[int] = range(num_steps)
     if tqdm is not None:
@@ -974,6 +1092,26 @@ def run_online_trajectory(
                 except Exception:
                     pass
         executor._step_if_needed(1)
+
+        # In pose-control evaluation, target/jammer scene stepping can let the
+        # multirotor physics update the UAV before we apply the next action.
+        # Keep the UAV exactly at the previous controlled pose so expert replay
+        # is a check of action/coordinate consistency, not free-fall dynamics.
+        if (
+            args.control_mode == "pose"
+            and args.hold_uav_pose_during_scene_step
+            and prev_uav_after_state is not None
+        ):
+            prev_pos = np.asarray(prev_uav_after_state["position"], dtype=np.float32)
+            prev_quat = _wxyz_quat_to_airsim_quat(prev_uav_after_state["orientation"])
+            set_vehicle_pose_static(
+                executor,
+                prev_pos,
+                prev_quat,
+                retries=1,
+                tol_xy=0.8,
+                tol_z=0.8,
+            )
 
         uav_state_before = executor.get_uav_state()
         uav_before_pos = np.asarray(uav_state_before["position"], dtype=np.float32)
@@ -1017,7 +1155,9 @@ def run_online_trajectory(
         if t + 1 < num_steps:
             next_rel_body = compute_target_relative_body(executor, uav_state_before, traj.target_traj_airsim[t + 1])
 
-        if traj.saved_instructions and t < len(traj.saved_instructions):
+        if getattr(args, "force_live_instruction", False):
+            instruction = instruction_from_relative(rel_body, next_rel_body)
+        elif traj.saved_instructions and t < len(traj.saved_instructions):
             instruction = traj.saved_instructions[t]
         elif traj.saved_instructions and len(traj.saved_instructions) == 1:
             instruction = traj.saved_instructions[0]
@@ -1030,25 +1170,47 @@ def run_online_trajectory(
         if args.save_rgb:
             save_rgb(rgb_out_dir / f"frame_{t:05d}.png", rgb_img)
 
-        image_t = rgb_to_model_tensor(rgb_img, transform, device)
-        text_tokens, attention_mask = tokenize_instruction(tokenizer, instruction, cfg.text_context_length, device)
-        privileged_np = rel_body / max(float(args.privileged_scale), 1e-6)
-        privileged_t = torch.from_numpy(privileged_np.astype(np.float32)).view(1, -1).to(device)
+        expert_action = traj.expert_action_physical[t] if t < len(traj.expert_action_physical) else None
+        expert_action_norm = None
+        action_source = "model"
 
-        pred, rssm_state = model.act(
-            image=image_t,
-            text_tokens=text_tokens,
-            privileged=privileged_t,
-            prev_action=prev_action,
-            rssm_state=rssm_state,
-            attention_mask=attention_mask,
-            prev_done=prev_done,
-            deterministic=args.deterministic_action,
-            num_steps=args.sampling_steps,
-        )
-        action_norm = pred["action_norm"].detach().float().view(-1).cpu().numpy().astype(np.float32)
-        action_physical = pred["action_physical"].detach().float().view(-1).cpu().numpy().astype(np.float32)
-        pred_reward = float(pred["reward"].detach().float().view(-1)[0].cpu()) if "reward" in pred else None
+        if args.replay_expert_action:
+            if expert_action is None:
+                break
+            expert_action_norm = physical_action_to_norm(expert_action, cfg.max_vel, cfg.max_yaw_rate)
+            action_norm = expert_action_norm.astype(np.float32)
+            action_physical = np.asarray(expert_action, dtype=np.float32)
+            action_source = "expert"
+        else:
+            image_t = rgb_to_model_tensor(rgb_img, transform, device)
+            text_tokens, attention_mask = tokenize_instruction(tokenizer, instruction, cfg.text_context_length, device)
+            privileged_np = rel_body / max(float(args.privileged_scale), 1e-6)
+            privileged_t = torch.from_numpy(privileged_np.astype(np.float32)).view(1, -1).to(device)
+            attention_heatmap_t = None
+            if cfg.use_target_visual_guidance:
+                raw_privileged_t = torch.from_numpy(rel_body.astype(np.float32)).view(1, -1).to(device)
+                if cfg.use_attention_heatmap:
+                    attention_heatmap_t = make_attention_heatmap(
+                        raw_privileged_t,
+                        image_hw=(image_t.shape[-2], image_t.shape[-1]),
+                        fov_deg=cfg.visual_guidance_fov_deg,
+                        sigma=cfg.attention_heatmap_sigma,
+                    )
+
+            pred, rssm_state = model.act(
+                image=image_t,
+                text_tokens=text_tokens,
+                privileged=privileged_t,
+                prev_action=prev_action,
+                rssm_state=rssm_state,
+                attention_mask=attention_mask,
+                attention_heatmap=attention_heatmap_t,
+                prev_done=prev_done,
+                deterministic=args.deterministic_action,
+                num_steps=args.sampling_steps,
+            )
+            action_norm = pred["action_norm"].detach().float().view(-1).cpu().numpy().astype(np.float32)
+            action_physical = pred["action_physical"].detach().float().view(-1).cpu().numpy().astype(np.float32)
 
         if args.control_mode == "velocity":
             uav_state_after = apply_action_by_velocity(executor, action_physical, args.dt)
@@ -1073,11 +1235,12 @@ def run_online_trajectory(
         )
         collision_now = bool(collision_before_action or collision_after_action)
         collision = bool(collision or collision_now)
+        close_enough = bool(distance <= float(args.capture_distance))
+        effectively_tracked = bool(close_enough and visible and not collision_now)
 
-        expert_action = traj.expert_action_physical[t] if t < len(traj.expert_action_physical) else None
-        expert_action_norm = None
         if expert_action is not None:
-            expert_action_norm = physical_action_to_norm(expert_action, cfg.max_vel, cfg.max_yaw_rate)
+            if expert_action_norm is None:
+                expert_action_norm = physical_action_to_norm(expert_action, cfg.max_vel, cfg.max_yaw_rate)
             diff = action_physical - expert_action
             action_abs_err.append(float(np.mean(np.abs(diff))))
             action_mse.append(float(np.mean(diff ** 2)))
@@ -1096,11 +1259,13 @@ def run_online_trajectory(
             "relative_target_body_after": post_rel_body.astype(float).tolist(),
             "distance_after": distance,
             "visible_by_geometry": bool(visible),
+            "close_enough": bool(close_enough),
+            "effectively_tracked": bool(effectively_tracked),
+            "action_source": action_source,
             "action_norm": action_norm.astype(float).tolist(),
             "action_physical": action_physical.astype(float).tolist(),
             "expert_action_physical": None if expert_action is None else expert_action.astype(float).tolist(),
             "expert_action_norm": None if expert_action_norm is None else expert_action_norm.astype(float).tolist(),
-            "pred_reward": pred_reward,
             "collision": bool(collision_now),
             "collision_before_action": bool(collision_before_action),
             "collision_after_action": bool(collision_after_action),
@@ -1128,21 +1293,64 @@ def run_online_trajectory(
             )
             iterator.set_postfix(
                 dist=f"{distance:.2f}",
-                pred=pred_act,
+                action=pred_act,
+                src=action_source,
                 expert=expert_act,
             )
 
         prev_uav_after_pos = np.asarray(uav_state_after["position"], dtype=np.float32).copy()
+        prev_uav_after_state = {
+            "position": np.asarray(uav_state_after["position"], dtype=np.float32).copy(),
+            "orientation": np.asarray(uav_state_after["orientation"], dtype=np.float32).copy(),
+        }
 
         if collision_now and args.stop_on_collision:
             break
 
-    # Success criterion: only the final frame counts.
-    # Success means: final target is within capture_distance and visible.
+    effective_flags = [bool(s.get("effectively_tracked", False)) for s in steps]
+    close_flags = [bool(s.get("close_enough", False)) for s in steps]
+    visible_flags = [bool(s.get("visible_by_geometry", False)) for s in steps]
+    collision_flags = [bool(s.get("collision", False)) for s in steps]
+
+    tracked_frames_before_failure = 0
+    for step in steps:
+        if bool(step.get("collision", False)):
+            break
+        if not bool(step.get("close_enough", False)):
+            break
+        if not bool(step.get("visible_by_geometry", False)):
+            break
+        tracked_frames_before_failure += 1
+
+    failure_step = None
+    failure_reason = None
+    for idx, step in enumerate(steps):
+        if bool(step.get("collision", False)):
+            failure_step = idx
+            failure_reason = "collision"
+            break
+        if not bool(step.get("close_enough", False)):
+            failure_step = idx
+            failure_reason = "out_of_capture_distance"
+            break
+        if args.require_visibility_for_success and not bool(step.get("visible_by_geometry", False)):
+            failure_step = idx
+            failure_reason = "target_not_visible"
+            break
+
+    if steps and failure_step is None:
+        failure_reason = "none"
+
+    # Success criterion: only the final frame counts, and any collision fails.
+    # Visibility is included only when explicitly requested.
     final_distance = float(distances[-1]) if distances else float("inf")
     final_visible = bool(steps[-1].get("visible_by_geometry", False)) if steps else False
-    success = bool(final_distance <= float(args.capture_distance) and final_visible)
+    final_close = bool(final_distance <= float(args.capture_distance))
+    success = bool((not collision) and final_close and ((not args.require_visibility_for_success) or final_visible))
     success_step = (len(steps) - 1) if (success and steps) else None
+    success_criterion = "no collision and final_distance <= capture_distance"
+    if args.require_visibility_for_success:
+        success_criterion += " and final_visible_by_geometry"
 
     summary = {
         "scene_id": traj.scene_id,
@@ -1152,9 +1360,21 @@ def run_online_trajectory(
         "success": bool(success),
         "success_step": success_step,
         "collision": bool(collision),
+        "failure_step": failure_step,
+        "failure_reason": failure_reason,
+        "tracked_frames_before_failure": int(tracked_frames_before_failure),
+        "tracked_frame_ratio_before_failure": float(tracked_frames_before_failure / max(len(steps), 1)),
+        "consecutive_tracked_frames_before_failure": int(tracked_frames_before_failure),
+        "consecutive_tracked_frame_ratio_before_failure": float(tracked_frames_before_failure / max(len(steps), 1)),
+        "effective_tracked_frames": int(sum(1 for x in effective_flags if x)),
+        "effective_tracking_ratio": float(np.mean(effective_flags)) if effective_flags else None,
+        "close_frame_ratio": float(np.mean(close_flags)) if close_flags else None,
+        "visible_frame_ratio": float(np.mean(visible_flags)) if visible_flags else None,
+        "collision_frame_ratio": float(np.mean(collision_flags)) if collision_flags else None,
         "final_distance": final_distance if distances else None,
+        "final_close_enough": bool(final_close),
         "final_visible_by_geometry": bool(final_visible),
-        "success_criterion": "final_distance <= capture_distance and final_visible_by_geometry",
+        "success_criterion": success_criterion,
         "min_distance": float(min_distance) if distances else None,
         "mean_distance": float(np.mean(distances)) if distances else None,
         "visible_ratio_geometry": float(visible_count / max(len(steps), 1)),
@@ -1163,6 +1383,8 @@ def run_online_trajectory(
         "target_asset_name": getattr(executor, "target_asset_name", None),
         "jammer_asset_names": getattr(executor, "_jammer_asset_names_by_id", {}),
         "control_mode": args.control_mode,
+        "replay_expert_action": bool(args.replay_expert_action),
+        "hold_uav_pose_during_scene_step": bool(args.hold_uav_pose_during_scene_step),
         "capture_distance": args.capture_distance,
         "require_visibility_for_success": args.require_visibility_for_success,
     }
@@ -1303,6 +1525,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--privileged-scale", type=float, default=1.0, help="Use 1.0 if training used raw target_position_in_body_frame; set 100.0 only if your builder normalized by 100.")
     parser.add_argument("--action-dim", type=int, default=4)
     parser.add_argument("--sampling-steps", type=int, default=20)
+    parser.add_argument("--dit-candidate-selection", type=_str2bool, default=None)
+    parser.add_argument("--dit-candidate-count", type=int, default=None)
+    parser.add_argument("--dit-candidate-lateral-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-vertical-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-distance-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-smooth-weight", type=float, default=None)
+    parser.add_argument("--use-target-visual-guidance", type=_str2bool, default=None)
+    parser.add_argument("--use-attention-heatmap", type=_str2bool, default=None)
+    parser.add_argument("--visual-guidance-fov-deg", type=float, default=None)
+    parser.add_argument("--attention-heatmap-sigma", type=float, default=None)
     parser.add_argument("--max-vel", type=float, default=DEFAULT_MODEL_CFG.max_vel)
     parser.add_argument("--max-yaw-rate", type=float, default=DEFAULT_MODEL_CFG.max_yaw_rate)
     parser.add_argument("--max-speed-norm", type=float, default=DEFAULT_MODEL_CFG.max_speed_norm)
@@ -1312,6 +1544,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--finetune-clip-text", action="store_false", dest="freeze_clip_text")
     parser.add_argument("--deterministic-action", action="store_true", default=True)
     parser.add_argument("--stochastic-action", action="store_false", dest="deterministic_action")
+    parser.add_argument(
+        "--use-diffusion-actor",
+        type=_str2bool,
+        default=None,
+        help="true/false: override cfg.use_diffusion_actor from checkpoint. By default, use checkpoint cfg.",
+    )
+    parser.add_argument(
+        "--privileged-fusion-mode",
+        type=str,
+        default=None,
+        choices=["attention", "concat"],
+        help="Override cfg.privileged_fusion_mode from checkpoint. By default, use checkpoint cfg.",
+    )
 
     # AirSim / executor config
     parser.add_argument("--sim-server-host", type=str, default="127.0.0.1")
@@ -1334,8 +1579,12 @@ def parse_args() -> argparse.Namespace:
 
     # Online rollout config
     parser.add_argument("--control-mode", type=str, default="pose", choices=["pose", "velocity"])
+    parser.add_argument("--replay-expert-action", action="store_true", default=False, help="Sanity-check mode: execute dataset expert actions instead of model actions.")
+    parser.add_argument("--hold-uav-pose-during-scene-step", action="store_true", default=True, help="In pose control, keep UAV fixed while stepping target/jammer scene updates.")
+    parser.add_argument("--no-hold-uav-pose-during-scene-step", action="store_false", dest="hold_uav_pose_during_scene_step")
     parser.add_argument("--dt", type=float, default=1.0)
     parser.add_argument("--max-step-norm", type=float, default=1.0, help="Safety clamp for one pose-control step. <=0 disables clamp.")
+    parser.add_argument("--force-live-instruction", action="store_true", default=False, help="Generate instruction from current online relative target state instead of replaying saved dataset text.")
     parser.add_argument("--capture-distance", type=float, default=10.0)
     parser.add_argument("--require-visibility-for-success", action="store_true", default=False)
     parser.add_argument("--fov-deg", type=float, default=90.0)
@@ -1435,12 +1684,70 @@ def main() -> None:
         collision_values = [1.0 if s.get("collision") else 0.0 for s in all_summaries]
         min_distances = [float(s["min_distance"]) for s in all_summaries if s.get("min_distance") is not None]
         final_distances = [float(s["final_distance"]) for s in all_summaries if s.get("final_distance") is not None]
+        mean_distances = [float(s["mean_distance"]) for s in all_summaries if s.get("mean_distance") is not None]
+        effective_frames = [
+            float(s["effective_tracked_frames"])
+            for s in all_summaries
+            if s.get("effective_tracked_frames") is not None
+        ]
+        effective_tracking_ratios = [
+            float(s["effective_tracking_ratio"])
+            for s in all_summaries
+            if s.get("effective_tracking_ratio") is not None
+        ]
+        consecutive_frames = [
+            float(s["consecutive_tracked_frames_before_failure"])
+            for s in all_summaries
+            if s.get("consecutive_tracked_frames_before_failure") is not None
+        ]
+        consecutive_frame_ratios = [
+            float(s["consecutive_tracked_frame_ratio_before_failure"])
+            for s in all_summaries
+            if s.get("consecutive_tracked_frame_ratio_before_failure") is not None
+        ]
+        close_frame_ratios = [
+            float(s["close_frame_ratio"])
+            for s in all_summaries
+            if s.get("close_frame_ratio") is not None
+        ]
+        visible_frame_ratios = [
+            float(s["visible_frame_ratio"])
+            for s in all_summaries
+            if s.get("visible_frame_ratio") is not None
+        ]
+        collision_frame_ratios = [
+            float(s["collision_frame_ratio"])
+            for s in all_summaries
+            if s.get("collision_frame_ratio") is not None
+        ]
+        final_close_values = [1.0 if s.get("final_close_enough") else 0.0 for s in all_summaries]
+        final_visible_values = [1.0 if s.get("final_visible_by_geometry") else 0.0 for s in all_summaries]
+        failure_reasons: Dict[str, int] = {}
+        for summary in all_summaries:
+            reason = str(summary.get("failure_reason") or "unknown")
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
         agg = {
             "num_trajectories": len(all_summaries),
+            "SR": float(np.mean(success_values)) if success_values else None,
             "success_rate": float(np.mean(success_values)) if success_values else None,
+            "ATF": float(np.mean(effective_frames)) if effective_frames else None,
+            "average_tracked_frames": float(np.mean(effective_frames)) if effective_frames else None,
+            "average_tracked_frame_ratio": float(np.mean(effective_tracking_ratios)) if effective_tracking_ratios else None,
+            "CTF": float(np.mean(consecutive_frames)) if consecutive_frames else None,
+            "consecutive_tracked_frames": float(np.mean(consecutive_frames)) if consecutive_frames else None,
+            "average_consecutive_tracked_frame_ratio_before_failure": float(np.mean(consecutive_frame_ratios)) if consecutive_frame_ratios else None,
+            "average_effective_tracked_frames": float(np.mean(effective_frames)) if effective_frames else None,
+            "mean_effective_tracking_ratio": float(np.mean(effective_tracking_ratios)) if effective_tracking_ratios else None,
+            "mean_close_frame_ratio": float(np.mean(close_frame_ratios)) if close_frame_ratios else None,
+            "mean_visible_frame_ratio": float(np.mean(visible_frame_ratios)) if visible_frame_ratios else None,
+            "mean_collision_frame_ratio": float(np.mean(collision_frame_ratios)) if collision_frame_ratios else None,
+            "final_close_rate": float(np.mean(final_close_values)) if final_close_values else None,
+            "final_visible_rate": float(np.mean(final_visible_values)) if final_visible_values else None,
             "collision_rate": float(np.mean(collision_values)) if collision_values else None,
+            "failure_reason_counts": failure_reasons,
             "mean_min_distance": float(np.mean(min_distances)) if min_distances else None,
             "mean_final_distance": float(np.mean(final_distances)) if final_distances else None,
+            "mean_distance": float(np.mean(mean_distances)) if mean_distances else None,
             "args": vars(args),
             "summaries": all_summaries,
         }

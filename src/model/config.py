@@ -27,6 +27,15 @@ class ModelConfig:
     privileged_dim: int = 3
     action_dim: int = 4
     privileged_hidden_dim: int = 128
+    privileged_fusion_mode: str = "attention"  # attention | concat
+
+    # Optional visual target guidance:
+    # - global image remains unchanged
+    # - attention heatmap adds a target-location token to visual tokens
+    use_target_visual_guidance: bool = False
+    use_attention_heatmap: bool = True
+    visual_guidance_fov_deg: float = 90.0
+    attention_heatmap_sigma: float = 0.08
 
     # Fusion
     fusion_dim: int = 512
@@ -49,40 +58,45 @@ class ModelConfig:
     action_dit_hidden_dim: int = 256
     action_dit_depth: int = 4
     action_dit_heads: int = 8
+    # DiT actor predicts a short normalized action sequence [H, action_dim].
+    # Online control executes only the first action and replans every frame.
+    action_sequence_horizon: int = 3
     action_diffusion_steps: int = 20
     action_sampling_steps: int = 20
+    # Optional DiT inference-time candidate selection. When enabled, sample N
+    # action sequences, rollout RSSM with each sequence, and execute the first
+    # action from the lowest-score sequence.
+    dit_candidate_selection: bool = False
+    dit_candidate_count: int = 4
+    dit_candidate_lateral_weight: float = 1.0
+    dit_candidate_vertical_weight: float = 1.0
+    dit_candidate_distance_weight: float = 0.05
+    dit_candidate_smooth_weight: float = 0.05
     action_loss_weight: float = 1.0
     # MSE over action dims: yaw (norm space, index 3 when action_dim=4) vs vx,vy,vz.
     action_yaw_loss_weight: float = 5.0
     max_vel: float = 1.0
-    max_yaw_rate: float = 45.0
+    max_yaw_rate: float = 15.0
     max_speed_norm: float = 1.0
 
     # Loss weights
     kl_weight: float = 0.05
 
-    # KL warmup：从 kl_warmup_start * kl_weight 线性升到 kl_weight
-    # 设为 0 表示不使用 warmup，直接使用 kl_weight
-    kl_warmup_steps: int = 10000
-    kl_warmup_start: float = 0.0
-
-    reward_weight: float = 1.0
     done_weight: float = 1.0
 
-    # Additional prior auxiliary loss. This forces the action-conditioned prior
-    # to predict task variables, instead of relying only on posterior features.
-    prior_loss_weight: float = 0.5
-
-    # ----- Curriculum（train_teacher 通常只用 train_reward_aux + use_diffusion_actor 两档）-----
+    # ----- Curriculum / WAM auxiliaries -----
     # train_kl 在方案 A 起即开启（与直连/特权重建一起约束 RSSM）；也可用 checkpoint 覆盖。
     use_diffusion_actor: bool = True
     train_kl: bool = True
-    train_reward_aux: bool = True
-    train_privileged_recon: bool = True
     train_direct_action: bool = True
+    train_next_privileged: bool = False
+    train_rollout: bool = False
 
     direct_action_loss_weight: float = 1.0
-    privileged_recon_loss_weight: float = 1.0
+    next_privileged_loss_weight: float = 1.0
+    prior_privileged_loss_weight: float = 0.2
+    rollout_loss_weight: float = 0.2
+    rollout_horizon: int = 3
     # x0 loss: MSE between one-step predicted clean action and expert (only when use_diffusion_actor).
     x0_action_loss_weight: float = 1.0
 
