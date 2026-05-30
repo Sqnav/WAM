@@ -18,10 +18,10 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from data.teacher_dataset_builder import build_records
-from model.config import ModelConfig
+from model.config import ModelConfig, migrate_legacy_config
 from model.action_loss_utils import weighted_mean_action_squared_error
 from model.losses import summarize_losses, world_model_dit_loss
-from model.model import PrivilegedTeacherWorldModelDiT
+from model.model import TeacherWorldModelDiT, migrate_legacy_state_dict_keys
 from train.train_teacher import TrajectoryDataset, collate_fn, move_batch_to_device
 
 try:
@@ -67,6 +67,14 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+def _trainable_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    """Checkpoint only trainable params to avoid repeatedly writing frozen encoders."""
+    unwrapped = _unwrap_model(model)
+    trainable_names = {name for name, param in unwrapped.named_parameters() if param.requires_grad}
+    state = unwrapped.state_dict()
+    return {name: tensor for name, tensor in state.items() if name in trainable_names}
+
+
 def _reduce_metrics(metrics: Dict[str, float], device: torch.device, use_ddp: bool) -> Dict[str, float]:
     if not use_ddp or not metrics:
         return metrics
@@ -86,9 +94,8 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
         "dit_noise_distill",
         "sup_action",
         "sup_kl",
-        "sup_privileged",
-        "sup_prior_privileged",
-        "sup_rollout_privileged",
+        "sup_next_target_relative",
+        "sup_prior_next_target_relative",
     ]
     parts = []
     for key in order:
@@ -127,7 +134,8 @@ def _load_checkpoint_cfg(ckpt_path: str) -> Dict[str, Any]:
 
 def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] = None) -> ModelConfig:
     valid_fields = {f.name for f in fields(ModelConfig)}
-    cfg_kwargs = {k: v for k, v in (checkpoint_cfg or {}).items() if k in valid_fields}
+    checkpoint_cfg = migrate_legacy_config(checkpoint_cfg or {})
+    cfg_kwargs = {k: v for k, v in checkpoint_cfg.items() if k in valid_fields}
 
     # Runtime/path arguments stay script-controlled, while WAM switches and loss
     # weights are inherited from the teacher checkpoint by default.
@@ -137,7 +145,7 @@ def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] 
         dinov2_freeze=args.freeze_dinov2,
         clip_text_model_name=args.clip_text_model_name,
         clip_text_freeze=args.freeze_clip_text,
-        privileged_dim=args.privileged_dim,
+        target_relative_dim=args.target_relative_dim,
         action_dim=args.action_dim,
         action_diffusion_steps=args.diffusion_steps,
         action_sampling_steps=args.sampling_steps,
@@ -145,8 +153,8 @@ def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] 
         max_yaw_rate=args.max_yaw_rate,
         max_speed_norm=args.max_speed_norm,
     )
-    if args.privileged_fusion_mode is not None:
-        cfg_kwargs["privileged_fusion_mode"] = str(args.privileged_fusion_mode)
+    if args.target_token_fusion_mode is not None:
+        cfg_kwargs["target_token_fusion_mode"] = str(args.target_token_fusion_mode)
     if args.action_sequence_horizon is not None:
         cfg_kwargs["action_sequence_horizon"] = int(args.action_sequence_horizon)
     if args.use_target_visual_guidance is not None:
@@ -163,6 +171,7 @@ def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] 
 def load_model_state(model: torch.nn.Module, ckpt_path: str, strict: bool = True) -> Dict[str, Any]:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    state = migrate_legacy_state_dict_keys(state)
     missing, unexpected = model.load_state_dict(state, strict=strict)
     if (missing or unexpected) and strict:
         raise RuntimeError(f"Checkpoint load mismatch. missing={missing}, unexpected={unexpected}")
@@ -196,27 +205,14 @@ def masked_mse_lastdim(x: torch.Tensor, y: torch.Tensor, valid_mask: Optional[to
     return (per_item * mask).sum() / mask.sum().clamp(min=1.0)
 
 
-def dit_noise_distillation_loss(
-    student_model: PrivilegedTeacherWorldModelDiT,
-    teacher_model: PrivilegedTeacherWorldModelDiT,
-    student_feat: torch.Tensor,
-    teacher_feat: torch.Tensor,
+def _make_action_sequence_target(
     expert_action: torch.Tensor,
-    valid_mask: Optional[torch.Tensor],
-    cfg: ModelConfig,
+    horizon: int,
+    action_dim: int,
 ) -> torch.Tensor:
-    """Distill the DiT action head at the noise-prediction level.
-
-    We use the same noisy action x_t and diffusion timestep for teacher and student.
-    This is better than comparing sampled actions because the current sample()
-    method is inference-only and decorated with torch.no_grad().
-    """
     if expert_action.ndim != 3:
         raise ValueError("expert_action must have shape [B, T, A].")
     batch, seq_len, action_dim = expert_action.shape
-    device = expert_action.device
-    horizon = max(int(getattr(cfg, "action_sequence_horizon", 1)), 1)
-
     if horizon > 1:
         seq_targets = []
         for k in range(horizon):
@@ -227,6 +223,43 @@ def dit_noise_distillation_loss(
                 )
             )
         expert_action = torch.stack(seq_targets, dim=2).reshape(batch, seq_len, horizon * action_dim)
+    return expert_action
+
+
+def _weighted_flat_action_sequence_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: ModelConfig,
+) -> torch.Tensor:
+    action_dim = int(getattr(cfg, "action_dim", pred.shape[-1]))
+    if pred.shape[-1] % action_dim != 0:
+        return (pred.float() - target.float()).pow(2).mean(dim=-1)
+    horizon = pred.shape[-1] // action_dim
+    pred_seq = pred.reshape(pred.shape[0], horizon, action_dim)
+    tgt_seq = target.reshape(target.shape[0], horizon, action_dim)
+    return weighted_mean_action_squared_error(pred_seq, tgt_seq, cfg).mean(dim=-1)
+
+
+def dit_denoising_distillation_losses(
+    student_model: TeacherWorldModelDiT,
+    teacher_model: TeacherWorldModelDiT,
+    student_feat: torch.Tensor,
+    teacher_feat: torch.Tensor,
+    expert_action: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+    cfg: ModelConfig,
+) -> Dict[str, torch.Tensor]:
+    """Distill DiT with shared noisy action and timestep.
+
+    Teacher and student see exactly the same ``x_t`` and ``t``. We expose two
+    aligned losses: predicted noise and reconstructed clean action sequence x0.
+    """
+    if expert_action.ndim != 3:
+        raise ValueError("expert_action must have shape [B, T, A].")
+    batch, seq_len, action_dim = expert_action.shape
+    device = expert_action.device
+    horizon = max(int(getattr(cfg, "action_sequence_horizon", 1)), 1)
+    expert_action = _make_action_sequence_target(expert_action, horizon, action_dim)
 
     flat_action = expert_action.reshape(batch * seq_len, -1)
     flat_student_feat = student_feat.reshape(batch * seq_len, student_feat.size(-1))
@@ -246,11 +279,22 @@ def dit_noise_distillation_loss(
     student_pred_noise = actor_s(flat_student_feat, xt, t)
     with torch.no_grad():
         teacher_pred_noise = actor_t(flat_teacher_feat, xt, t)
+        teacher_x0 = actor_t.predict_x0(xt, t, teacher_pred_noise)
 
-    per_item = weighted_mean_action_squared_error(student_pred_noise, teacher_pred_noise, cfg)
+    student_x0 = actor_s.predict_x0(xt, t, student_pred_noise)
+
+    noise_per_item = _weighted_flat_action_sequence_mse(student_pred_noise, teacher_pred_noise, cfg)
+    x0_per_item = _weighted_flat_action_sequence_mse(student_x0, teacher_x0, cfg)
     if flat_mask is None:
-        return per_item.mean()
-    return (per_item * flat_mask).sum() / flat_mask.sum().clamp(min=1.0)
+        return {
+            "noise": noise_per_item.mean(),
+            "x0": x0_per_item.mean(),
+        }
+    denom = flat_mask.sum().clamp(min=1.0)
+    return {
+        "noise": (noise_per_item * flat_mask).sum() / denom,
+        "x0": (x0_per_item * flat_mask).sum() / denom,
+    }
 
 
 def action_distillation_loss(
@@ -259,10 +303,13 @@ def action_distillation_loss(
     valid_mask: Optional[torch.Tensor],
     cfg: ModelConfig,
 ) -> torch.Tensor:
-    student_action = student_out.get("policy_action_sequence")
-    teacher_action = teacher_out.get("policy_action_sequence")
     device = next(iter(student_out["posts"].values())).device
     dtype = next(iter(student_out["posts"].values())).dtype
+    if bool(getattr(cfg, "use_diffusion_actor", False)):
+        return torch.zeros((), device=device, dtype=dtype)
+
+    student_action = student_out.get("policy_action_sequence")
+    teacher_action = teacher_out.get("policy_action_sequence")
     if student_action is not None and teacher_action is not None:
         with torch.no_grad():
             target = teacher_action.detach()
@@ -286,8 +333,8 @@ def action_distillation_loss(
 def self_distill_losses(
     student_out: Dict[str, torch.Tensor],
     teacher_out: Dict[str, torch.Tensor],
-    student_model: PrivilegedTeacherWorldModelDiT,
-    teacher_model: PrivilegedTeacherWorldModelDiT,
+    student_model: TeacherWorldModelDiT,
+    teacher_model: TeacherWorldModelDiT,
     batch: Dict[str, Any],
     cfg: ModelConfig,
     args: argparse.Namespace,
@@ -303,9 +350,9 @@ def self_distill_losses(
 
     feat_loss = masked_mse_lastdim(student_belief, teacher_belief, valid_mask)
     action_loss = action_distillation_loss(student_out, teacher_out, valid_mask, cfg)
-
-    if args.dit_noise_distill_weight > 0.0 and cfg.use_diffusion_actor:
-        dit_loss = dit_noise_distillation_loss(
+    dit_loss = torch.zeros((), device=feat_loss.device, dtype=feat_loss.dtype)
+    if cfg.use_diffusion_actor and (args.dit_noise_distill_weight > 0.0 or args.action_distill_weight > 0.0):
+        dit_losses = dit_denoising_distillation_losses(
             student_model=student_model,
             teacher_model=teacher_model,
             student_feat=student_belief,
@@ -314,8 +361,8 @@ def self_distill_losses(
             valid_mask=valid_mask,
             cfg=cfg,
         )
-    else:
-        dit_loss = torch.zeros((), device=feat_loss.device, dtype=feat_loss.dtype)
+        dit_loss = dit_losses["noise"]
+        action_loss = dit_losses["x0"]
 
     total = (
         args.sup_weight * sup["total"]
@@ -333,8 +380,8 @@ def self_distill_losses(
 
 @torch.no_grad()
 def evaluate_distill(
-    student: PrivilegedTeacherWorldModelDiT,
-    teacher: PrivilegedTeacherWorldModelDiT,
+    student: TeacherWorldModelDiT,
+    teacher: TeacherWorldModelDiT,
     loader: DataLoader,
     cfg: ModelConfig,
     args: argparse.Namespace,
@@ -352,22 +399,23 @@ def evaluate_distill(
     for batch in val_iter:
         batch = move_batch_to_device(batch, device)
 
+        teacher_policy_target = batch["expert_action"] if (args.action_distill_weight > 0.0 and not cfg.use_diffusion_actor) else None
         teacher_out = teacher(
             images=batch["images"],
             text_tokens=batch["text_tokens"],
-            privileged=batch["privileged"],
+            target_relative=batch["target_relative"],
             prev_actions=batch["prev_actions"],
             attention_mask=batch["attention_mask"],
             attention_heatmaps=batch.get("attention_heatmaps"),
-            expert_action=batch["expert_action"],
-            valid_mask=batch["valid_mask"],
+            expert_action=teacher_policy_target,
+            valid_mask=batch["valid_mask"] if teacher_policy_target is not None else None,
             done=batch.get("done"),
         )
 
         student_out = student(
             images=batch["images"],
             text_tokens=batch["text_tokens"],
-            privileged=batch["privileged"],
+            target_relative=batch["target_relative"],
             prev_actions=batch["prev_actions"],
             attention_mask=batch["attention_mask"],
             attention_heatmaps=batch.get("attention_heatmaps"),
@@ -426,7 +474,7 @@ def build_loaders(
         records=train_records,
         image_size=cfg.image_size,
         seq_len=args.seq_len,
-        privileged_dim=cfg.privileged_dim,
+        target_relative_dim=cfg.target_relative_dim,
         action_dim=cfg.action_dim,
         direction_bins=cfg.direction_bins,
         distance_bins=cfg.distance_bins,
@@ -470,7 +518,7 @@ def build_loaders(
             records=val_records,
             image_size=cfg.image_size,
             seq_len=args.seq_len,
-            privileged_dim=cfg.privileged_dim,
+            target_relative_dim=cfg.target_relative_dim,
             action_dim=cfg.action_dim,
             direction_bins=cfg.direction_bins,
             distance_bins=cfg.distance_bins,
@@ -497,7 +545,7 @@ def build_loaders(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Privileged self-distillation for Teacher World Model + DiT action head.")
+    parser = argparse.ArgumentParser(description="Self-distillation for Teacher World Model + DiT action head.")
 
     # Dataset / paths
     parser.add_argument("--dataset-root", type=str, required=True)
@@ -517,7 +565,7 @@ def parse_args() -> argparse.Namespace:
     # Model / data config
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--seq-len", type=int, default=16)
-    parser.add_argument("--privileged-dim", type=int, default=3)
+    parser.add_argument("--target-relative-dim", type=int, default=3)
     parser.add_argument("--action-dim", type=int, default=4)
     parser.add_argument("--max-vel", type=float, default=_DEFAULT_CFG.max_vel)
     parser.add_argument("--max-yaw-rate", type=float, default=_DEFAULT_CFG.max_yaw_rate)
@@ -526,11 +574,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diffusion-steps", type=int, default=20)
     parser.add_argument("--sampling-steps", type=int, default=20)
     parser.add_argument(
-        "--privileged-fusion-mode",
+        "--target-token-fusion-mode",
         type=str,
         default=None,
         choices=["attention", "concat"],
-        help="Override teacher checkpoint cfg.privileged_fusion_mode. Default uses checkpoint cfg.",
+        help="Override teacher checkpoint cfg.target_token_fusion_mode. Default uses checkpoint cfg.",
     )
     parser.add_argument("--use-target-visual-guidance", type=_str2bool, default=None)
     parser.add_argument("--use-attention-heatmap", type=_str2bool, default=None)
@@ -606,21 +654,21 @@ def main() -> None:
             print(f"[dataset] total={total_n}, train={train_n}")
         print(
             f"[cfg] use_diffusion_actor={cfg.use_diffusion_actor}, "
-            f"privileged_input=disabled, fusion={cfg.privileged_fusion_mode}, "
-            f"train_next_privileged={cfg.train_next_privileged}, train_rollout={cfg.train_rollout}"
+            f"low_dim_target_input=off, fusion={cfg.target_token_fusion_mode}, "
+            f"train_next_target_relative={cfg.train_next_target_relative}, rollout_head=false"
         )
         print(
             f"[distill] sup={args.sup_weight}, feat={args.feat_distill_weight}, "
             f"action={args.action_distill_weight}, dit_noise={args.dit_noise_distill_weight}"
         )
 
-    teacher = PrivilegedTeacherWorldModelDiT(cfg).to(device)
+    teacher = TeacherWorldModelDiT(cfg).to(device)
     load_model_state(teacher, args.teacher_ckpt, strict=False)
     freeze_model(teacher)
     if _is_main_process():
         print(f"[teacher] loaded frozen teacher: {args.teacher_ckpt}")
 
-    student = PrivilegedTeacherWorldModelDiT(cfg).to(device)
+    student = TeacherWorldModelDiT(cfg).to(device)
     if args.init_student_from_teacher:
         load_model_state(student, args.teacher_ckpt, strict=False)
         if _is_main_process():
@@ -688,22 +736,25 @@ def main() -> None:
 
             with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
                 with torch.no_grad():
+                    teacher_policy_target = (
+                        batch["expert_action"] if (args.action_distill_weight > 0.0 and not cfg.use_diffusion_actor) else None
+                    )
                     teacher_out = teacher(
                         images=batch["images"],
                         text_tokens=batch["text_tokens"],
-                        privileged=batch["privileged"],
+                        target_relative=batch["target_relative"],
                         prev_actions=batch["prev_actions"],
                         attention_mask=batch["attention_mask"],
                         attention_heatmaps=batch.get("attention_heatmaps"),
-                        expert_action=batch["expert_action"],
-                        valid_mask=batch["valid_mask"],
+                        expert_action=teacher_policy_target,
+                        valid_mask=batch["valid_mask"] if teacher_policy_target is not None else None,
                         done=batch.get("done"),
                     )
 
                 student_out = student(
                     images=batch["images"],
                     text_tokens=batch["text_tokens"],
-                    privileged=batch["privileged"],
+                    target_relative=batch["target_relative"],
                     prev_actions=batch["prev_actions"],
                     attention_mask=batch["attention_mask"],
                     attention_heatmaps=batch.get("attention_heatmaps"),
@@ -775,7 +826,8 @@ def main() -> None:
             })
             ckpt = {
                 "epoch": epoch,
-                "model": _unwrap_model(student).state_dict(),
+                "model": _trainable_state_dict(student),
+                "model_state_format": "trainable_only",
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "cfg": cfg.__dict__,

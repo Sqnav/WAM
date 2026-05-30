@@ -30,14 +30,11 @@ ATTENTION_HEATMAP_SIGMA="0.08"
 # =========================
 # WAM auxiliary switches
 # =========================
-TRAIN_NEXT_PRIVILEGED=true
-TRAIN_ROLLOUT=true
-next_privileged_loss_weight="1.0"
-prior_privileged_loss_weight="0.2"
+TRAIN_NEXT_TARGET_RELATIVE=true
+next_target_relative_loss_weight="1.0"
+prior_target_relative_loss_weight="0.2"
 direct_action_loss_weight="2.0"
 action_yaw_loss_weight="10.0"
-rollout_loss_weight="0.2"
-rollout_horizon="3"
 # ==========================================
 # Dataset selection
 # ==========================================
@@ -50,7 +47,7 @@ trajectory_range="1-450"
 # =========================
 # 在脚本里直接改成 true 或 false（小写）
 USE_DIFFUSION_ACTOR=false
-PRIVILEGED_FUSION_MODE="concat"
+TARGET_TOKEN_FUSION_MODE="concat"
 
 # =========================
 # Environment
@@ -85,8 +82,8 @@ print(max(len(g), 1))
 PY
 )"
 
-echo "[train_teacher] use_diffusion_actor=${USE_DIFFUSION_ACTOR} privileged_input=disabled privileged_fusion_mode=${PRIVILEGED_FUSION_MODE}"
-echo "[train_teacher] action_sequence_horizon=${action_sequence_horizon} rollout_loss_weight=${rollout_loss_weight}"
+echo "[train_teacher] use_diffusion_actor=${USE_DIFFUSION_ACTOR} low_dim_target_input=off target_token_fusion_mode=${TARGET_TOKEN_FUSION_MODE}"
+echo "[train_teacher] action_sequence_horizon=${action_sequence_horizon} rollout_head=false"
 echo "[train_teacher] visual_guidance=${USE_TARGET_VISUAL_GUIDANCE} heatmap=${USE_ATTENTION_HEATMAP}"
 
 # Launch training with DDP. Do not use DataParallel here.
@@ -107,18 +104,15 @@ echo "[train_teacher] visual_guidance=${USE_TARGET_VISUAL_GUIDANCE} heatmap=${US
   --max-speed-norm "${max_speed_norm}" \
   --action-sequence-horizon "${action_sequence_horizon}" \
   --num-workers "${num_workers}" \
-  --train-next-privileged "${TRAIN_NEXT_PRIVILEGED}" \
-  --train-rollout "${TRAIN_ROLLOUT}" \
-  --next-privileged-loss-weight "${next_privileged_loss_weight}" \
-  --prior-privileged-loss-weight "${prior_privileged_loss_weight}" \
+  --train-next-target-relative "${TRAIN_NEXT_TARGET_RELATIVE}" \
+  --next-target-relative-loss-weight "${next_target_relative_loss_weight}" \
+  --prior-target-relative-loss-weight "${prior_target_relative_loss_weight}" \
   --direct-action-loss-weight "${direct_action_loss_weight}" \
   --action-yaw-loss-weight "${action_yaw_loss_weight}" \
-  --rollout-loss-weight "${rollout_loss_weight}" \
-  --rollout-horizon "${rollout_horizon}" \
   --use-target-visual-guidance "${USE_TARGET_VISUAL_GUIDANCE}" \
   --use-attention-heatmap "${USE_ATTENTION_HEATMAP}" \
   --visual-guidance-fov-deg "${VISUAL_GUIDANCE_FOV_DEG}" \
   --attention-heatmap-sigma "${ATTENTION_HEATMAP_SIGMA}" \
   --multi-gpu \
-  --privileged-fusion-mode "${PRIVILEGED_FUSION_MODE}" \
+  --target-token-fusion-mode "${TARGET_TOKEN_FUSION_MODE}" \
   --use-diffusion-actor "${USE_DIFFUSION_ACTOR}"

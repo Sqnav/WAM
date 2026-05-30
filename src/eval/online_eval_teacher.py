@@ -24,8 +24,8 @@ from scipy.spatial.transform import Rotation as R
 from torchvision import transforms
 
 from data.visual_guidance import make_attention_heatmap
-from model.config import ModelConfig
-from model.model import PrivilegedTeacherWorldModelDiT
+from model.config import ModelConfig, migrate_legacy_config
+from model.model import TeacherWorldModelDiT, migrate_legacy_state_dict_keys
 
 try:
     from data.instruction_generator import EPISODE_INSTRUCTION
@@ -471,7 +471,7 @@ def discover_dataset_trajectories(
 
 def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) -> ModelConfig:
     field_names = {f.name for f in dataclasses.fields(ModelConfig)}
-    raw_cfg = ckpt.get("cfg", {}) or {}
+    raw_cfg = migrate_legacy_config(ckpt.get("cfg", {}) or {})
     cfg_kwargs = {k: v for k, v in raw_cfg.items() if k in field_names}
     if "action_sequence_horizon" not in cfg_kwargs:
         state = _strip_module_prefix(ckpt.get("model", {}) or {})
@@ -485,7 +485,7 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
             "dinov2_freeze": args.freeze_dinov2,
             "clip_text_model_name": args.clip_text_model_name,
             "clip_text_freeze": args.freeze_clip_text,
-            "privileged_dim": args.privileged_dim,
+            "target_relative_dim": args.target_relative_dim,
             "action_dim": args.action_dim,
             "action_sampling_steps": args.sampling_steps,
             "max_vel": args.max_vel,
@@ -495,8 +495,8 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
     )
     if getattr(args, "use_diffusion_actor", None) is not None:
         cfg_kwargs["use_diffusion_actor"] = bool(args.use_diffusion_actor)
-    if getattr(args, "privileged_fusion_mode", None) is not None:
-        cfg_kwargs["privileged_fusion_mode"] = str(args.privileged_fusion_mode)
+    if getattr(args, "target_token_fusion_mode", None) is not None:
+        cfg_kwargs["target_token_fusion_mode"] = str(args.target_token_fusion_mode)
     if getattr(args, "dit_candidate_selection", None) is not None:
         cfg_kwargs["dit_candidate_selection"] = bool(args.dit_candidate_selection)
     if getattr(args, "dit_candidate_count", None) is not None:
@@ -509,6 +509,20 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
         cfg_kwargs["dit_candidate_distance_weight"] = float(args.dit_candidate_distance_weight)
     if getattr(args, "dit_candidate_smooth_weight", None) is not None:
         cfg_kwargs["dit_candidate_smooth_weight"] = float(args.dit_candidate_smooth_weight)
+    if getattr(args, "dit_candidate_yaw_angle_weight", None) is not None:
+        cfg_kwargs["dit_candidate_yaw_angle_weight"] = float(args.dit_candidate_yaw_angle_weight)
+    if getattr(args, "dit_candidate_pitch_angle_weight", None) is not None:
+        cfg_kwargs["dit_candidate_pitch_angle_weight"] = float(args.dit_candidate_pitch_angle_weight)
+    if getattr(args, "dit_candidate_final_distance_weight", None) is not None:
+        cfg_kwargs["dit_candidate_final_distance_weight"] = float(args.dit_candidate_final_distance_weight)
+    if getattr(args, "dit_candidate_progress_weight", None) is not None:
+        cfg_kwargs["dit_candidate_progress_weight"] = float(args.dit_candidate_progress_weight)
+    if getattr(args, "dit_candidate_front_weight", None) is not None:
+        cfg_kwargs["dit_candidate_front_weight"] = float(args.dit_candidate_front_weight)
+    if getattr(args, "dit_candidate_action_weight", None) is not None:
+        cfg_kwargs["dit_candidate_action_weight"] = float(args.dit_candidate_action_weight)
+    if getattr(args, "dit_candidate_temporal_smooth_weight", None) is not None:
+        cfg_kwargs["dit_candidate_temporal_smooth_weight"] = float(args.dit_candidate_temporal_smooth_weight)
     if getattr(args, "use_target_visual_guidance", None) is not None:
         cfg_kwargs["use_target_visual_guidance"] = bool(args.use_target_visual_guidance)
     if getattr(args, "use_attention_heatmap", None) is not None:
@@ -523,31 +537,75 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
 
 
 def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if not any(k.startswith("module.") for k in state_dict):
-        return state_dict
-    return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    if any(k.startswith("module.") for k in state_dict):
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    return migrate_legacy_state_dict_keys(state_dict)
 
 
-def load_model(args: argparse.Namespace, device: torch.device) -> Tuple[PrivilegedTeacherWorldModelDiT, ModelConfig]:
+def _summarize_checkpoint_load(
+    model: torch.nn.Module,
+    cfg: ModelConfig,
+    missing: Sequence[str],
+    unexpected: Sequence[str],
+    ckpt: Dict[str, Any],
+) -> None:
+    state_format = str(ckpt.get("model_state_format") or "full")
+    if state_format == "trainable_only":
+        trainable_names = {name for name, param in model.named_parameters() if param.requires_grad}
+        expected_missing = [name for name in missing if name not in trainable_names]
+        unexpected_missing = [name for name in missing if name in trainable_names]
+    else:
+        expected_missing = []
+        unexpected_missing = list(missing)
+
+    if expected_missing:
+        groups = {
+            "image_encoder": 0,
+            "text_encoder": 0,
+            "inactive_actor": 0,
+            "inactive_visual_guidance": 0,
+            "other_frozen": 0,
+        }
+        for name in expected_missing:
+            if name.startswith("image_encoder."):
+                groups["image_encoder"] += 1
+            elif name.startswith("text_encoder."):
+                groups["text_encoder"] += 1
+            elif (not cfg.use_diffusion_actor) and name.startswith("actor."):
+                groups["inactive_actor"] += 1
+            elif (not cfg.use_target_visual_guidance) and name == "fusion.target_bias_embed":
+                groups["inactive_visual_guidance"] += 1
+            else:
+                groups["other_frozen"] += 1
+        group_s = ", ".join(f"{k}={v}" for k, v in groups.items() if v)
+        print(
+            f"[checkpoint] trainable_only checkpoint; skipped expected frozen/inactive keys: "
+            f"{len(expected_missing)} ({group_s})"
+        )
+    if unexpected_missing:
+        print(f"[warn] missing trainable keys when loading checkpoint: {unexpected_missing}")
+    if unexpected:
+        print(f"[warn] unexpected keys when loading checkpoint: {list(unexpected)}")
+
+
+def load_model(args: argparse.Namespace, device: torch.device) -> Tuple[TeacherWorldModelDiT, ModelConfig]:
     ckpt_path = Path(args.checkpoint)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = _make_cfg_from_checkpoint(ckpt, args)
-    model = PrivilegedTeacherWorldModelDiT(cfg).to(device)
+    model = TeacherWorldModelDiT(cfg).to(device)
     missing, unexpected = model.load_state_dict(_strip_module_prefix(ckpt["model"]), strict=False)
-    if missing:
-        print(f"[warn] missing keys when loading checkpoint: {missing}")
-    if unexpected:
-        print(f"[warn] unexpected keys when loading checkpoint: {unexpected}")
+    _summarize_checkpoint_load(model, cfg, missing, unexpected, ckpt)
     model.eval()
     print(f"[model] loaded checkpoint: {ckpt_path}")
     print(
-        f"[model] privileged_input=disabled, "
-        f"privileged_fusion_mode={cfg.privileged_fusion_mode}, "
+        f"[model] low_dim_target_input=off, "
+        f"target_token_fusion_mode={cfg.target_token_fusion_mode}, "
         f"use_diffusion_actor={cfg.use_diffusion_actor}, "
         f"dit_candidate_selection={cfg.dit_candidate_selection}, "
         f"dit_candidate_count={cfg.dit_candidate_count}, "
+        f"candidate_score=tracking, "
         f"visual_guidance={cfg.use_target_visual_guidance}"
     )
     return model, cfg
@@ -825,6 +883,26 @@ def save_rgb(path: Path, rgb: np.ndarray) -> None:
     cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
 
+def save_heatmap_overlay(path: Path, rgb: np.ndarray, heatmap: torch.Tensor, alpha: float = 0.45) -> None:
+    import cv2
+
+    rgb_u8 = np.asarray(rgb, dtype=np.uint8)
+    hm = heatmap.detach().float().cpu().squeeze().numpy()
+    if hm.ndim != 2:
+        raise ValueError(f"expected 2D heatmap after squeeze, got shape {hm.shape}")
+    hm = hm - float(np.min(hm))
+    denom = float(np.max(hm))
+    if denom > 1e-8:
+        hm = hm / denom
+    hm_u8 = np.clip(hm * 255.0, 0, 255).astype(np.uint8)
+    hm_u8 = cv2.resize(hm_u8, (rgb_u8.shape[1], rgb_u8.shape[0]), interpolation=cv2.INTER_LINEAR)
+    colored_bgr = cv2.applyColorMap(hm_u8, cv2.COLORMAP_JET)
+    colored_rgb = cv2.cvtColor(colored_bgr, cv2.COLOR_BGR2RGB)
+    overlay_rgb = cv2.addWeighted(rgb_u8, 1.0 - float(alpha), colored_rgb, float(alpha), 0.0)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
+
+
 def _save_trajectory_3d_plot(out_dir: Path, steps: List[Dict[str, Any]]) -> None:
     """Save per-trajectory 3D path plot (UAV/target/jammers)."""
     if not steps:
@@ -1009,7 +1087,7 @@ def _prepare_objects(executor, traj: OnlineTrajectory, args: argparse.Namespace)
 
 @torch.no_grad()
 def run_online_trajectory(
-    model: PrivilegedTeacherWorldModelDiT,
+    model: TeacherWorldModelDiT,
     cfg: ModelConfig,
     tokenizer,
     transform,
@@ -1020,9 +1098,15 @@ def run_online_trajectory(
 ) -> Dict[str, Any]:
     out_dir = Path(args.output_dir) / traj.scene_id / traj.trajectory_name
     rgb_out_dir = out_dir / "rgb"
+    heatmap_overlay_dir = out_dir / "heatmap_overlay"
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.save_rgb:
         rgb_out_dir.mkdir(parents=True, exist_ok=True)
+    save_heatmap_overlay_enabled = bool(
+        args.save_heatmap_overlay and cfg.use_target_visual_guidance and cfg.use_attention_heatmap
+    )
+    if save_heatmap_overlay_enabled:
+        heatmap_overlay_dir.mkdir(parents=True, exist_ok=True)
 
     _set_saved_assets_for_trajectory(executor, traj, args)
     _prepare_objects(executor, traj, args)
@@ -1060,7 +1144,6 @@ def run_online_trajectory(
 
     steps: List[Dict[str, Any]] = []
     distances: List[float] = []
-    min_distance = float("inf")
     success = False
     success_step: Optional[int] = None
     collision = False
@@ -1173,6 +1256,8 @@ def run_online_trajectory(
         expert_action = traj.expert_action_physical[t] if t < len(traj.expert_action_physical) else None
         expert_action_norm = None
         action_source = "model"
+        pred = None
+        heatmap_overlay_relpath = None
 
         if args.replay_expert_action:
             if expert_action is None:
@@ -1184,23 +1269,27 @@ def run_online_trajectory(
         else:
             image_t = rgb_to_model_tensor(rgb_img, transform, device)
             text_tokens, attention_mask = tokenize_instruction(tokenizer, instruction, cfg.text_context_length, device)
-            privileged_np = rel_body / max(float(args.privileged_scale), 1e-6)
-            privileged_t = torch.from_numpy(privileged_np.astype(np.float32)).view(1, -1).to(device)
+            target_relative_np = rel_body / max(float(args.target_relative_scale), 1e-6)
+            target_relative_t = torch.from_numpy(target_relative_np.astype(np.float32)).view(1, -1).to(device)
             attention_heatmap_t = None
             if cfg.use_target_visual_guidance:
-                raw_privileged_t = torch.from_numpy(rel_body.astype(np.float32)).view(1, -1).to(device)
+                raw_target_relative_t = torch.from_numpy(rel_body.astype(np.float32)).view(1, -1).to(device)
                 if cfg.use_attention_heatmap:
                     attention_heatmap_t = make_attention_heatmap(
-                        raw_privileged_t,
+                        raw_target_relative_t,
                         image_hw=(image_t.shape[-2], image_t.shape[-1]),
                         fov_deg=cfg.visual_guidance_fov_deg,
                         sigma=cfg.attention_heatmap_sigma,
                     )
+                    if save_heatmap_overlay_enabled:
+                        heatmap_overlay_path = heatmap_overlay_dir / f"frame_{t:05d}.png"
+                        save_heatmap_overlay(heatmap_overlay_path, rgb_img, attention_heatmap_t)
+                        heatmap_overlay_relpath = str(heatmap_overlay_path.relative_to(out_dir))
 
             pred, rssm_state = model.act(
                 image=image_t,
                 text_tokens=text_tokens,
-                privileged=privileged_t,
+                target_relative=target_relative_t,
                 prev_action=prev_action,
                 rssm_state=rssm_state,
                 attention_mask=attention_mask,
@@ -1220,7 +1309,6 @@ def run_online_trajectory(
         post_rel_body = compute_target_relative_body(executor, uav_state_after, target_now)
         distance = float(np.linalg.norm(post_rel_body))
         distances.append(distance)
-        min_distance = min(min_distance, distance)
         visible = is_visible_by_geometry(post_rel_body, fov_deg=args.fov_deg)
         if visible:
             visible_count += 1
@@ -1275,6 +1363,29 @@ def run_online_trajectory(
                 str(did): _airsim_xyz_to_dataset(pos) for did, pos in jammer_positions_now.items()
             },
         }
+        if heatmap_overlay_relpath is not None:
+            step_record["heatmap_overlay"] = heatmap_overlay_relpath
+        if pred is not None and "candidate_scores" in pred:
+            selected_candidate = int(pred["selected_candidate"].detach().view(-1)[0].cpu().item())
+            candidate_scores = pred["candidate_scores"].detach().float().view(-1).cpu().numpy()
+            step_record["dit_candidate_selection"] = {
+                "selected": selected_candidate,
+                "scores": candidate_scores.astype(float).tolist(),
+                "selected_score": float(candidate_scores[selected_candidate]),
+            }
+            for key in (
+                "candidate_yaw_angle",
+                "candidate_pitch_angle",
+                "candidate_final_distance_norm",
+                "candidate_progress_penalty",
+                "candidate_front_penalty",
+                "candidate_smooth_prev",
+                "candidate_temporal_smooth",
+                "candidate_action_effort",
+            ):
+                if key in pred:
+                    values = pred[key].detach().float().view(-1).cpu().numpy()
+                    step_record["dit_candidate_selection"][key.replace("candidate_", "")] = values.astype(float).tolist()
         steps.append(step_record)
 
         prev_action = torch.from_numpy(action_norm).view(1, -1).to(device).float()
@@ -1322,25 +1433,6 @@ def run_online_trajectory(
             break
         tracked_frames_before_failure += 1
 
-    failure_step = None
-    failure_reason = None
-    for idx, step in enumerate(steps):
-        if bool(step.get("collision", False)):
-            failure_step = idx
-            failure_reason = "collision"
-            break
-        if not bool(step.get("close_enough", False)):
-            failure_step = idx
-            failure_reason = "out_of_capture_distance"
-            break
-        if args.require_visibility_for_success and not bool(step.get("visible_by_geometry", False)):
-            failure_step = idx
-            failure_reason = "target_not_visible"
-            break
-
-    if steps and failure_step is None:
-        failure_reason = "none"
-
     # Success criterion: only the final frame counts, and any collision fails.
     # Visibility is included only when explicitly requested.
     final_distance = float(distances[-1]) if distances else float("inf")
@@ -1351,6 +1443,22 @@ def run_online_trajectory(
     success_criterion = "no collision and final_distance <= capture_distance"
     if args.require_visibility_for_success:
         success_criterion += " and final_visible_by_geometry"
+
+    failure_step = None
+    failure_reason = "none" if success else "unknown"
+    if not success:
+        if collision:
+            for idx, step in enumerate(steps):
+                if bool(step.get("collision", False)):
+                    failure_step = idx
+                    break
+            failure_reason = "collision"
+        elif not final_close:
+            failure_step = (len(steps) - 1) if steps else None
+            failure_reason = "out_of_capture_distance"
+        elif args.require_visibility_for_success and not final_visible:
+            failure_step = (len(steps) - 1) if steps else None
+            failure_reason = "target_not_visible"
 
     summary = {
         "scene_id": traj.scene_id,
@@ -1375,7 +1483,6 @@ def run_online_trajectory(
         "final_close_enough": bool(final_close),
         "final_visible_by_geometry": bool(final_visible),
         "success_criterion": success_criterion,
-        "min_distance": float(min_distance) if distances else None,
         "mean_distance": float(np.mean(distances)) if distances else None,
         "visible_ratio_geometry": float(visible_count / max(len(steps), 1)),
         "mean_action_abs_error_physical": float(np.mean(action_abs_err)) if action_abs_err else None,
@@ -1521,8 +1628,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-text-model-name", type=str, default=LOCAL_CLIP_MODEL_PATH)
     parser.add_argument("--dinov2-model-name", type=str, default=LOCAL_DINOV2_MODEL_PATH)
     parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--privileged-dim", type=int, default=3)
-    parser.add_argument("--privileged-scale", type=float, default=1.0, help="Use 1.0 if training used raw target_position_in_body_frame; set 100.0 only if your builder normalized by 100.")
+    parser.add_argument("--target-relative-dim", type=int, default=3)
+    parser.add_argument("--target-relative-scale", type=float, default=1.0, help="Use 1.0 if training used raw target_position_in_body_frame; set 100.0 only if your builder normalized by 100.")
     parser.add_argument("--action-dim", type=int, default=4)
     parser.add_argument("--sampling-steps", type=int, default=20)
     parser.add_argument("--dit-candidate-selection", type=_str2bool, default=None)
@@ -1531,6 +1638,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dit-candidate-vertical-weight", type=float, default=None)
     parser.add_argument("--dit-candidate-distance-weight", type=float, default=None)
     parser.add_argument("--dit-candidate-smooth-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-yaw-angle-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-pitch-angle-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-final-distance-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-progress-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-front-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-action-weight", type=float, default=None)
+    parser.add_argument("--dit-candidate-temporal-smooth-weight", type=float, default=None)
     parser.add_argument("--use-target-visual-guidance", type=_str2bool, default=None)
     parser.add_argument("--use-attention-heatmap", type=_str2bool, default=None)
     parser.add_argument("--visual-guidance-fov-deg", type=float, default=None)
@@ -1551,11 +1665,11 @@ def parse_args() -> argparse.Namespace:
         help="true/false: override cfg.use_diffusion_actor from checkpoint. By default, use checkpoint cfg.",
     )
     parser.add_argument(
-        "--privileged-fusion-mode",
+        "--target-token-fusion-mode",
         type=str,
         default=None,
         choices=["attention", "concat"],
-        help="Override cfg.privileged_fusion_mode from checkpoint. By default, use checkpoint cfg.",
+        help="Override cfg.target_token_fusion_mode from checkpoint. By default, use checkpoint cfg.",
     )
 
     # AirSim / executor config
@@ -1595,6 +1709,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-stop-on-collision", action="store_false", dest="stop_on_collision")
     parser.add_argument("--save-rgb", action="store_true", default=True)
     parser.add_argument("--no-save-rgb", action="store_false", dest="save_rgb")
+    parser.add_argument("--save-heatmap-overlay", action="store_true", default=True)
+    parser.add_argument("--no-save-heatmap-overlay", action="store_false", dest="save_heatmap_overlay")
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -1682,7 +1798,6 @@ def main() -> None:
 
         success_values = [1.0 if s.get("success") else 0.0 for s in all_summaries]
         collision_values = [1.0 if s.get("collision") else 0.0 for s in all_summaries]
-        min_distances = [float(s["min_distance"]) for s in all_summaries if s.get("min_distance") is not None]
         final_distances = [float(s["final_distance"]) for s in all_summaries if s.get("final_distance") is not None]
         mean_distances = [float(s["mean_distance"]) for s in all_summaries if s.get("mean_distance") is not None]
         effective_frames = [
@@ -1745,7 +1860,6 @@ def main() -> None:
             "final_visible_rate": float(np.mean(final_visible_values)) if final_visible_values else None,
             "collision_rate": float(np.mean(collision_values)) if collision_values else None,
             "failure_reason_counts": failure_reasons,
-            "mean_min_distance": float(np.mean(min_distances)) if min_distances else None,
             "mean_final_distance": float(np.mean(final_distances)) if final_distances else None,
             "mean_distance": float(np.mean(mean_distances)) if mean_distances else None,
             "args": vars(args),

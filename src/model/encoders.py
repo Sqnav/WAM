@@ -166,16 +166,16 @@ class CLIPTextEncoder(nn.Module):
         return pooled, tokens
 
 
-class PrivilegedEncoder(nn.Module):
+class TargetTokenEncoder(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.mlp = MLP(
-            cfg.privileged_dim,
-            cfg.privileged_hidden_dim,
+            cfg.target_relative_dim,
+            cfg.target_token_hidden_dim,
             cfg.fusion_dim,
             num_layers=2,
             dropout=cfg.dropout,
         )
 
-    def forward(self, privileged: torch.Tensor) -> torch.Tensor:
-        return self.mlp(privileged)
+    def forward(self, target_relative: torch.Tensor) -> torch.Tensor:
+        return self.mlp(target_relative)

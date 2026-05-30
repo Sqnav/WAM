@@ -2,7 +2,7 @@
 set -euo pipefail
 
 #
-# Minimal online evaluation launcher for privileged self-distill checkpoint.
+# Minimal online evaluation launcher for self-distill checkpoint.
 # Change only SCENE_LIST / TRAJECTORY_RANGE by default.
 #
 
@@ -10,15 +10,15 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "$script_dir/../.." && pwd)"
 
 DATASET_ROOT="$root_dir/Dataset"
-CHECKPOINT="$root_dir/save_self_distill/best.pt"
-OUTPUT_DIR="$root_dir/online_eval_self_distill"
+CHECKPOINT="${CHECKPOINT:-$root_dir/experiments/visual_guidance_ablation/self_distill_dit_heatmap/best.pt}"
+OUTPUT_DIR="${OUTPUT_DIR:-$root_dir/experiments/visual_guidance_ablation/online_eval/self_distill_dit_heatmap}"
 EXECUTOR_SCRIPT="$root_dir/code/src/executor/trajectory_executor.py"
 
 # =========================
 # Dataset selection (usually the only things you change)
 # =========================
-SCENE_LIST="City_1"
-TRAJECTORY_RANGE="451-500"
+SCENE_LIST="${SCENE_LIST:-City_1}"
+TRAJECTORY_RANGE="${TRAJECTORY_RANGE:-451-500}"
 
 # =========================
 # Runtime / model
@@ -34,27 +34,27 @@ export OMP_NUM_THREADS=4
 export DAGGER_MULTI_WORKER=1
 
 # GPU selection (single process)
-GPU_ID="0"
+GPU_ID="${GPU_ID:-2}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 GPU_ID_FOR_AIRSIM="${GPU_ID}"
 DEVICE="cuda"
-PRIVILEGED_FUSION_MODE="concat"
-USE_TARGET_VISUAL_GUIDANCE=false
-USE_ATTENTION_HEATMAP=true
-VISUAL_GUIDANCE_FOV_DEG="90.0"
-ATTENTION_HEATMAP_SIGMA="0.08"
+TARGET_TOKEN_FUSION_MODE="${TARGET_TOKEN_FUSION_MODE:-concat}"
+USE_TARGET_VISUAL_GUIDANCE="${USE_TARGET_VISUAL_GUIDANCE:-true}"
+USE_ATTENTION_HEATMAP="${USE_ATTENTION_HEATMAP:-true}"
+VISUAL_GUIDANCE_FOV_DEG="${VISUAL_GUIDANCE_FOV_DEG:-90.0}"
+ATTENTION_HEATMAP_SIGMA="${ATTENTION_HEATMAP_SIGMA:-0.08}"
 
 # =========================
 # AirSim / online rollout
 # =========================
-SIM_SERVER_HOST="127.0.0.1"
-SIM_SERVER_PORT=30000
+SIM_SERVER_HOST="${SIM_SERVER_HOST:-127.0.0.1}"
+SIM_SERVER_PORT="${SIM_SERVER_PORT:-30000}"
 
 mkdir -p "${OUTPUT_DIR}"
 echo "[eval] checkpoint=${CHECKPOINT}"
 echo "[eval] scenes=${SCENE_LIST} range=${TRAJECTORY_RANGE}"
-echo "[eval] privileged_input=disabled"
-echo "[eval] privileged_fusion=${PRIVILEGED_FUSION_MODE}"
+echo "[eval] low_dim_target_input=off"
+echo "[eval] target_token_fusion=${TARGET_TOKEN_FUSION_MODE}"
 echo "[eval] visual_guidance=${USE_TARGET_VISUAL_GUIDANCE} heatmap=${USE_ATTENTION_HEATMAP}"
 
 # Single process: do NOT use torchrun, DDP, DataParallel, or ThreadPoolExecutor here.
@@ -74,4 +74,4 @@ echo "[eval] visual_guidance=${USE_TARGET_VISUAL_GUIDANCE} heatmap=${USE_ATTENTI
   --use-attention-heatmap "${USE_ATTENTION_HEATMAP}" \
   --visual-guidance-fov-deg "${VISUAL_GUIDANCE_FOV_DEG}" \
   --attention-heatmap-sigma "${ATTENTION_HEATMAP_SIGMA}" \
-  --privileged-fusion-mode "${PRIVILEGED_FUSION_MODE}"
+  --target-token-fusion-mode "${TARGET_TOKEN_FUSION_MODE}"

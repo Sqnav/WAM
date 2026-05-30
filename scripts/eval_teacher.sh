@@ -28,7 +28,7 @@ TRAJECTORY_RANGE="451-500"
 USE_DIFFUSION_ACTOR=false
 # Empty means: use the mode saved in checkpoint cfg.
 # Set to "attention" or "concat" only when you intentionally want to override it.
-PRIVILEGED_FUSION_MODE=""
+TARGET_TOKEN_FUSION_MODE=""
 
 # =========================
 # Runtime / model
@@ -56,6 +56,13 @@ DIT_CANDIDATE_LATERAL_WEIGHT="1.0"
 DIT_CANDIDATE_VERTICAL_WEIGHT="1.0"
 DIT_CANDIDATE_DISTANCE_WEIGHT="0.05"
 DIT_CANDIDATE_SMOOTH_WEIGHT="0.05"
+DIT_CANDIDATE_YAW_ANGLE_WEIGHT="${DIT_CANDIDATE_YAW_ANGLE_WEIGHT:-1.0}"
+DIT_CANDIDATE_PITCH_ANGLE_WEIGHT="${DIT_CANDIDATE_PITCH_ANGLE_WEIGHT:-0.7}"
+DIT_CANDIDATE_FINAL_DISTANCE_WEIGHT="${DIT_CANDIDATE_FINAL_DISTANCE_WEIGHT:-0.25}"
+DIT_CANDIDATE_PROGRESS_WEIGHT="${DIT_CANDIDATE_PROGRESS_WEIGHT:-1.0}"
+DIT_CANDIDATE_FRONT_WEIGHT="${DIT_CANDIDATE_FRONT_WEIGHT:-0.5}"
+DIT_CANDIDATE_ACTION_WEIGHT="${DIT_CANDIDATE_ACTION_WEIGHT:-0.02}"
+DIT_CANDIDATE_TEMPORAL_SMOOTH_WEIGHT="${DIT_CANDIDATE_TEMPORAL_SMOOTH_WEIGHT:-0.05}"
 USE_TARGET_VISUAL_GUIDANCE=false
 USE_ATTENTION_HEATMAP=true
 VISUAL_GUIDANCE_FOV_DEG="90.0"
@@ -72,18 +79,19 @@ SCENE_INDEX=1
 
 mkdir -p "${OUTPUT_DIR}"
 echo "[eval] scenes=${SCENE_LIST} range=${TRAJECTORY_RANGE} diffusion=${USE_DIFFUSION_ACTOR}"
-echo "[eval] privileged_input=disabled"
+echo "[eval] low_dim_target_input=off"
 echo "[eval] dit_candidate_selection=${DIT_CANDIDATE_SELECTION} count=${DIT_CANDIDATE_COUNT}"
+echo "[eval] dit_candidate_score=tracking"
 echo "[eval] visual_guidance=${USE_TARGET_VISUAL_GUIDANCE} heatmap=${USE_ATTENTION_HEATMAP}"
-if [[ -n "${PRIVILEGED_FUSION_MODE}" ]]; then
-  echo "[eval] privileged_fusion_override=${PRIVILEGED_FUSION_MODE}"
+if [[ -n "${TARGET_TOKEN_FUSION_MODE}" ]]; then
+  echo "[eval] target_token_fusion_override=${TARGET_TOKEN_FUSION_MODE}"
 else
-  echo "[eval] privileged_fusion=checkpoint"
+  echo "[eval] target_token_fusion=checkpoint"
 fi
 
 extra_args=()
-if [[ -n "${PRIVILEGED_FUSION_MODE}" ]]; then
-  extra_args+=(--privileged-fusion-mode "${PRIVILEGED_FUSION_MODE}")
+if [[ -n "${TARGET_TOKEN_FUSION_MODE}" ]]; then
+  extra_args+=(--target-token-fusion-mode "${TARGET_TOKEN_FUSION_MODE}")
 fi
 
 # Single process: do NOT use torchrun, DDP, DataParallel, or ThreadPoolExecutor here.
@@ -108,6 +116,13 @@ fi
   --dit-candidate-vertical-weight "${DIT_CANDIDATE_VERTICAL_WEIGHT}" \
   --dit-candidate-distance-weight "${DIT_CANDIDATE_DISTANCE_WEIGHT}" \
   --dit-candidate-smooth-weight "${DIT_CANDIDATE_SMOOTH_WEIGHT}" \
+  --dit-candidate-yaw-angle-weight "${DIT_CANDIDATE_YAW_ANGLE_WEIGHT}" \
+  --dit-candidate-pitch-angle-weight "${DIT_CANDIDATE_PITCH_ANGLE_WEIGHT}" \
+  --dit-candidate-final-distance-weight "${DIT_CANDIDATE_FINAL_DISTANCE_WEIGHT}" \
+  --dit-candidate-progress-weight "${DIT_CANDIDATE_PROGRESS_WEIGHT}" \
+  --dit-candidate-front-weight "${DIT_CANDIDATE_FRONT_WEIGHT}" \
+  --dit-candidate-action-weight "${DIT_CANDIDATE_ACTION_WEIGHT}" \
+  --dit-candidate-temporal-smooth-weight "${DIT_CANDIDATE_TEMPORAL_SMOOTH_WEIGHT}" \
   --use-target-visual-guidance "${USE_TARGET_VISUAL_GUIDANCE}" \
   --use-attention-heatmap "${USE_ATTENTION_HEATMAP}" \
   --visual-guidance-fov-deg "${VISUAL_GUIDANCE_FOV_DEG}" \

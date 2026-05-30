@@ -66,9 +66,7 @@ def world_model_dit_loss(
 
     train_kl = bool(getattr(cfg, "train_kl", True))
     train_direct_action = bool(getattr(cfg, "train_direct_action", True))
-    train_next_privileged = bool(getattr(cfg, "train_next_privileged", False))
-    train_rollout = bool(getattr(cfg, "train_rollout", False))
-
+    train_next_target_relative = bool(getattr(cfg, "train_next_target_relative", False))
     losses: Dict[str, torch.Tensor] = {}
 
     if train_kl:
@@ -80,18 +78,18 @@ def world_model_dit_loss(
         losses["kl"] = torch.zeros((), device=device, dtype=dtype)
 
     z = torch.zeros((), device=device, dtype=dtype)
-    if not train_next_privileged:
-        losses["privileged"] = z
-        losses["prior_privileged"] = z
+    if not train_next_target_relative:
+        losses["next_target_relative"] = z
+        losses["prior_next_target_relative"] = z
     else:
-        if "privileged" not in losses:
-            losses["privileged"] = masked_mean(
-                (outputs["privileged"] - batch["next_privileged"].float()).pow(2),
+        if "next_target_relative" not in losses:
+            losses["next_target_relative"] = masked_mean(
+                (outputs["next_target_relative"] - batch["next_target_relative"].float()).pow(2),
                 valid_mask,
             )
-        if "prior_privileged" not in losses:
-            losses["prior_privileged"] = masked_mean(
-                (outputs["prior_privileged"] - batch["next_privileged"].float()).pow(2),
+        if "prior_next_target_relative" not in losses:
+            losses["prior_next_target_relative"] = masked_mean(
+                (outputs["prior_next_target_relative"] - batch["next_target_relative"].float()).pow(2),
                 valid_mask,
             )
 
@@ -126,20 +124,6 @@ def world_model_dit_loss(
         losses["action"] = torch.zeros((), device=device, dtype=dtype)
         losses["x0_action"] = torch.zeros((), device=device, dtype=dtype)
 
-    if train_rollout and "rollout_privileged" in outputs:
-        rollout_pred = outputs["rollout_privileged"]
-        privileged = batch["privileged"].float()
-        valid = valid_mask.float() if valid_mask is not None else torch.ones_like(privileged[..., 0])
-        horizon = rollout_pred.size(2)
-        terms = []
-        for k in range(horizon):
-            target = torch.cat([privileged[:, k + 1 :], privileged[:, -1:].expand(-1, k + 1, -1)], dim=1)
-            mask = torch.cat([valid[:, k + 1 :], torch.zeros_like(valid[:, : k + 1])], dim=1)
-            terms.append(masked_mean((rollout_pred[:, :, k] - target).pow(2), mask))
-        losses["rollout_privileged"] = torch.stack(terms).mean()
-    else:
-        losses["rollout_privileged"] = torch.zeros((), device=device, dtype=dtype)
-
     # DiT actor uses the standard diffusion denoising objective as
     # losses["action"]; an optional x0 reconstruction term keeps the sampled
     # clean trajectory aligned with expert actions.
@@ -149,14 +133,12 @@ def world_model_dit_loss(
     total = torch.zeros((), device=device, dtype=dtype)
     if train_kl:
         total = total + kl_w * losses["kl"]
-    if train_next_privileged:
-        total = total + float(cfg.next_privileged_loss_weight) * losses["privileged"]
-        total = total + float(cfg.prior_privileged_loss_weight) * losses["prior_privileged"]
+    if train_next_target_relative:
+        total = total + float(cfg.next_target_relative_loss_weight) * losses["next_target_relative"]
+        total = total + float(cfg.prior_target_relative_loss_weight) * losses["prior_next_target_relative"]
     if train_direct_action and "policy_action" in outputs:
         total = total + float(cfg.direct_action_loss_weight) * losses["action"]
         total = total + float(getattr(cfg, "x0_action_loss_weight", 0.0)) * losses["x0_action"]
-    if train_rollout and "rollout_privileged" in outputs:
-        total = total + float(cfg.rollout_loss_weight) * losses["rollout_privileged"]
 
     if total.ndim > 0:
         total = total.mean()

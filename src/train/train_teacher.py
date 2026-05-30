@@ -20,7 +20,7 @@ from data.visual_guidance import make_attention_heatmap
 from data.teacher_dataset_builder import build_records
 from model.config import ModelConfig
 from model.losses import summarize_losses, world_model_dit_loss
-from model.model import PrivilegedTeacherWorldModelDiT
+from model.model import TeacherWorldModelDiT, migrate_legacy_state_dict_keys
 
 try:
     from tqdm.auto import tqdm
@@ -58,18 +58,22 @@ def seed_everything(seed: int) -> None:
 
 class TrajectoryDataset(Dataset):
     REQUIRED_KEYS = [
-        "privileged",
-        "next_privileged",
+        "target_relative",
+        "next_target_relative",
         "prev_actions",
         "expert_action",
     ]
+    LEGACY_KEY_ALIASES = {
+        "target_relative": "privileged",
+        "next_target_relative": "next_privileged",
+    }
 
     def __init__(
         self,
         records: List[Dict[str, Any]],
         image_size: int,
         seq_len: int,
-        privileged_dim: int,
+        target_relative_dim: int,
         action_dim: int,
         direction_bins: int = 8,
         distance_bins: int = 6,
@@ -83,7 +87,7 @@ class TrajectoryDataset(Dataset):
     ) -> None:
         self.records = records
         self.seq_len = seq_len
-        self.privileged_dim = privileged_dim
+        self.target_relative_dim = target_relative_dim
         self.action_dim = action_dim
         self.direction_bins = direction_bins
         self.distance_bins = distance_bins
@@ -119,16 +123,43 @@ class TrajectoryDataset(Dataset):
             return f"record index {index}"
         return "record"
 
-    def _load_rgb_sequence(self, record: Dict[str, Any]) -> torch.Tensor:
+    def _sequence_length(self, record: Dict[str, Any], index: int) -> int:
+        rgb_paths = record.get("rgb_paths")
+        if rgb_paths is not None:
+            return len(rgb_paths)
+        for key in ["images", *self.REQUIRED_KEYS]:
+            value = record.get(key)
+            if value is None and key in self.LEGACY_KEY_ALIASES:
+                value = record.get(self.LEGACY_KEY_ALIASES[key])
+            if value is None:
+                continue
+            tensor = torch.load(value, map_location="cpu") if isinstance(value, str) and Path(value).exists() else torch.tensor(value)
+            if tensor.ndim >= 1:
+                return int(tensor.shape[0])
+        raise KeyError(f"{self._record_name(record, index)} 无法推断序列长度。")
+
+    def _select_window(self, length: int) -> tuple[int, int]:
+        if length <= 0:
+            raise ValueError("trajectory length must be positive.")
+        if length >= self.seq_len:
+            start = random.randint(0, length - self.seq_len) if self.random_crop else 0
+            return start, start + self.seq_len
+        return 0, length
+
+    def _load_rgb_sequence(self, record: Dict[str, Any], start: Optional[int] = None, end: Optional[int] = None) -> torch.Tensor:
         if "images" in record:
             value = record["images"]
             images = torch.load(value, map_location="cpu") if isinstance(value, str) else torch.tensor(value)
             if images.ndim != 4:
                 raise ValueError("images must have shape [T, C, H, W].")
+            if start is not None or end is not None:
+                images = images[slice(start, end)]
             return images.float()
         rgb_paths = record.get("rgb_paths")
         if rgb_paths is None:
             raise KeyError("每条样本必须包含 images 或 rgb_paths。")
+        if start is not None or end is not None:
+            rgb_paths = rgb_paths[slice(start, end)]
         frames = []
         for p in rgb_paths:
             img = Image.open(p).convert("RGB")
@@ -149,8 +180,12 @@ class TrajectoryDataset(Dataset):
 
     def _require_tensor_field(self, record: Dict[str, Any], key: str, dtype: torch.dtype, index: int) -> torch.Tensor:
         tensor = self._load_tensor_field(record, key, dtype)
+        if tensor is None and key in self.LEGACY_KEY_ALIASES:
+            tensor = self._load_tensor_field(record, self.LEGACY_KEY_ALIASES[key], dtype)
         if tensor is None:
-            raise KeyError(f"{self._record_name(record, index)} 缺少必需字段 `{key}`。")
+            legacy = self.LEGACY_KEY_ALIASES.get(key)
+            suffix = f" 或旧字段 `{legacy}`" if legacy is not None else ""
+            raise KeyError(f"{self._record_name(record, index)} 缺少必需字段 `{key}`{suffix}。")
         return tensor
 
     def _tokenize_if_needed(self, record: Dict[str, Any], seq_len: int, index: int) -> Dict[str, Optional[torch.Tensor]]:
@@ -213,6 +248,13 @@ class TrajectoryDataset(Dataset):
             raise ValueError(f"`{key}` contains values outside [0, {num_bins - 1}].")
         return x
 
+    def _slice_time_tensor(self, x: Optional[torch.Tensor], full_length: int, start: int, end: int) -> Optional[torch.Tensor]:
+        if x is None:
+            return None
+        if x.ndim >= 1 and x.shape[0] == full_length:
+            return x[start:end]
+        return x
+
     def _crop_or_pad(self, item: Dict[str, Optional[torch.Tensor]]) -> Dict[str, Optional[torch.Tensor]]:
         length = item["images"].shape[0]  # type: ignore[union-attr]
         if length >= self.seq_len:
@@ -247,50 +289,53 @@ class TrajectoryDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Optional[torch.Tensor]]:
         record = self.records[index]
         for key in self.REQUIRED_KEYS:
-            if key not in record:
-                raise KeyError(f"{self._record_name(record, index)} 缺少必需字段 `{key}`。")
+            legacy = self.LEGACY_KEY_ALIASES.get(key)
+            if key not in record and (legacy is None or legacy not in record):
+                suffix = f" 或旧字段 `{legacy}`" if legacy is not None else ""
+                raise KeyError(f"{self._record_name(record, index)} 缺少必需字段 `{key}`{suffix}。")
 
-        images = self._load_rgb_sequence(record)
-        seq_len = images.shape[0]
+        full_len = self._sequence_length(record, index)
+        start, end = self._select_window(full_len)
+        images = self._load_rgb_sequence(record, start=start, end=end)
 
-        text = self._tokenize_if_needed(record, seq_len, index)
-        privileged = self._ensure_2d(
-            self._require_tensor_field(record, "privileged", torch.float32, index),
-            seq_len,
-            self.privileged_dim,
-            "privileged",
+        text = self._tokenize_if_needed(record, full_len, index)
+        target_relative = self._ensure_2d(
+            self._require_tensor_field(record, "target_relative", torch.float32, index),
+            full_len,
+            self.target_relative_dim,
+            "target_relative",
         )
         prev_actions = self._ensure_2d(
             self._require_tensor_field(record, "prev_actions", torch.float32, index),
-            seq_len,
+            full_len,
             self.action_dim,
             "prev_actions",
         )
-        next_privileged = self._ensure_2d(
-            self._require_tensor_field(record, "next_privileged", torch.float32, index),
-            seq_len,
-            self.privileged_dim,
-            "next_privileged",
+        next_target_relative = self._ensure_2d(
+            self._require_tensor_field(record, "next_target_relative", torch.float32, index),
+            full_len,
+            self.target_relative_dim,
+            "next_target_relative",
         )
         expert_action = self._ensure_2d(
             self._require_tensor_field(record, "expert_action", torch.float32, index),
-            seq_len,
+            full_len,
             self.action_dim,
             "expert_action",
         )
         item: Dict[str, Optional[torch.Tensor]] = {
             "images": images.float(),
-            "text_tokens": text["text_tokens"].long(),  # type: ignore[union-attr]
-            "attention_mask": None if text["attention_mask"] is None else text["attention_mask"].long(),
-            "privileged": privileged.float(),
-            "next_privileged": next_privileged.float(),
-            "prev_actions": prev_actions.float(),
-            "expert_action": expert_action.float(),
+            "text_tokens": self._slice_time_tensor(text["text_tokens"].long(), full_len, start, end),  # type: ignore[union-attr]
+            "attention_mask": None if text["attention_mask"] is None else self._slice_time_tensor(text["attention_mask"].long(), full_len, start, end),
+            "target_relative": target_relative[start:end].float(),
+            "next_target_relative": next_target_relative[start:end].float(),
+            "prev_actions": prev_actions[start:end].float(),
+            "expert_action": expert_action[start:end].float(),
         }
         if self.use_target_visual_guidance:
             if self.use_attention_heatmap:
                 item["attention_heatmaps"] = make_attention_heatmap(
-                    privileged.float(),
+                    item["target_relative"].float(),  # type: ignore[union-attr]
                     image_hw=(images.shape[-2], images.shape[-1]),
                     fov_deg=self.visual_guidance_fov_deg,
                     sigma=self.attention_heatmap_sigma,
@@ -326,9 +371,8 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
         "total",
         "action",
         "kl",
-        "privileged",
-        "prior_privileged",
-        "rollout_privileged",
+        "next_target_relative",
+        "prior_next_target_relative",
     ]
     parts = []
     for key in order:
@@ -346,9 +390,8 @@ def _tqdm_train_postfix(avg: Dict[str, float]) -> Dict[str, str]:
         "total",
         "action",
         "kl",
-        "privileged",
-        "prior_privileged",
-        "rollout_privileged",
+        "next_target_relative",
+        "prior_next_target_relative",
     ]
     out: Dict[str, str] = {}
     for key in order:
@@ -364,6 +407,14 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     if isinstance(model, (torch.nn.DataParallel, DDP)):
         return model.module
     return model
+
+
+def _trainable_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    """Checkpoint only trainable params to avoid repeatedly writing frozen encoders."""
+    unwrapped = _unwrap_model(model)
+    trainable_names = {name for name, param in unwrapped.named_parameters() if param.requires_grad}
+    state = unwrapped.state_dict()
+    return {name: tensor for name, tensor in state.items() if name in trainable_names}
 
 
 def _ddp_is_initialized() -> bool:
@@ -397,7 +448,7 @@ def _reduce_metrics(metrics: Dict[str, float], device: torch.device, use_ddp: bo
 
 
 @torch.no_grad()
-def evaluate(model: PrivilegedTeacherWorldModelDiT, loader: DataLoader, cfg: ModelConfig, device: torch.device) -> Dict[str, float]:
+def evaluate(model: TeacherWorldModelDiT, loader: DataLoader, cfg: ModelConfig, device: torch.device) -> Dict[str, float]:
     model.eval()
     acc: Dict[str, float] = {}
     count = 0
@@ -409,7 +460,7 @@ def evaluate(model: PrivilegedTeacherWorldModelDiT, loader: DataLoader, cfg: Mod
         outputs = model(
             images=batch["images"],
             text_tokens=batch["text_tokens"],
-            privileged=batch["privileged"],
+            target_relative=batch["target_relative"],
             prev_actions=batch["prev_actions"],
             attention_mask=batch["attention_mask"],
             attention_heatmaps=batch.get("attention_heatmaps"),
@@ -441,7 +492,7 @@ def main() -> None:
     parser.add_argument("--dinov2-model-name", type=str, default=LOCAL_DINOV2_MODEL_PATH)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--seq-len", type=int, default=16)
-    parser.add_argument("--privileged-dim", type=int, default=3)
+    parser.add_argument("--target-relative-dim", type=int, default=3)
     parser.add_argument("--action-dim", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)
@@ -471,16 +522,16 @@ def main() -> None:
         help="true/false: true=DiT diffusion denoising actor；false=MLP direct action head。",
     )
     parser.add_argument(
-        "--privileged-fusion-mode",
+        "--target-token-fusion-mode",
         type=str,
-        default=_DEFAULT_CFG.privileged_fusion_mode,
+        default=_DEFAULT_CFG.target_token_fusion_mode,
         choices=["attention", "concat"],
         help="attention=null target token participates in cross-attention；concat=append null target embedding after image/text fusion。",
     )
-    parser.add_argument("--train-next-privileged", type=_str2bool, default=_DEFAULT_CFG.train_next_privileged)
-    parser.add_argument("--train-rollout", type=_str2bool, default=_DEFAULT_CFG.train_rollout)
-    parser.add_argument("--next-privileged-loss-weight", type=float, default=_DEFAULT_CFG.next_privileged_loss_weight)
-    parser.add_argument("--prior-privileged-loss-weight", type=float, default=_DEFAULT_CFG.prior_privileged_loss_weight)
+    parser.add_argument("--train-next-target-relative", type=_str2bool, default=_DEFAULT_CFG.train_next_target_relative)
+    parser.add_argument("--train-rollout", type=_str2bool, default=False, help="Deprecated; prediction-head rollout supervision is disabled.")
+    parser.add_argument("--next-target-relative-loss-weight", type=float, default=_DEFAULT_CFG.next_target_relative_loss_weight)
+    parser.add_argument("--prior-target-relative-loss-weight", type=float, default=_DEFAULT_CFG.prior_target_relative_loss_weight)
     parser.add_argument("--rollout-loss-weight", type=float, default=_DEFAULT_CFG.rollout_loss_weight)
     parser.add_argument("--rollout-horizon", type=int, default=_DEFAULT_CFG.rollout_horizon)
     parser.add_argument("--direct-action-loss-weight", type=float, default=1.0)
@@ -512,7 +563,7 @@ def main() -> None:
         dinov2_freeze=args.freeze_dinov2,
         clip_text_model_name=args.clip_text_model_name,
         clip_text_freeze=args.freeze_clip_text,
-        privileged_dim=args.privileged_dim,
+        target_relative_dim=args.target_relative_dim,
         action_dim=args.action_dim,
         action_sequence_horizon=args.action_sequence_horizon,
         action_diffusion_steps=args.diffusion_steps,
@@ -520,7 +571,7 @@ def main() -> None:
         max_vel=args.max_vel,
         max_yaw_rate=args.max_yaw_rate,
         max_speed_norm=args.max_speed_norm,
-        privileged_fusion_mode=args.privileged_fusion_mode,
+        target_token_fusion_mode=args.target_token_fusion_mode,
         use_target_visual_guidance=args.use_target_visual_guidance,
         use_attention_heatmap=args.use_attention_heatmap,
         visual_guidance_fov_deg=args.visual_guidance_fov_deg,
@@ -528,10 +579,10 @@ def main() -> None:
         use_diffusion_actor=args.use_diffusion_actor,
         train_kl=True,
         train_direct_action=True,
-        train_next_privileged=args.train_next_privileged,
-        train_rollout=args.train_rollout,
-        next_privileged_loss_weight=args.next_privileged_loss_weight,
-        prior_privileged_loss_weight=args.prior_privileged_loss_weight,
+        train_next_target_relative=args.train_next_target_relative,
+        train_rollout=False,
+        next_target_relative_loss_weight=args.next_target_relative_loss_weight,
+        prior_target_relative_loss_weight=args.prior_target_relative_loss_weight,
         rollout_loss_weight=args.rollout_loss_weight,
         rollout_horizon=args.rollout_horizon,
         direct_action_loss_weight=args.direct_action_loss_weight,
@@ -568,17 +619,17 @@ def main() -> None:
         print(
             "[cfg curriculum] "
             f"diffusion={cfg.use_diffusion_actor} | "
-            f"privileged_input=disabled fusion={cfg.privileged_fusion_mode} | "
+            f"low_dim_target_input=off fusion={cfg.target_token_fusion_mode} | "
             f"固定开启: kl={cfg.train_kl} direct_action={cfg.train_direct_action} | "
             f"action_w={cfg.direct_action_loss_weight} yaw_w={cfg.action_yaw_loss_weight} | "
-            f"WAM: next_privileged={cfg.train_next_privileged} rollout={cfg.train_rollout} | "
+            f"WAM: next_target_relative={cfg.train_next_target_relative} rollout_head=false | "
             f"visual_guidance={cfg.use_target_visual_guidance} heatmap={cfg.use_attention_heatmap}"
         )
     train_dataset = TrajectoryDataset(
         records=train_records,
         image_size=args.image_size,
         seq_len=args.seq_len,
-        privileged_dim=args.privileged_dim,
+        target_relative_dim=args.target_relative_dim,
         action_dim=args.action_dim,
         direction_bins=cfg.direction_bins,
         distance_bins=cfg.distance_bins,
@@ -620,7 +671,7 @@ def main() -> None:
             records=val_records,
             image_size=args.image_size,
             seq_len=args.seq_len,
-            privileged_dim=args.privileged_dim,
+            target_relative_dim=args.target_relative_dim,
             action_dim=args.action_dim,
             direction_bins=cfg.direction_bins,
             distance_bins=cfg.distance_bins,
@@ -643,7 +694,7 @@ def main() -> None:
             collate_fn=collate_fn,
         )
 
-    model = PrivilegedTeacherWorldModelDiT(cfg).to(device)
+    model = TeacherWorldModelDiT(cfg).to(device)
     if use_ddp:
         model = DDP(
             model,
@@ -674,7 +725,10 @@ def main() -> None:
     best_val = math.inf
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
-        missing, unexpected = _unwrap_model(model).load_state_dict(ckpt["model"], strict=False)
+        missing, unexpected = _unwrap_model(model).load_state_dict(
+            migrate_legacy_state_dict_keys(ckpt["model"]),
+            strict=False,
+        )
         if _is_main_process() and (missing or unexpected):
             print(f"[resume] load strict=False: missing={len(missing)} unexpected={len(unexpected)}")
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -705,7 +759,7 @@ def main() -> None:
                     outputs = model(
                         images=batch["images"],
                         text_tokens=batch["text_tokens"],
-                        privileged=batch["privileged"],
+                        target_relative=batch["target_relative"],
                         prev_actions=batch["prev_actions"],
                         attention_mask=batch["attention_mask"],
                         attention_heatmaps=batch.get("attention_heatmaps"),
@@ -754,7 +808,8 @@ def main() -> None:
             metric = train_avg["total"] if val_avg is None else val_avg["total"]
             ckpt = {
                 "epoch": epoch,
-                "model": _unwrap_model(model).state_dict(),
+                "model": _trainable_state_dict(model),
+                "model_state_format": "trainable_only",
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "cfg": cfg.__dict__,

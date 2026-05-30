@@ -26,11 +26,11 @@ class TeacherPredictionHeads(nn.Module):
         super().__init__()
         feat_dim = cfg.feature_dim
         hidden = cfg.head_hidden_dim
-        self.privileged = ScalarHead(feat_dim, hidden, out_dim=cfg.privileged_dim, dropout=cfg.dropout)
+        self.next_target_relative = ScalarHead(feat_dim, hidden, out_dim=cfg.target_relative_dim, dropout=cfg.dropout)
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
         return {
-            "privileged": self.privileged(feat),
+            "next_target_relative": self.next_target_relative(feat),
         }
 
 
