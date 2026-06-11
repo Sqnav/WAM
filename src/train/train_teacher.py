@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,13 +31,11 @@ except Exception:
 
 
 _DEFAULT_CFG = ModelConfig()
-LOCAL_CLIP_MODEL_PATH = "/data1/ysq/Worldmodel/model/clip-vit-base-patch32"
-LOCAL_DINOV2_MODEL_PATH = "/data1/ysq/Worldmodel/model/dinov2-base"
 
 try:
-    from transformers import CLIPTokenizerFast
+    import deepspeed
 except Exception:
-    CLIPTokenizerFast = None
+    deepspeed = None
 
 
 def _str2bool(value: str | bool) -> bool:
@@ -48,6 +48,28 @@ def _str2bool(value: str | bool) -> bool:
     if s in ("0", "false", "f", "no", "n", "off"):
         return False
     raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
+
+
+def _cuda_amp_dtype(cfg: ModelConfig) -> torch.dtype:
+    dtype_name = str(getattr(cfg, "wan22_torch_dtype", "bfloat16")).lower()
+    if dtype_name in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if dtype_name in ("fp16", "float16", "half"):
+        return torch.float16
+    return torch.float32
+
+
+def _autocast_context(device: torch.device, cfg: ModelConfig):
+    if device.type != "cuda":
+        return nullcontext()
+    amp_dtype = _cuda_amp_dtype(cfg)
+    if amp_dtype == torch.float32:
+        return nullcontext()
+    return torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+
+
+def _grad_scaler_enabled(device: torch.device, cfg: ModelConfig, use_deepspeed: bool) -> bool:
+    return device.type == "cuda" and (not use_deepspeed) and _cuda_amp_dtype(cfg) == torch.float16
 
 
 def seed_everything(seed: int) -> None:
@@ -77,16 +99,21 @@ class TrajectoryDataset(Dataset):
         action_dim: int,
         direction_bins: int = 8,
         distance_bins: int = 6,
-        tokenizer_name: Optional[str] = None,
         text_context_length: int = 77,
         random_crop: bool = True,
         use_target_visual_guidance: bool = False,
         use_attention_heatmap: bool = True,
         visual_guidance_fov_deg: float = 90.0,
         attention_heatmap_sigma: float = 0.08,
+        wan_latent_cache_root: Optional[str] = None,
+        action_video_freq_ratio: int = 1,
+        use_target_belief_tracker: bool = False,
     ) -> None:
         self.records = records
         self.seq_len = seq_len
+        self.action_video_freq_ratio = max(int(action_video_freq_ratio), 1)
+        self.use_target_belief_tracker = bool(use_target_belief_tracker)
+        self.image_size = int(image_size)
         self.target_relative_dim = target_relative_dim
         self.action_dim = action_dim
         self.direction_bins = direction_bins
@@ -97,20 +124,13 @@ class TrajectoryDataset(Dataset):
         self.use_attention_heatmap = bool(use_attention_heatmap)
         self.visual_guidance_fov_deg = float(visual_guidance_fov_deg)
         self.attention_heatmap_sigma = float(attention_heatmap_sigma)
+        self.wan_latent_cache_root = Path(wan_latent_cache_root) if wan_latent_cache_root else None
         self.transform = transforms.Compose(
             [
                 transforms.Resize((image_size, image_size)),
                 transforms.ToTensor(),
             ]
         )
-        self.tokenizer = None
-        if tokenizer_name is not None:
-            if CLIPTokenizerFast is None:
-                raise ImportError("transformers 未安装，无法对原始 instructions 做 CLIP tokenization。")
-            self.tokenizer = CLIPTokenizerFast.from_pretrained(
-                tokenizer_name,
-                local_files_only=True,
-            )
 
     def __len__(self) -> int:
         return len(self.records)
@@ -168,6 +188,31 @@ class TrajectoryDataset(Dataset):
             raise ValueError("rgb_paths 不能为空。")
         return torch.stack(frames, dim=0)
 
+    def _load_rgb_frame(self, record: Dict[str, Any], frame_index: int) -> torch.Tensor:
+        return self._load_rgb_sequence(record, start=frame_index, end=frame_index + 1)[0]
+
+    def _latent_cache_path(self, record: Dict[str, Any], start: int, end: int) -> Optional[Path]:
+        if self.wan_latent_cache_root is None:
+            return None
+        scene = str(record.get("scene_id", "unknown_scene"))
+        traj = str(record.get("trajectory_name", record.get("trajectory_id", "unknown_traj")))
+        suffix = "" if self.action_video_freq_ratio == 1 else f"_video{self.action_video_freq_ratio}"
+        return self.wan_latent_cache_root / scene / traj / f"seq{self.seq_len}{suffix}_start{start:04d}_end{end:04d}.pt"
+
+    def _load_cached_wan_latents(self, record: Dict[str, Any], start: int, end: int) -> Optional[torch.Tensor]:
+        path = self._latent_cache_path(record, start, end)
+        if path is None or not path.exists():
+            return None
+        try:
+            latents = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            latents = torch.load(path, map_location="cpu")
+        if isinstance(latents, dict):
+            latents = latents.get("latents")
+        if not torch.is_tensor(latents) or latents.ndim != 4:
+            raise ValueError(f"Invalid cached Wan latent at {path}: expected [C,T,H,W].")
+        return latents.float()
+
     def _load_tensor_field(self, record: Dict[str, Any], key: str, dtype: torch.dtype) -> Optional[torch.Tensor]:
         if key not in record:
             return None
@@ -188,27 +233,20 @@ class TrajectoryDataset(Dataset):
             raise KeyError(f"{self._record_name(record, index)} 缺少必需字段 `{key}`{suffix}。")
         return tensor
 
-    def _tokenize_if_needed(self, record: Dict[str, Any], seq_len: int, index: int) -> Dict[str, Optional[torch.Tensor]]:
+    def _text_tokens_or_placeholder(self, record: Dict[str, Any], seq_len: int, index: int) -> Dict[str, Optional[torch.Tensor]]:
         text_tokens = self._load_tensor_field(record, "text_tokens", torch.long)
         attention_mask = self._load_tensor_field(record, "attention_mask", torch.long)
         if text_tokens is not None:
             return {"text_tokens": text_tokens.long(), "attention_mask": None if attention_mask is None else attention_mask.long()}
 
-        instructions = record.get("instructions")
-        if instructions is None:
+        if record.get("instructions") is None:
             raise KeyError(f"{self._record_name(record, index)} 需要提供 text_tokens 或 instructions。")
-        if self.tokenizer is None:
-            raise ValueError("发现原始 instructions，但未提供 --tokenizer-name。")
-
-        # instructions can be a single string or a per-timestep list of strings.
-        enc = self.tokenizer(
-            instructions,
-            padding="max_length",
-            truncation=True,
-            max_length=self.text_context_length,
-            return_tensors="pt",
-        )
-        return {"text_tokens": enc["input_ids"].long(), "attention_mask": enc["attention_mask"].long()}
+        # Wan2.2 consumes raw instruction strings. Keep placeholder token tensors
+        # only to satisfy the shared model call signature and collate path.
+        return {
+            "text_tokens": torch.zeros(seq_len, 1, dtype=torch.long),
+            "attention_mask": torch.ones(seq_len, 1, dtype=torch.long),
+        }
 
     def _ensure_2d(self, x: torch.Tensor, length: int, dim: int, key: str) -> torch.Tensor:
         if x.ndim == 1:
@@ -257,12 +295,15 @@ class TrajectoryDataset(Dataset):
 
     def _crop_or_pad(self, item: Dict[str, Optional[torch.Tensor]]) -> Dict[str, Optional[torch.Tensor]]:
         length = item["images"].shape[0]  # type: ignore[union-attr]
+        static_keys = {"reference_images", "reference_target_relative"}
         if length >= self.seq_len:
             start = random.randint(0, length - self.seq_len) if self.random_crop else 0
             end = start + self.seq_len
             cropped: Dict[str, Optional[torch.Tensor]] = {}
             for k, v in item.items():
                 if not isinstance(v, torch.Tensor):
+                    cropped[k] = v
+                elif k in static_keys:
                     cropped[k] = v
                 elif v.ndim >= 1 and v.shape[0] == length:
                     cropped[k] = v[start:end]
@@ -275,6 +316,9 @@ class TrajectoryDataset(Dataset):
         padded: Dict[str, Optional[torch.Tensor]] = {}
         for k, v in item.items():
             if not isinstance(v, torch.Tensor):
+                padded[k] = v
+                continue
+            if k in static_keys:
                 padded[k] = v
                 continue
             if v.ndim >= 1 and v.shape[0] == length:
@@ -296,9 +340,23 @@ class TrajectoryDataset(Dataset):
 
         full_len = self._sequence_length(record, index)
         start, end = self._select_window(full_len)
-        images = self._load_rgb_sequence(record, start=start, end=end)
+        video_latents = None
+        images = None
+        if end - start == self.seq_len:
+            video_latents = self._load_cached_wan_latents(record, start=start, end=end)
+        if video_latents is None:
+            images = self._load_rgb_sequence(record, start=start, end=end)
+        else:
+            images = torch.zeros(end - start, 3, self.image_size, self.image_size, dtype=torch.float32)
 
-        text = self._tokenize_if_needed(record, full_len, index)
+        text = self._text_tokens_or_placeholder(record, full_len, index)
+        raw_instructions = record.get("instructions")
+        if isinstance(raw_instructions, list):
+            instruction_text = str(raw_instructions[start] if start < len(raw_instructions) else raw_instructions[0])
+        elif raw_instructions is None:
+            instruction_text = ""
+        else:
+            instruction_text = str(raw_instructions)
         target_relative = self._ensure_2d(
             self._require_tensor_field(record, "target_relative", torch.float32, index),
             full_len,
@@ -331,7 +389,13 @@ class TrajectoryDataset(Dataset):
             "next_target_relative": next_target_relative[start:end].float(),
             "prev_actions": prev_actions[start:end].float(),
             "expert_action": expert_action[start:end].float(),
+            "instructions": instruction_text,
         }
+        if self.use_target_belief_tracker:
+            item["reference_images"] = self._load_rgb_frame(record, 0).float()
+            item["reference_target_relative"] = target_relative[0].float()
+        if video_latents is not None:
+            item["video_latents"] = video_latents
         if self.use_target_visual_guidance:
             if self.use_attention_heatmap:
                 item["attention_heatmaps"] = make_attention_heatmap(
@@ -347,6 +411,9 @@ def collate_fn(batch: List[Dict[str, Optional[torch.Tensor]]]) -> Dict[str, Opti
     out: Dict[str, Optional[torch.Tensor]] = {}
     for key in batch[0].keys():
         values = [x[key] for x in batch]
+        if all(isinstance(v, str) for v in values):
+            out[key] = values  # type: ignore[assignment]
+            continue
         if all(v is None for v in values):
             out[key] = None
         elif any(v is None for v in values):
@@ -370,40 +437,64 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
     order = [
         "total",
         "action",
+        "video",
+        "next_target_relative",
+        "prior_next_target_relative",
+        "kl",
+    ]
+    hidden_when_zero = {
         "kl",
         "next_target_relative",
         "prior_next_target_relative",
-    ]
+        "video_x0",
+        "x0_action",
+    }
     parts = []
     for key in order:
-        if key in metrics:
+        if key in metrics and not (key in hidden_when_zero and abs(metrics[key]) < 1e-12):
             parts.append(f"{key}={metrics[key]:.4f}")
     for key in sorted(metrics.keys()):
-        if key not in order:
-            parts.append(f"{key}={metrics[key]:.4f}")
+        if key in order:
+            continue
+        if key in hidden_when_zero and abs(metrics[key]) < 1e-12:
+            continue
+        parts.append(f"{key}={metrics[key]:.4f}")
     return " | ".join(parts)
 
 
 def _tqdm_train_postfix(avg: Dict[str, float]) -> Dict[str, str]:
-    """All running-average loss keys for tqdm, four decimal places, stable order."""
+    """Active running-average loss keys for tqdm, four decimal places, stable order."""
     order = [
         "total",
         "action",
+        "video",
+        "next_target_relative",
+        "prior_next_target_relative",
+        "kl",
+    ]
+    hidden_when_zero = {
         "kl",
         "next_target_relative",
         "prior_next_target_relative",
-    ]
+        "video_x0",
+        "x0_action",
+    }
     out: Dict[str, str] = {}
     for key in order:
-        if key in avg:
+        if key in avg and not (key in hidden_when_zero and abs(avg[key]) < 1e-12):
             out[key] = f"{avg[key]:.4f}"
     for key in sorted(avg.keys()):
-        if key not in out:
-            out[key] = f"{avg[key]:.4f}"
+        if key in out:
+            continue
+        if key in hidden_when_zero and abs(avg[key]) < 1e-12:
+            continue
+        out[key] = f"{avg[key]:.4f}"
     return out
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    if hasattr(model, "module"):
+        return model.module
     if isinstance(model, (torch.nn.DataParallel, DDP)):
         return model.module
     return model
@@ -415,6 +506,37 @@ def _trainable_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
     trainable_names = {name for name, param in unwrapped.named_parameters() if param.requires_grad}
     state = unwrapped.state_dict()
     return {name: tensor for name, tensor in state.items() if name in trainable_names}
+
+
+def _wan_latent_cache_stats(
+    records: List[Dict[str, Any]],
+    cache_root: str,
+    seq_len: int,
+    action_video_freq_ratio: int = 1,
+) -> Optional[Dict[str, int]]:
+    if not cache_root:
+        return None
+    root = Path(cache_root)
+    if not root.exists():
+        return {"records": len(records), "windows": 0, "hits": 0}
+    windows = 0
+    hits = 0
+    for record in records:
+        rgb_paths = record.get("rgb_paths") or []
+        length = len(rgb_paths)
+        starts = range(0, length - seq_len + 1) if length >= seq_len else range(0, 1)
+        for start in starts:
+            end = min(start + seq_len, length)
+            if end - start != seq_len:
+                continue
+            windows += 1
+            scene = str(record.get("scene_id", "unknown_scene"))
+            traj = str(record.get("trajectory_name", record.get("trajectory_id", "unknown_traj")))
+            suffix = "" if int(action_video_freq_ratio) <= 1 else f"_video{int(action_video_freq_ratio)}"
+            path = root / scene / traj / f"seq{seq_len}{suffix}_start{start:04d}_end{end:04d}.pt"
+            if path.exists():
+                hits += 1
+    return {"records": len(records), "windows": windows, "hits": hits}
 
 
 def _ddp_is_initialized() -> bool:
@@ -437,14 +559,123 @@ def _is_main_process() -> bool:
     return _get_rank() == 0
 
 
-def _reduce_metrics(metrics: Dict[str, float], device: torch.device, use_ddp: bool) -> Dict[str, float]:
-    if not use_ddp or not metrics:
+def _reduce_metrics(metrics: Dict[str, float], device: torch.device, distributed: bool) -> Dict[str, float]:
+    if not distributed or not metrics:
         return metrics
     keys = sorted(metrics.keys())
     values = torch.tensor([float(metrics[k]) for k in keys], device=device, dtype=torch.float32)
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
     values = values / float(_get_world_size())
     return {k: float(v.item()) for k, v in zip(keys, values)}
+
+
+def _make_deepspeed_config(args: argparse.Namespace) -> Dict[str, Any]:
+    world_size = max(_get_world_size(), 1)
+    grad_accum = max(int(args.gradient_accumulation_steps), 1)
+    micro_batch = int(args.batch_size)
+    zero_optimization = {
+        "stage": 1,
+        "offload_param": {"device": "none"},
+        "overlap_comm": False,
+        "contiguous_gradients": False,
+        "reduce_bucket_size": 2e8,
+        "allgather_bucket_size": 2e8,
+    }
+    if bool(getattr(args, "deepspeed_offload_optimizer", False)):
+        zero_optimization["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
+    return {
+        "train_micro_batch_size_per_gpu": micro_batch,
+        "gradient_accumulation_steps": grad_accum,
+        "train_batch_size": micro_batch * grad_accum * world_size,
+        "bf16": {"enabled": True},
+        "zero_optimization": zero_optimization,
+        "zero_force_ds_cpu_optimizer": False,
+        "gradient_clipping": float(args.grad_clip),
+        "steps_per_print": 1000000,
+    }
+
+
+def _cosine_epoch_lr(base_lr: float, epoch: int, total_epochs: int, eta_min: float = 0.0) -> float:
+    if total_epochs <= 0:
+        return float(base_lr)
+    progress = min(max(float(epoch) / float(total_epochs), 0.0), 1.0)
+    return float(eta_min + 0.5 * (float(base_lr) - float(eta_min)) * (1.0 + math.cos(math.pi * progress)))
+
+
+def _cosine_step_lr(base_lr: float, step: int, total_steps: int, eta_min: float = 0.0) -> float:
+    if total_steps <= 0:
+        return float(base_lr)
+    progress = min(max(float(step) / float(total_steps), 0.0), 1.0)
+    return float(eta_min + 0.5 * (float(base_lr) - float(eta_min)) * (1.0 + math.cos(math.pi * progress)))
+
+
+def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
+
+
+def _init_swanlab(args: argparse.Namespace, cfg: ModelConfig, run_name: str):
+    if not bool(getattr(args, "use_swanlab", False)) or not _is_main_process():
+        return None
+    try:
+        import swanlab
+    except Exception as exc:
+        print(f"[swanlab] disabled: import failed ({exc})")
+        return None
+    try:
+        return swanlab.init(
+            project=args.swanlab_project,
+            workspace=args.swanlab_workspace or None,
+            experiment_name=run_name,
+            logdir=args.swanlab_log_dir or None,
+            mode=args.swanlab_mode,
+            config={
+                **cfg.__dict__,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "scene_list": args.scene_list,
+                "trajectory_range": args.trajectory_range,
+            },
+        )
+    except Exception as exc:
+        print(f"[swanlab] disabled: init failed ({exc})")
+        return None
+
+
+def _swanlab_log(run, metrics: Dict[str, float], step: int, prefix: str) -> None:
+    if run is None or not _is_main_process():
+        return
+    hidden_when_zero = {
+        "kl",
+        "next_target_relative",
+        "prior_next_target_relative",
+        "video_x0",
+        "x0_action",
+    }
+    active = {
+        k: float(v)
+        for k, v in metrics.items()
+        if not (k in hidden_when_zero and abs(float(v)) < 1e-12)
+    }
+    if not active:
+        return
+    try:
+        import swanlab
+        swanlab.log({f"{prefix}/{k}": v for k, v in active.items()}, step=step)
+    except Exception as exc:
+        print(f"[swanlab] log skipped: {exc}")
+
+
+def _swanlab_finish(run) -> None:
+    if run is None or not _is_main_process():
+        return
+    try:
+        import swanlab
+        swanlab.finish()
+    except Exception as exc:
+        print(f"[swanlab] finish skipped: {exc}")
 
 
 @torch.no_grad()
@@ -467,6 +698,10 @@ def evaluate(model: TeacherWorldModelDiT, loader: DataLoader, cfg: ModelConfig, 
             expert_action=batch["expert_action"],
             valid_mask=batch["valid_mask"],
             done=batch.get("done"),
+            instructions=batch.get("instructions"),
+            video_latents=batch.get("video_latents"),
+            reference_target_relative=batch.get("reference_target_relative"),
+            reference_images=batch.get("reference_images"),
         )
         losses = world_model_dit_loss(outputs, batch, cfg, valid_mask=batch["valid_mask"])
         summary = summarize_losses(losses)
@@ -487,39 +722,61 @@ def main() -> None:
     parser.add_argument("--max-yaw-rate", type=float, default=_DEFAULT_CFG.max_yaw_rate, help="Physical max yaw rate for action normalization.")
     parser.add_argument("--max-speed-norm", type=float, default=_DEFAULT_CFG.max_speed_norm, help="Physical speed-norm cap used both in training targets and online action execution.")
     parser.add_argument("--save-dir", type=str, required=True)
-    parser.add_argument("--tokenizer-name", type=str, default=LOCAL_CLIP_MODEL_PATH)
-    parser.add_argument("--clip-text-model-name", type=str, default=LOCAL_CLIP_MODEL_PATH)
-    parser.add_argument("--dinov2-model-name", type=str, default=LOCAL_DINOV2_MODEL_PATH)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--target-relative-dim", type=int, default=3)
     parser.add_argument("--action-dim", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--max-train-steps", type=int, default=0, help="Stop after this many optimizer update steps; 0 keeps epoch-based training.")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--wan-latent-cache-root", type=str, default="")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--action-sequence-horizon", type=int, default=_DEFAULT_CFG.action_sequence_horizon)
+    parser.add_argument("--action-video-freq-ratio", type=int, default=_DEFAULT_CFG.fastwam_action_video_freq_ratio)
     parser.add_argument("--diffusion-steps", type=int, default=20)
     parser.add_argument("--sampling-steps", type=int, default=20)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--save-every-epochs", type=int, default=1, help="Write last.pt every N epochs; always save on final epoch.")
+    parser.add_argument("--save-best-checkpoint", type=_str2bool, default=True, help="Whether to write best.pt on checkpoint epochs.")
+    parser.add_argument("--save-optimizer-state", type=_str2bool, default=True, help="Include optimizer/scheduler state in checkpoints when not using DeepSpeed.")
     parser.add_argument(
         "--multi-gpu",
         action="store_true",
-        help="Enable multi-GPU training. With torchrun this uses DDP; otherwise falls back to DataParallel.",
+        help="Enable multi-GPU training. Prefer --deepspeed; legacy DDP/DataParallel remains available when --deepspeed is off.",
     )
-    parser.add_argument("--freeze-clip-text", action="store_true", default=True)
-    parser.add_argument("--finetune-clip-text", action="store_false", dest="freeze_clip_text")
-    parser.add_argument("--freeze-dinov2", action="store_true", default=True)
-    parser.add_argument("--finetune-dinov2", action="store_false", dest="freeze_dinov2")
+    parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed engine instead of DDP/DataParallel.")
+    parser.add_argument("--deepspeed-config", type=str, default=None, help="Path to DeepSpeed JSON config.")
+    parser.add_argument("--deepspeed-offload-optimizer", type=_str2bool, default=False)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--local_rank", type=int, default=-1, help="Passed by DeepSpeed launcher.")
+    parser.add_argument("--use-swanlab", type=_str2bool, default=False)
+    parser.add_argument("--swanlab-project", type=str, default="WAM-FastWAM")
+    parser.add_argument("--swanlab-experiment-name", type=str, default=None)
+    parser.add_argument("--swanlab-workspace", type=str, default="")
+    parser.add_argument("--swanlab-log-dir", type=str, default=None)
+    parser.add_argument("--swanlab-mode", type=str, default="cloud", choices=["cloud", "local", "offline", "disabled"])
+    parser.add_argument("--use-wan22-encoders", type=_str2bool, default=_DEFAULT_CFG.use_wan22_encoders)
+    parser.add_argument("--wan22-model-base-path", type=str, default=_DEFAULT_CFG.wan22_model_base_path)
+    parser.add_argument("--wan22-fastwam-src-path", type=str, default=_DEFAULT_CFG.wan22_fastwam_src_path)
+    parser.add_argument("--wan22-skip-download", type=_str2bool, default=_DEFAULT_CFG.wan22_skip_download)
+    parser.add_argument("--wan22-text-context-length", type=int, default=_DEFAULT_CFG.wan22_text_context_length)
+    parser.add_argument("--wan22-text-encode-batch-size", type=int, default=_DEFAULT_CFG.wan22_text_encode_batch_size)
     parser.add_argument(
         "--use-diffusion-actor",
         type=_str2bool,
         default=True,
         help="true/false: true=DiT diffusion denoising actor；false=MLP direct action head。",
+    )
+    parser.add_argument(
+        "--use-fastwam-mot",
+        type=_str2bool,
+        default=_DEFAULT_CFG.use_fastwam_mot,
+        help="true/false: true=FastWAM video/action MoT；false=legacy MLP/DiT actor path。",
     )
     parser.add_argument(
         "--target-token-fusion-mode",
@@ -536,11 +793,27 @@ def main() -> None:
     parser.add_argument("--rollout-horizon", type=int, default=_DEFAULT_CFG.rollout_horizon)
     parser.add_argument("--direct-action-loss-weight", type=float, default=1.0)
     parser.add_argument("--action-yaw-loss-weight", type=float, default=_DEFAULT_CFG.action_yaw_loss_weight)
-    parser.add_argument("--x0-action-loss-weight", type=float, default=1.0)
+    parser.add_argument("--x0-action-loss-weight", type=float, default=_DEFAULT_CFG.x0_action_loss_weight)
     parser.add_argument("--use-target-visual-guidance", type=_str2bool, default=_DEFAULT_CFG.use_target_visual_guidance)
     parser.add_argument("--use-attention-heatmap", type=_str2bool, default=_DEFAULT_CFG.use_attention_heatmap)
     parser.add_argument("--visual-guidance-fov-deg", type=float, default=_DEFAULT_CFG.visual_guidance_fov_deg)
     parser.add_argument("--attention-heatmap-sigma", type=float, default=_DEFAULT_CFG.attention_heatmap_sigma)
+    parser.add_argument("--use-heatmap-tensor-encoder", type=_str2bool, default=_DEFAULT_CFG.use_heatmap_tensor_encoder)
+    parser.add_argument("--heatmap-token-scale", type=float, default=_DEFAULT_CFG.heatmap_token_scale)
+    parser.add_argument("--fastwam-heatmap-context-grid", type=int, default=_DEFAULT_CFG.fastwam_heatmap_context_grid)
+    parser.add_argument("--use-target-belief-tracker", type=_str2bool, default=_DEFAULT_CFG.use_target_belief_tracker)
+    parser.add_argument("--target-belief-token-scale", type=float, default=_DEFAULT_CFG.target_belief_token_scale)
+    parser.add_argument("--target-belief-update-rate", type=float, default=_DEFAULT_CFG.target_belief_update_rate)
+    parser.add_argument("--target-belief-min-confidence", type=float, default=_DEFAULT_CFG.target_belief_min_confidence)
+    parser.add_argument("--target-belief-temperature", type=float, default=_DEFAULT_CFG.target_belief_temperature)
+    parser.add_argument("--target-belief-loss-weight", type=float, default=_DEFAULT_CFG.target_belief_loss_weight)
+    parser.add_argument("--target-belief-motion-weight", type=float, default=_DEFAULT_CFG.target_belief_motion_weight)
+    parser.add_argument("--target-belief-update-sharpness", type=float, default=_DEFAULT_CFG.target_belief_update_sharpness)
+    parser.add_argument("--fastwam-lambda-action", type=float, default=_DEFAULT_CFG.fastwam_lambda_action)
+    parser.add_argument("--fastwam-lambda-video", type=float, default=_DEFAULT_CFG.fastwam_lambda_video)
+    parser.add_argument("--fastwam-skip-dit-load-from-pretrain", type=_str2bool, default=_DEFAULT_CFG.fastwam_skip_dit_load_from_pretrain)
+    parser.add_argument("--fastwam-action-dit-pretrained-path", type=str, default=_DEFAULT_CFG.fastwam_action_dit_pretrained_path)
+    parser.add_argument("--fastwam-mot-checkpoint-mixed-attn", type=_str2bool, default=_DEFAULT_CFG.fastwam_mot_checkpoint_mixed_attn)
     args = parser.parse_args()
 
     seed_everything(args.seed + _get_rank())
@@ -548,9 +821,17 @@ def main() -> None:
     if _is_main_process():
         save_dir.mkdir(parents=True, exist_ok=True)
 
-    # DDP init (torchrun sets LOCAL_RANK/RANK/WORLD_SIZE)
-    use_ddp = args.multi_gpu and torch.cuda.is_available() and _get_world_size() > 1
-    if use_ddp:
+    use_deepspeed = bool(args.deepspeed)
+    if use_deepspeed and deepspeed is None:
+        raise ImportError("DeepSpeed is not installed in this environment.")
+    use_distributed = (use_deepspeed or args.multi_gpu) and torch.cuda.is_available() and _get_world_size() > 1
+    use_ddp = (not use_deepspeed) and args.multi_gpu and torch.cuda.is_available() and _get_world_size() > 1
+    if use_deepspeed:
+        torch.cuda.set_device(_get_local_rank())
+        if dist.is_available() and not dist.is_initialized() and _get_world_size() > 1:
+            deepspeed.init_distributed(dist_backend="nccl")
+        device = torch.device("cuda", _get_local_rank())
+    elif use_ddp:
         torch.cuda.set_device(_get_local_rank())
         dist.init_process_group(backend="nccl", init_method="env://")
         device = torch.device("cuda", _get_local_rank())
@@ -559,13 +840,17 @@ def main() -> None:
 
     cfg = ModelConfig(
         image_size=args.image_size,
-        dinov2_model_name=args.dinov2_model_name,
-        dinov2_freeze=args.freeze_dinov2,
-        clip_text_model_name=args.clip_text_model_name,
-        clip_text_freeze=args.freeze_clip_text,
+        text_context_length=args.wan22_text_context_length if args.use_wan22_encoders else _DEFAULT_CFG.text_context_length,
+        use_wan22_encoders=args.use_wan22_encoders,
+        wan22_model_base_path=args.wan22_model_base_path,
+        wan22_fastwam_src_path=args.wan22_fastwam_src_path,
+        wan22_skip_download=args.wan22_skip_download,
+        wan22_text_context_length=args.wan22_text_context_length,
+        wan22_text_encode_batch_size=args.wan22_text_encode_batch_size,
         target_relative_dim=args.target_relative_dim,
         action_dim=args.action_dim,
         action_sequence_horizon=args.action_sequence_horizon,
+        fastwam_action_video_freq_ratio=max(int(args.action_video_freq_ratio), 1),
         action_diffusion_steps=args.diffusion_steps,
         action_sampling_steps=args.sampling_steps,
         max_vel=args.max_vel,
@@ -576,8 +861,21 @@ def main() -> None:
         use_attention_heatmap=args.use_attention_heatmap,
         visual_guidance_fov_deg=args.visual_guidance_fov_deg,
         attention_heatmap_sigma=args.attention_heatmap_sigma,
+        use_heatmap_tensor_encoder=args.use_heatmap_tensor_encoder,
+        heatmap_token_scale=args.heatmap_token_scale,
+        fastwam_heatmap_context_grid=args.fastwam_heatmap_context_grid,
+        use_target_belief_tracker=args.use_target_belief_tracker,
+        target_belief_token_scale=args.target_belief_token_scale,
+        target_belief_update_rate=args.target_belief_update_rate,
+        target_belief_min_confidence=args.target_belief_min_confidence,
+        target_belief_temperature=args.target_belief_temperature,
+        target_belief_loss_weight=args.target_belief_loss_weight,
+        target_belief_motion_weight=args.target_belief_motion_weight,
+        target_belief_update_sharpness=args.target_belief_update_sharpness,
         use_diffusion_actor=args.use_diffusion_actor,
-        train_kl=True,
+        use_fastwam_mot=args.use_fastwam_mot,
+        use_rssm=False,
+        train_kl=False,
         train_direct_action=True,
         train_next_target_relative=args.train_next_target_relative,
         train_rollout=False,
@@ -588,7 +886,24 @@ def main() -> None:
         direct_action_loss_weight=args.direct_action_loss_weight,
         action_yaw_loss_weight=args.action_yaw_loss_weight,
         x0_action_loss_weight=args.x0_action_loss_weight,
+        fastwam_lambda_action=args.fastwam_lambda_action,
+        fastwam_lambda_video=args.fastwam_lambda_video,
+        fastwam_skip_dit_load_from_pretrain=args.fastwam_skip_dit_load_from_pretrain,
+        fastwam_action_dit_pretrained_path=args.fastwam_action_dit_pretrained_path,
+        fastwam_mot_checkpoint_mixed_attn=args.fastwam_mot_checkpoint_mixed_attn,
     )
+    action_video_freq_ratio = max(int(args.action_video_freq_ratio), 1)
+    if (args.seq_len - 1) % action_video_freq_ratio != 0:
+        raise ValueError(
+            "--seq-len must satisfy (seq_len - 1) % action_video_freq_ratio == 0; "
+            f"got seq_len={args.seq_len}, action_video_freq_ratio={action_video_freq_ratio}."
+        )
+    sampled_video_len = (args.seq_len - 1) // action_video_freq_ratio + 1
+    if sampled_video_len % 4 != 1:
+        raise ValueError(
+            "Sampled video frame count must satisfy T % 4 == 1 for Wan VAE; "
+            f"got sampled_video_len={sampled_video_len}."
+        )
 
     scene_list = [s.strip() for s in args.scene_list.split(",") if s.strip()]
     if not scene_list:
@@ -616,14 +931,28 @@ def main() -> None:
             print(f"[dataset] total={len(records)}, train={len(train_records)}, val={len(val_records)}")
         else:
             print(f"[dataset] total={len(records)}, train={len(train_records)}")
+        cache_stats = _wan_latent_cache_stats(records, args.wan_latent_cache_root, args.seq_len, action_video_freq_ratio)
+        if cache_stats is not None:
+            hits = cache_stats["hits"]
+            windows = cache_stats["windows"]
+            ratio = (hits / windows) if windows else 0.0
+            print(
+                f"[wan-latents] cache_root={args.wan_latent_cache_root} "
+                f"seq_len={args.seq_len} video_ratio={action_video_freq_ratio} hits={hits}/{windows} ({ratio:.1%})"
+            )
+            if windows > 0 and hits == 0:
+                print("[wan-latents] WARNING: no matching cached latents; training will encode RGB videos online.")
         print(
             "[cfg curriculum] "
             f"diffusion={cfg.use_diffusion_actor} | "
-            f"low_dim_target_input=off fusion={cfg.target_token_fusion_mode} | "
-            f"固定开启: kl={cfg.train_kl} direct_action={cfg.train_direct_action} | "
+            f"architecture=fastwam_video_action_mot_no_rssm fusion={cfg.target_token_fusion_mode} | "
+            f"fastwam_mot={cfg.use_fastwam_mot} | "
+            f"action_video_freq_ratio={cfg.fastwam_action_video_freq_ratio} | "
+            f"kl={cfg.train_kl} direct_action={cfg.train_direct_action} | "
             f"action_w={cfg.direct_action_loss_weight} yaw_w={cfg.action_yaw_loss_weight} | "
-            f"WAM: next_target_relative={cfg.train_next_target_relative} rollout_head=false | "
-            f"visual_guidance={cfg.use_target_visual_guidance} heatmap={cfg.use_attention_heatmap}"
+            f"WAM auxiliary: next_target_relative={cfg.train_next_target_relative} rollout_head=false | "
+            f"visual_guidance={cfg.use_target_visual_guidance} heatmap={cfg.use_attention_heatmap} | "
+            f"target_belief_tracker={cfg.use_target_belief_tracker} belief_w={cfg.target_belief_loss_weight}"
         )
     train_dataset = TrajectoryDataset(
         records=train_records,
@@ -633,13 +962,15 @@ def main() -> None:
         action_dim=args.action_dim,
         direction_bins=cfg.direction_bins,
         distance_bins=cfg.distance_bins,
-        tokenizer_name=args.tokenizer_name,
         text_context_length=cfg.text_context_length,
         random_crop=True,
         use_target_visual_guidance=cfg.use_target_visual_guidance,
         use_attention_heatmap=cfg.use_attention_heatmap,
         visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
         attention_heatmap_sigma=cfg.attention_heatmap_sigma,
+        wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
+        action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
+        use_target_belief_tracker=cfg.use_target_belief_tracker,
     )
     train_sampler = (
         DistributedSampler(
@@ -649,7 +980,7 @@ def main() -> None:
             shuffle=True,
             drop_last=False,
         )
-        if use_ddp
+        if use_distributed
         else None
     )
     train_loader = DataLoader(
@@ -666,7 +997,7 @@ def main() -> None:
 
     # For simplicity: run validation only on rank0 under DDP.
     val_loader = None
-    if val_records and ((not use_ddp) or _is_main_process()):
+    if val_records and ((not use_distributed) or _is_main_process()):
         val_dataset = TrajectoryDataset(
             records=val_records,
             image_size=args.image_size,
@@ -675,13 +1006,15 @@ def main() -> None:
             action_dim=args.action_dim,
             direction_bins=cfg.direction_bins,
             distance_bins=cfg.distance_bins,
-            tokenizer_name=args.tokenizer_name,
             text_context_length=cfg.text_context_length,
             random_crop=False,
             use_target_visual_guidance=cfg.use_target_visual_guidance,
             use_attention_heatmap=cfg.use_attention_heatmap,
             visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
             attention_heatmap_sigma=cfg.attention_heatmap_sigma,
+            wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
+            action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
+            use_target_belief_tracker=cfg.use_target_belief_tracker,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -695,7 +1028,25 @@ def main() -> None:
         )
 
     model = TeacherWorldModelDiT(cfg).to(device)
-    if use_ddp:
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    if use_deepspeed:
+        ds_config = args.deepspeed_config if args.deepspeed_config is not None else _make_deepspeed_config(args)
+        model, optimizer, _, _ = deepspeed.initialize(
+            args=args,
+            model=model,
+            model_parameters=trainable_params,
+            optimizer=optimizer,
+            config=ds_config,
+        )
+        if _is_main_process():
+            print(f"[train] DeepSpeed enabled on world_size={_get_world_size()} (local_rank={_get_local_rank()})")
+    elif use_ddp:
         model = DDP(
             model,
             device_ids=[_get_local_rank()],
@@ -712,16 +1063,12 @@ def main() -> None:
             print(f"[train] DataParallel enabled on {torch.cuda.device_count()} GPUs")
         else:
             print(f"[train] Device: {device}")
-
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=_grad_scaler_enabled(device, cfg, use_deepspeed))
+    if _is_main_process() and device.type == "cuda":
+        print(f"[train] AMP dtype: {_cuda_amp_dtype(cfg)}, grad_scaler={scaler.is_enabled()}")
 
     start_epoch = 0
+    global_step = 0
     best_val = math.inf
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
@@ -731,31 +1078,75 @@ def main() -> None:
         )
         if _is_main_process() and (missing or unexpected):
             print(f"[resume] load strict=False: missing={len(missing)} unexpected={len(unexpected)}")
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
+        if not use_deepspeed:
+            if ckpt.get("optimizer") and ckpt.get("scheduler"):
+                optimizer.load_state_dict(ckpt["optimizer"])
+                scheduler.load_state_dict(ckpt["scheduler"])
+            elif _is_main_process():
+                print("[resume] optimizer/scheduler state missing; restarting optimizer state.")
         start_epoch = ckpt["epoch"] + 1
+        global_step = int(ckpt.get("global_step", 0))
         best_val = ckpt.get("best_val", best_val)
 
     total_pbar = None
+    run_name = args.swanlab_experiment_name or save_dir.name
+    swanlab_run = _init_swanlab(args, cfg, run_name)
+    if _is_main_process():
+        print(
+            "[running-model] "
+            f"model={save_dir.name} | run={run_name} | save_dir={save_dir} | "
+            f"target_belief_tracker={cfg.use_target_belief_tracker} | "
+            f"visual_guidance={cfg.use_target_visual_guidance} | "
+            f"fastwam_mot={cfg.use_fastwam_mot}"
+        )
     if tqdm is not None and _is_main_process():
-        total_steps = max(args.epochs - start_epoch, 0) * max(len(train_loader), 1)
+        if int(args.max_train_steps) > 0:
+            total_steps = max(int(args.max_train_steps) - int(global_step), 0)
+            desc = f"train steps {global_step}->{int(args.max_train_steps)}"
+        else:
+            total_steps = max(args.epochs - start_epoch, 0) * max(len(train_loader), 1)
+            desc = f"train {start_epoch:03d}->{args.epochs - 1:03d}"
         total_pbar = tqdm(
             total=total_steps,
-            desc=f"train {start_epoch:03d}->{args.epochs - 1:03d}",
+            desc=desc,
             leave=True,
             dynamic_ncols=True,
         )
 
     try:
+        reached_max_steps = False
         for epoch in range(start_epoch, args.epochs):
+            if int(args.max_train_steps) > 0 and global_step >= int(args.max_train_steps):
+                break
             model.train()
+            if use_deepspeed:
+                epoch_lr = (
+                    _cosine_step_lr(args.lr, global_step, int(args.max_train_steps))
+                    if int(args.max_train_steps) > 0
+                    else _cosine_epoch_lr(args.lr, epoch, args.epochs)
+                )
+                _set_optimizer_lr(optimizer, epoch_lr)
+            else:
+                epoch_lr = float(optimizer.param_groups[0]["lr"])
             running: Dict[str, float] = {}
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
+            num_train_batches = 0
             for step, batch in enumerate(train_loader):
+                if int(args.max_train_steps) > 0 and global_step >= int(args.max_train_steps):
+                    reached_max_steps = True
+                    break
+                if int(args.max_train_steps) > 0:
+                    step_lr = _cosine_step_lr(args.lr, global_step, int(args.max_train_steps))
+                    _set_optimizer_lr(optimizer, step_lr)
+                    epoch_lr = step_lr
                 batch = move_batch_to_device(batch, device)
-                optimizer.zero_grad(set_to_none=True)
-                with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
+                if use_deepspeed:
+                    model.zero_grad()
+                else:
+                    optimizer.zero_grad(set_to_none=True)
+                amp_ctx = nullcontext() if use_deepspeed else _autocast_context(device, cfg)
+                with amp_ctx:
                     outputs = model(
                         images=batch["images"],
                         text_tokens=batch["text_tokens"],
@@ -766,6 +1157,10 @@ def main() -> None:
                         expert_action=batch["expert_action"],
                         valid_mask=batch["valid_mask"],
                         done=batch.get("done"),
+                        instructions=batch.get("instructions"),
+                        video_latents=batch.get("video_latents"),
+                        reference_target_relative=batch.get("reference_target_relative"),
+                        reference_images=batch.get("reference_images"),
                     )
                     losses = world_model_dit_loss(
                         outputs,
@@ -775,59 +1170,101 @@ def main() -> None:
                     )
                     loss = losses["total"]
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                if use_deepspeed:
+                    model.backward(loss)
+                    model.step()
+                else:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
 
                 summary = summarize_losses(losses)
                 for k, v in summary.items():
                     running[k] = running.get(k, 0.0) + v
 
+                num_train_batches += 1
                 avg = {k: v / (step + 1) for k, v in running.items()}
+                global_step += 1
                 if total_pbar is not None:
-                    postfix = {"epoch": f"{epoch:03d}", **_tqdm_train_postfix(avg)}
+                    postfix = {"epoch": f"{epoch:03d}", "step": global_step, **_tqdm_train_postfix(avg)}
                     total_pbar.set_postfix(**postfix)
                     total_pbar.update(1)
                 elif _is_main_process() and (step + 1) % 20 == 0:
                     print(f"[Epoch {epoch:03d} | Step {step + 1:05d}] {_format_metrics(avg)}")
 
-            scheduler.step()
-            train_avg = {k: v / max(len(train_loader), 1) for k, v in running.items()}
-            train_avg = _reduce_metrics(train_avg, device, use_ddp)
+            if not use_deepspeed:
+                if int(args.max_train_steps) <= 0:
+                    scheduler.step()
+            train_avg = {k: v / max(num_train_batches, 1) for k, v in running.items()}
+            train_avg = _reduce_metrics(train_avg, device, use_distributed)
             if _is_main_process():
-                print(f">>> Epoch {epoch:03d} train: {_format_metrics(train_avg)}")
+                msg = f">>> Epoch {epoch:03d} train: {_format_metrics(train_avg)} | lr={epoch_lr:.6g} | global_step={global_step}"
+                tqdm.write(msg) if tqdm is not None else print(msg)
+                _swanlab_log(swanlab_run, {**train_avg, "lr": float(epoch_lr), "global_step": int(global_step)}, step=global_step, prefix="train")
 
             val_avg = None
             if val_loader is not None:
                 val_avg = evaluate(_unwrap_model(model), val_loader, cfg, device)
                 if _is_main_process():
-                    print(f">>> Epoch {epoch:03d} val:   {_format_metrics(val_avg)}")
+                    msg = f">>> Epoch {epoch:03d} val:   {_format_metrics(val_avg)}"
+                    tqdm.write(msg) if tqdm is not None else print(msg)
+                    _swanlab_log(swanlab_run, val_avg, step=epoch, prefix="val")
 
             metric = train_avg["total"] if val_avg is None else val_avg["total"]
-            ckpt = {
-                "epoch": epoch,
-                "model": _trainable_state_dict(model),
-                "model_state_format": "trainable_only",
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "cfg": cfg.__dict__,
-                "best_val": best_val,
-            }
-            if _is_main_process():
-                torch.save(ckpt, save_dir / "last.pt")
-                if metric < best_val:
+            should_save = (
+                _is_main_process()
+                and (
+                    (
+                        int(args.max_train_steps) <= 0
+                        and int(args.save_every_epochs) > 0
+                        and (((epoch + 1) % int(args.save_every_epochs) == 0) or (epoch + 1 == args.epochs))
+                    )
+                    or (
+                        int(args.max_train_steps) > 0
+                        and global_step >= int(args.max_train_steps)
+                    )
+                )
+            )
+            if should_save:
+                is_best = metric < best_val
+                if is_best:
                     best_val = metric
-                    ckpt["best_val"] = best_val
+                ckpt = {
+                    "epoch": epoch,
+                    "global_step": int(global_step),
+                    "max_train_steps": int(args.max_train_steps),
+                    "model": _trainable_state_dict(model),
+                    "model_state_format": "trainable_only",
+                    "optimizer": {} if (use_deepspeed or not args.save_optimizer_state) else optimizer.state_dict(),
+                    "scheduler": {} if (use_deepspeed or not args.save_optimizer_state) else scheduler.state_dict(),
+                    "cfg": cfg.__dict__,
+                    "best_val": best_val,
+                }
+                torch.save(ckpt, save_dir / "last.pt")
+                if bool(args.save_best_checkpoint) and is_best:
                     torch.save(ckpt, save_dir / "best.pt")
 
-            if use_ddp:
+            if use_distributed:
                 dist.barrier()
+            if reached_max_steps or (int(args.max_train_steps) > 0 and global_step >= int(args.max_train_steps)):
+                break
+        if _is_main_process():
+            done_marker = {
+                "status": "complete",
+                "epochs": int(args.epochs),
+                "global_step": int(global_step),
+                "max_train_steps": int(args.max_train_steps),
+                "best_val": float(best_val),
+            }
+            with open(save_dir / "done.marker", "w", encoding="utf-8") as f:
+                json.dump(done_marker, f, indent=2, ensure_ascii=False)
     finally:
         if total_pbar is not None:
             total_pbar.close()
-        if use_ddp and _ddp_is_initialized():
+        _swanlab_finish(swanlab_run)
+        if use_distributed and _ddp_is_initialized():
             dist.destroy_process_group()
 
 

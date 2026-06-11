@@ -9,6 +9,7 @@ import subprocess
 import threading
 import argparse
 import json
+import re
 from pathlib import Path
 
 CWD_DIR = Path(__file__).resolve().parent
@@ -206,6 +207,75 @@ class EventHandler(object):
     def ping(self) -> bool:
         return True
 
+    def _kill_scene_process_locked(self, scen_id, info, reason: str) -> None:
+        p = info.get('process') if isinstance(info, dict) else None
+        port = info.get('port') if isinstance(info, dict) else None
+        gpu_id = info.get('gpu_id') if isinstance(info, dict) else None
+        try:
+            if p is not None and p.poll() is None:
+                print(f"Closing scene process: {scen_id}, pid={p.pid}, port={port}, gpu={gpu_id}, reason={reason}")
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Failed to close scene {scen_id}: {e}")
+
+    def _refresh_used_ports_locked(self) -> None:
+        self.scene_used_ports = [
+            info.get('port')
+            for info in self.scene_processes.values()
+            if isinstance(info, dict) and info.get('port') is not None
+        ]
+
+    def _kill_untracked_scene_processes_for_gpus_locked(self, gpu_ids) -> None:
+        target_gpus = {str(gpu_id) for gpu_id in gpu_ids}
+        if not target_gpus:
+            return
+        tracked_pids = {
+            info.get('process').pid
+            for info in self.scene_processes.values()
+            if isinstance(info, dict)
+            and info.get('process') is not None
+            and getattr(info.get('process'), 'pid', None) is not None
+        }
+        try:
+            p = subprocess.Popen(
+                "pgrep -af 'LinuxNoEditor|Binaries/Linux'",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                shell=True,
+            )
+            output, _ = p.communicate(timeout=3)
+        except Exception as e:
+            print(f"Failed to scan untracked scene processes: {e}")
+            return
+        text = output.decode('utf-8', errors='ignore') if output else ''
+        for line in text.splitlines():
+            try:
+                pid_text, cmdline = line.split(' ', 1)
+                pid = int(pid_text)
+            except Exception:
+                continue
+            if pid == os.getpid() or pid in tracked_pids:
+                continue
+            if 'LinuxNoEditor' not in cmdline and '/Binaries/Linux/' not in cmdline:
+                continue
+            match = re.search(r'-GraphicsAdapter=(\S+)', cmdline)
+            if match is None or match.group(1) not in target_gpus:
+                continue
+            print(f"Closing untracked scene process pid={pid}, gpu={match.group(1)}, reason=same_gpu_untracked, cmd={cmdline}")
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception as e:
+                    print(f"Failed to close untracked scene process pid={pid}: {e}")
+
     def _open_scenes(self, ip: str, scen_id_gpu_list: list):
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tSTART open scenes: {[s[0] for s in scen_id_gpu_list]}")
 
@@ -213,13 +283,28 @@ class EventHandler(object):
         env_exec_path_dict = _get_env_exec_path_dict(_global_root_path)
 
         with self._port_lock:
+            requested_scenes = {
+                (scen_id.decode('utf-8') if isinstance(scen_id, bytes) else str(scen_id))
+                for scen_id, _ in scen_id_gpu_list
+            }
+            requested_gpus = {str(gpu_id) for _, gpu_id in scen_id_gpu_list}
+            for old_scene_id, old_info in list(self.scene_processes.items()):
+                old_gpu_id = old_info.get('gpu_id') if isinstance(old_info, dict) else None
+                same_scene = str(old_scene_id) in requested_scenes
+                same_gpu = str(old_gpu_id) in requested_gpus
+                if same_scene or same_gpu:
+                    reason = 'same_scene' if same_scene else 'same_gpu'
+                    self._kill_scene_process_locked(old_scene_id, old_info, reason=reason)
+                    self.scene_processes.pop(old_scene_id, None)
+            self._kill_untracked_scene_processes_for_gpus_locked(requested_gpus)
+            self._refresh_used_ports_locked()
+
             for scen_id, gpu_id in scen_id_gpu_list:
                 if isinstance(scen_id, bytes):
                     scen_id = scen_id.decode('utf-8')
 
                 port = None
                 try:
-                    import re
                     match = re.search(r'(\d+)', str(scen_id))
                     if match:
                         scene_number = int(match.group(1))
@@ -344,21 +429,10 @@ class EventHandler(object):
 
             try:
                 with self._port_lock:
-                    old_info = self.scene_processes.get(scen_id)
+                    old_info = self.scene_processes.pop(scen_id, None)
                     if old_info is not None:
-                        old_p = old_info.get('process')
-                        try:
-                            if old_p is not None and old_p.poll() is None:
-                                print(f"Closing old scene process: {scen_id}, pid={old_p.pid}, port={old_info.get('port')}")
-                                try:
-                                    os.killpg(os.getpgid(old_p.pid), signal.SIGKILL)
-                                except Exception:
-                                    try:
-                                        old_p.kill()
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
+                        self._kill_scene_process_locked(scen_id, old_info, reason='same_scene_late')
+                        self._refresh_used_ports_locked()
                 env = os.environ.copy()
                 with open(log_file_path, 'w', encoding='utf-8') as log_file:
                     p = subprocess.Popen(
@@ -373,6 +447,8 @@ class EventHandler(object):
                 p_s.append(p)
                 with self._port_lock:
                     self.scene_processes[scen_id] = {'process': p, 'port': ports[index], 'gpu_id': gpu_id}
+                    if ports[index] not in self.scene_used_ports:
+                        self.scene_used_ports.append(ports[index])
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tScene {scen_id} starting, GPU {gpu_id}, log: {log_file_path}")
             except Exception as e:
                 raise Exception(f"Failed to start scene: {e}")
@@ -427,39 +503,13 @@ class EventHandler(object):
                         if scen_id not in target_set:
                             continue
                         to_remove.append(scen_id)
-                        p = info.get('process')
-                        port = info.get('port')
-                        try:
-                            if p is not None and p.poll() is None:
-                                print(f"Closing scene process: {scen_id}, pid={p.pid}, port={port}")
-                                try:
-                                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                                except Exception:
-                                    try:
-                                        p.kill()
-                                    except Exception:
-                                        pass
-                        except Exception as e:
-                            print(f"Failed to close scene {scen_id}: {e}")
+                        self._kill_scene_process_locked(scen_id, info, reason='close_scenes')
                     for scen_id in to_remove:
                         self.scene_processes.pop(scen_id, None)
-                    self.scene_used_ports = [info.get('port') for info in self.scene_processes.values() if info.get('port') is not None]
+                    self._refresh_used_ports_locked()
                 else:
                     for scen_id, info in list(self.scene_processes.items()):
-                        p = info.get('process')
-                        port = info.get('port')
-                        try:
-                            if p is not None and p.poll() is None:
-                                print(f"Closing scene process: {scen_id}, pid={p.pid}, port={port}")
-                                try:
-                                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                                except Exception:
-                                    try:
-                                        p.kill()
-                                    except Exception:
-                                        pass
-                        except Exception as e:
-                            print(f"Failed to close scene {scen_id}: {e}")
+                        self._kill_scene_process_locked(scen_id, info, reason='close_all')
                     self.scene_processes.clear()
                     self.scene_used_ports = []
             result = True

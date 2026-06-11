@@ -81,6 +81,9 @@ class CrossAttentionFusion(nn.Module):
         if target_token.ndim != 2:
             raise ValueError("target_token must have shape [B, C].")
 
+        image_tokens = image_tokens.to(dtype=self.image_proj.weight.dtype)
+        text_tokens = text_tokens.to(dtype=self.text_proj.weight.dtype)
+        target_token = target_token.to(dtype=self.target_token_proj.weight.dtype)
         queries = self.image_proj(image_tokens)
         if target_patch_bias is not None:
             if target_patch_bias.ndim != 2:

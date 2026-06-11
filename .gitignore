@@ -12,6 +12,8 @@ __pycache__/
 
 # logs
 logs/
+src/envs/logs/
+src/envs/settings/
 lightning_logs/
 wandb/
 runs/

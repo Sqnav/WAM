@@ -4,7 +4,8 @@ from typing import Any, Dict, Tuple
 
 @dataclass
 class ModelConfig:
-    # Image / DINOv2
+    # Legacy image/text fields are kept only for old checkpoint/config
+    # compatibility; the active model path uses Wan2.2 encoders below.
     image_size: int = 224
     in_channels: int = 3
     image_encoder_dim: int = 768
@@ -15,13 +16,25 @@ class ModelConfig:
     image_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
     image_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
-    # Text / real pretrained CLIP text encoder
     clip_text_model_name: str = "/data1/ysq/Worldmodel/model/clip-vit-base-patch32"
     clip_text_freeze: bool = True
     clip_text_local_files_only: bool = True
     text_context_length: int = 77
     text_width: int = 512
     text_pad_id: int = 0
+
+    # Wan2.2 text encoder + visual VAE, matching the official FastWAM entry
+    # path. DINOv2/CLIP encoder modules have been removed.
+    use_wan22_encoders: bool = True
+    wan22_model_id: str = "Wan-AI/Wan2.2-TI2V-5B"
+    wan22_tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B"
+    wan22_model_base_path: str = "/data1/ysq/Worldmodel/model"
+    wan22_fastwam_src_path: str = "/data1/ysq/Worldmodel/model/FastWAM/src"
+    wan22_redirect_common_files: bool = True
+    wan22_skip_download: bool = True
+    wan22_torch_dtype: str = "bfloat16"
+    wan22_text_context_length: int = 512
+    wan22_text_encode_batch_size: int = 4
 
     # Low-dimensional inputs. State input has been removed.
     target_relative_dim: int = 3
@@ -38,6 +51,30 @@ class ModelConfig:
     attention_heatmap_sigma: float = 0.08
     heatmap_attention_bias_strength: float = 2.0
     heatmap_out_of_view_bias_scale: float = 0.5
+    # Encode the actual heatmap tensor into visual tokens instead of only using
+    # target-relative reprojection as an attention bias.
+    use_heatmap_tensor_encoder: bool = True
+    heatmap_token_scale: float = 1.0
+    fastwam_heatmap_context_grid: int = 4
+    # Proposed method toggles. Keep them off by default so the base FastWAM
+    # experiment remains unchanged unless an ablation enables one explicitly.
+    use_target_belief_tracker: bool = False
+    target_belief_token_scale: float = 1.0
+    target_belief_update_rate: float = 0.25
+    target_belief_min_confidence: float = 0.05
+    target_belief_temperature: float = 0.07
+    # Reference-guided temporal target belief tracker.
+    target_belief_loss_weight: float = 0.1
+    target_belief_motion_weight: float = 0.25
+    target_belief_update_sharpness: float = 10.0
+    use_latent_mpc: bool = False
+    latent_mpc_candidate_count: int = 4
+    latent_mpc_distance_weight: float = 0.0
+    latent_mpc_smooth_weight: float = 0.05
+    latent_mpc_action_weight: float = 0.02
+    latent_mpc_visual_weight: float = 0.1
+    latent_mpc_latent_frames: int = 3
+    latent_mpc_video_sampling_steps: int = 4
 
     # Fusion
     fusion_dim: int = 512
@@ -47,6 +84,7 @@ class ModelConfig:
     dropout: float = 0.1
 
     # RSSM
+    use_rssm: bool = False
     rssm_deter_dim: int = 512
     rssm_stoch_dim: int = 64
     rssm_hidden_dim: int = 512
@@ -64,11 +102,16 @@ class ModelConfig:
     # DiT actor predicts a short normalized action sequence [H, action_dim].
     # Online control executes only the first action and replans every frame.
     action_sequence_horizon: int = 3
+    # FastWAM temporal layout. The training window contains action timesteps;
+    # video frames are sampled every N action steps before Wan VAE encoding.
+    # The official FastWAM default is 33 actions/observations with ratio=4,
+    # yielding 9 RGB video frames and 3 Wan latent frames.
+    fastwam_action_video_freq_ratio: int = 1
     action_diffusion_steps: int = 20
     action_sampling_steps: int = 20
-    # Optional DiT inference-time candidate selection. When enabled, sample N
-    # action sequences, rollout RSSM with each sequence, and execute the first
-    # action from the lowest-score sequence.
+    # Optional DiT inference-time candidate selection. This requires use_rssm=True.
+    # The default Fast-WAM-style path keeps it disabled and directly executes
+    # the first predicted action.
     dit_candidate_selection: bool = False
     dit_candidate_count: int = 4
     dit_candidate_lateral_weight: float = 1.0
@@ -99,9 +142,10 @@ class ModelConfig:
     done_weight: float = 1.0
 
     # ----- Curriculum / WAM auxiliaries -----
-    # train_kl 在方案 A 起即开启（与直连/特权重建一起约束 RSSM）；也可用 checkpoint 覆盖。
+    # Fast-WAM-style default: no recurrent RSSM and no KL. The world head is a
+    # training auxiliary on direct observation features.
     use_diffusion_actor: bool = True
-    train_kl: bool = True
+    train_kl: bool = False
     train_direct_action: bool = True
     train_next_target_relative: bool = False
     # Deprecated: prediction-head rollout supervision was removed. RSSM
@@ -115,11 +159,29 @@ class ModelConfig:
     rollout_loss_weight: float = 0.2
     # Deprecated with train_rollout.
     rollout_horizon: int = 3
-    # x0 loss: MSE between one-step predicted clean action and expert (only when use_diffusion_actor).
-    x0_action_loss_weight: float = 1.0
+    # x0 reconstruction is only for the legacy DDPM actor, not FastWAM flow matching.
+    x0_action_loss_weight: float = 0.0
+
+    # FastWAM-style video/action MoT.
+    use_fastwam_mot: bool = True
+    fastwam_hidden_dim: int = 256
+    fastwam_layers: int = 4
+    fastwam_heads: int = 8
+    fastwam_video_train_timesteps: int = 1000
+    fastwam_action_train_timesteps: int = 1000
+    fastwam_video_shift: float = 5.0
+    fastwam_action_shift: float = 5.0
+    fastwam_lambda_video: float = 1.0
+    fastwam_lambda_action: float = 1.0
+    fastwam_use_official_wan_experts: bool = True
+    fastwam_skip_dit_load_from_pretrain: bool = False
+    fastwam_action_dit_pretrained_path: str = ""
+    fastwam_mot_checkpoint_mixed_attn: bool = True
 
     @property
     def feature_dim(self) -> int:
+        if not self.use_rssm:
+            return self.fusion_dim
         return self.rssm_deter_dim + self.rssm_stoch_dim
 
 
@@ -132,6 +194,8 @@ def migrate_legacy_config(raw_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "train_next_privileged": "train_next_target_relative",
         "next_privileged_loss_weight": "next_target_relative_loss_weight",
         "prior_privileged_loss_weight": "prior_target_relative_loss_weight",
+        "use_reference_target_grounding": "use_target_belief_tracker",
+        "reference_grounding_token_scale": "target_belief_token_scale",
     }
     out = dict(raw_cfg)
     for old, new in aliases.items():

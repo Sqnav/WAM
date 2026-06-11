@@ -23,6 +23,7 @@ from PIL import Image
 from scipy.spatial.transform import Rotation as R
 from torchvision import transforms
 
+from data.action_mapping import clamp_physical_action_speed
 from data.visual_guidance import make_attention_heatmap
 from model.config import ModelConfig, migrate_legacy_config
 from model.model import TeacherWorldModelDiT, migrate_legacy_state_dict_keys
@@ -89,6 +90,18 @@ def _dump_json(path: Path, payload: Any) -> None:
         f.flush()
         os.fsync(f.fileno())
     tmp.replace(path)
+
+
+def _jsonable_cfg(cfg: ModelConfig) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in dataclasses.asdict(cfg).items():
+        if isinstance(value, tuple):
+            out[key] = list(value)
+        elif isinstance(value, Path):
+            out[key] = str(value)
+        else:
+            out[key] = value
+    return out
 
 
 def _xyz_from_any(obj: Any) -> Optional[np.ndarray]:
@@ -473,8 +486,10 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
     field_names = {f.name for f in dataclasses.fields(ModelConfig)}
     raw_cfg = migrate_legacy_config(ckpt.get("cfg", {}) or {})
     cfg_kwargs = {k: v for k, v in raw_cfg.items() if k in field_names}
+    state = _strip_module_prefix(ckpt.get("model", {}) or {})
+    if "use_fastwam_mot" not in cfg_kwargs:
+        cfg_kwargs["use_fastwam_mot"] = any(k.startswith("fastwam.") for k in state)
     if "action_sequence_horizon" not in cfg_kwargs:
-        state = _strip_module_prefix(ckpt.get("model", {}) or {})
         token = state.get("actor.action_token_embed")
         if token is not None and getattr(token, "ndim", 0) == 3:
             cfg_kwargs["action_sequence_horizon"] = max(int(token.shape[1]) // max(int(args.action_dim), 1), 1)
@@ -485,6 +500,10 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
             "dinov2_freeze": args.freeze_dinov2,
             "clip_text_model_name": args.clip_text_model_name,
             "clip_text_freeze": args.freeze_clip_text,
+            "wan22_model_base_path": args.wan22_model_base_path,
+            "wan22_fastwam_src_path": args.wan22_fastwam_src_path,
+            "wan22_skip_download": args.wan22_skip_download,
+            "wan22_text_encode_batch_size": args.wan22_text_encode_batch_size,
             "target_relative_dim": args.target_relative_dim,
             "action_dim": args.action_dim,
             "action_sampling_steps": args.sampling_steps,
@@ -495,6 +514,14 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
     )
     if getattr(args, "use_diffusion_actor", None) is not None:
         cfg_kwargs["use_diffusion_actor"] = bool(args.use_diffusion_actor)
+    if getattr(args, "use_wan22_encoders", None) is not None:
+        cfg_kwargs["use_wan22_encoders"] = bool(args.use_wan22_encoders)
+    if getattr(args, "wan22_text_context_length", None) is not None:
+        cfg_kwargs["wan22_text_context_length"] = int(args.wan22_text_context_length)
+        if bool(cfg_kwargs.get("use_wan22_encoders", False)):
+            cfg_kwargs["text_context_length"] = int(args.wan22_text_context_length)
+    if getattr(args, "use_fastwam_mot", None) is not None:
+        cfg_kwargs["use_fastwam_mot"] = bool(args.use_fastwam_mot)
     if getattr(args, "target_token_fusion_mode", None) is not None:
         cfg_kwargs["target_token_fusion_mode"] = str(args.target_token_fusion_mode)
     if getattr(args, "dit_candidate_selection", None) is not None:
@@ -531,6 +558,38 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
         cfg_kwargs["visual_guidance_fov_deg"] = float(args.visual_guidance_fov_deg)
     if getattr(args, "attention_heatmap_sigma", None) is not None:
         cfg_kwargs["attention_heatmap_sigma"] = float(args.attention_heatmap_sigma)
+    if getattr(args, "use_target_belief_tracker", None) is not None:
+        cfg_kwargs["use_target_belief_tracker"] = bool(args.use_target_belief_tracker)
+    if getattr(args, "target_belief_token_scale", None) is not None:
+        cfg_kwargs["target_belief_token_scale"] = float(args.target_belief_token_scale)
+    if getattr(args, "target_belief_update_rate", None) is not None:
+        cfg_kwargs["target_belief_update_rate"] = float(args.target_belief_update_rate)
+    if getattr(args, "target_belief_min_confidence", None) is not None:
+        cfg_kwargs["target_belief_min_confidence"] = float(args.target_belief_min_confidence)
+    if getattr(args, "target_belief_temperature", None) is not None:
+        cfg_kwargs["target_belief_temperature"] = float(args.target_belief_temperature)
+    if getattr(args, "target_belief_loss_weight", None) is not None:
+        cfg_kwargs["target_belief_loss_weight"] = float(args.target_belief_loss_weight)
+    if getattr(args, "target_belief_motion_weight", None) is not None:
+        cfg_kwargs["target_belief_motion_weight"] = float(args.target_belief_motion_weight)
+    if getattr(args, "target_belief_update_sharpness", None) is not None:
+        cfg_kwargs["target_belief_update_sharpness"] = float(args.target_belief_update_sharpness)
+    if getattr(args, "use_latent_mpc", None) is not None:
+        cfg_kwargs["use_latent_mpc"] = bool(args.use_latent_mpc)
+    if getattr(args, "latent_mpc_candidate_count", None) is not None:
+        cfg_kwargs["latent_mpc_candidate_count"] = int(args.latent_mpc_candidate_count)
+    if getattr(args, "latent_mpc_distance_weight", None) is not None:
+        cfg_kwargs["latent_mpc_distance_weight"] = float(args.latent_mpc_distance_weight)
+    if getattr(args, "latent_mpc_smooth_weight", None) is not None:
+        cfg_kwargs["latent_mpc_smooth_weight"] = float(args.latent_mpc_smooth_weight)
+    if getattr(args, "latent_mpc_action_weight", None) is not None:
+        cfg_kwargs["latent_mpc_action_weight"] = float(args.latent_mpc_action_weight)
+    if getattr(args, "latent_mpc_visual_weight", None) is not None:
+        cfg_kwargs["latent_mpc_visual_weight"] = float(args.latent_mpc_visual_weight)
+    if getattr(args, "latent_mpc_latent_frames", None) is not None:
+        cfg_kwargs["latent_mpc_latent_frames"] = int(args.latent_mpc_latent_frames)
+    if getattr(args, "latent_mpc_video_sampling_steps", None) is not None:
+        cfg_kwargs["latent_mpc_video_sampling_steps"] = int(args.latent_mpc_video_sampling_steps)
     if getattr(args, "force_direct_action", False):
         cfg_kwargs["use_diffusion_actor"] = False
     return ModelConfig(**cfg_kwargs)
@@ -603,10 +662,13 @@ def load_model(args: argparse.Namespace, device: torch.device) -> Tuple[TeacherW
         f"[model] low_dim_target_input=off, "
         f"target_token_fusion_mode={cfg.target_token_fusion_mode}, "
         f"use_diffusion_actor={cfg.use_diffusion_actor}, "
+        f"use_fastwam_mot={cfg.use_fastwam_mot}, "
         f"dit_candidate_selection={cfg.dit_candidate_selection}, "
         f"dit_candidate_count={cfg.dit_candidate_count}, "
         f"candidate_score=tracking, "
-        f"visual_guidance={cfg.use_target_visual_guidance}"
+        f"visual_guidance={cfg.use_target_visual_guidance}, "
+        f"target_belief_tracker={cfg.use_target_belief_tracker}, "
+        f"latent_mpc={cfg.use_latent_mpc}"
     )
     return model, cfg
 
@@ -723,6 +785,146 @@ def compute_target_relative_body(executor, uav_state: Dict[str, Any], target_pos
         float(q[3]),
     )
     return np.asarray(rel_body, dtype=np.float32)
+
+
+def _wrap_angle_rad(angle: float) -> float:
+    return float(np.arctan2(np.sin(float(angle)), np.cos(float(angle))))
+
+
+def _target_facing_yaw_airsim(uav_pos_airsim: np.ndarray, target_pos_airsim: np.ndarray, fallback_yaw: float) -> float:
+    dx = float(target_pos_airsim[0]) - float(uav_pos_airsim[0])
+    dy = float(target_pos_airsim[1]) - float(uav_pos_airsim[1])
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        return float(fallback_yaw)
+    return _wrap_angle_rad(math.atan2(dy, dx))
+
+
+def _normalize_np(v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    arr = np.asarray(v, dtype=np.float64)
+    n = float(np.linalg.norm(arr))
+    if n < eps:
+        return np.zeros_like(arr)
+    return arr / n
+
+
+def _planner_direct_chase_next_dataset(
+    tracker_pos_dataset: np.ndarray,
+    target_now_dataset: np.ndarray,
+    target_next_dataset: np.ndarray,
+    step_length: float,
+) -> np.ndarray:
+    """One-step online version of planner `_build_tracker_direct_chase`.
+
+    The offline planner samples a complete tracker trajectory and validates
+    collision/FOV globally. Online eval only has the current closed-loop state,
+    so this mirrors the planner's local direct-chase candidate selection.
+    """
+    curr = np.asarray(tracker_pos_dataset, dtype=np.float64)
+    target_now = np.asarray(target_now_dataset, dtype=np.float64)
+    target_next = np.asarray(target_next_dataset, dtype=np.float64)
+
+    rel_now = target_now - curr
+    rel_dir_now = _normalize_np(rel_now)
+    if float(np.linalg.norm(rel_dir_now)) < 1e-6:
+        return curr.copy()
+
+    max_next_z = float(target_next[2])
+    capped_now = target_now.copy()
+    capped_now[2] = min(float(capped_now[2]), max_next_z)
+    capped_next = target_next.copy()
+    capped_next[2] = min(float(capped_next[2]), max_next_z)
+    aim_points = [
+        target_now,
+        target_next,
+        capped_now,
+        capped_next,
+        0.5 * target_now + 0.5 * target_next,
+    ]
+
+    cos_thresh = math.cos(math.radians(30.0))
+    candidates: List[Tuple[float, np.ndarray]] = []
+    for aim in aim_points:
+        move_dir = _normalize_np(np.asarray(aim, dtype=np.float64) - curr)
+        if float(np.linalg.norm(move_dir)) < 1e-6:
+            continue
+        align = float(np.dot(move_dir, rel_dir_now))
+        if align < cos_thresh:
+            continue
+        nxt = curr + float(step_length) * move_dir
+        if float(nxt[2]) > max_next_z + 1e-6:
+            continue
+        candidates.append((align, nxt))
+
+    if candidates:
+        candidates.sort(key=lambda x: -x[0])
+        return np.asarray(candidates[0][1], dtype=np.float32)
+
+    return np.asarray(curr + float(step_length) * rel_dir_now, dtype=np.float32)
+
+
+def compute_live_expert_action(
+    executor,
+    uav_state: Dict[str, Any],
+    target_now_airsim: np.ndarray,
+    target_next_airsim: Optional[np.ndarray],
+    max_speed_norm: float,
+    max_yaw_rate: float,
+) -> np.ndarray:
+    """Planner-style oracle action for the current online state.
+
+    It mirrors the direct-chase branch in
+    `trajectory_generator_with_5_jammers.py`: choose a one-step tracker move
+    from current UAV state toward current/lookahead target candidates, then
+    convert that planned tracker step into the same body-frame action format
+    used by training labels.
+    """
+    uav_pos_airsim = np.asarray(uav_state["position"], dtype=np.float32)
+    q = uav_state["orientation"]
+    target_now = np.asarray(target_now_airsim, dtype=np.float32)
+    target_next = np.asarray(
+        target_next_airsim if target_next_airsim is not None else target_now_airsim,
+        dtype=np.float32,
+    )
+
+    tracker_dataset = np.asarray([uav_pos_airsim[0], uav_pos_airsim[1], -uav_pos_airsim[2]], dtype=np.float32)
+    target_now_dataset = np.asarray([target_now[0], target_now[1], -target_now[2]], dtype=np.float32)
+    target_next_dataset = np.asarray([target_next[0], target_next[1], -target_next[2]], dtype=np.float32)
+
+    step_length = max(float(max_speed_norm), 1e-6)
+    next_tracker_dataset = _planner_direct_chase_next_dataset(
+        tracker_dataset,
+        target_now_dataset,
+        target_next_dataset,
+        step_length=step_length,
+    )
+    delta_dataset = np.asarray(next_tracker_dataset - tracker_dataset, dtype=np.float32)
+    velocity_body = executor._world_to_body_frame(
+        delta_dataset,
+        float(q[0]),
+        float(q[1]),
+        float(q[2]),
+        float(q[3]),
+    )
+
+    current_yaw = _get_yaw_from_state(uav_state)
+    next_tracker_airsim = np.asarray(
+        [next_tracker_dataset[0], next_tracker_dataset[1], -next_tracker_dataset[2]],
+        dtype=np.float32,
+    )
+    desired_yaw = _target_facing_yaw_airsim(next_tracker_airsim, target_next, fallback_yaw=current_yaw)
+    yaw_rate_deg = math.degrees(_wrap_angle_rad(desired_yaw - current_yaw))
+    yaw_cap = abs(float(max_yaw_rate))
+    if yaw_cap > 0.0:
+        yaw_rate_deg = float(np.clip(yaw_rate_deg, -yaw_cap, yaw_cap))
+
+    action = np.asarray(
+        [float(velocity_body[0]), float(velocity_body[1]), float(velocity_body[2]), float(yaw_rate_deg)],
+        dtype=np.float32,
+    )
+    return np.asarray(
+        clamp_physical_action_speed(action, max_speed_norm=max_speed_norm),
+        dtype=np.float32,
+    )
 
 
 def _axis_word(value: float, pos_word: str, neg_word: str, threshold: float) -> Optional[str]:
@@ -901,6 +1103,51 @@ def save_heatmap_overlay(path: Path, rgb: np.ndarray, heatmap: torch.Tensor, alp
     overlay_rgb = cv2.addWeighted(rgb_u8, 1.0 - float(alpha), colored_rgb, float(alpha), 0.0)
     path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
+
+
+def save_attention_map_overlay(
+    path: Path,
+    rgb: np.ndarray,
+    attention_map: torch.Tensor,
+    alpha: float = 0.45,
+) -> None:
+    import cv2
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rgb_u8 = np.asarray(rgb, dtype=np.uint8)
+    attn = attention_map.detach().float().cpu().squeeze().numpy()
+    if attn.ndim != 2:
+        raise ValueError(f"expected 2D attention map after squeeze, got shape {attn.shape}")
+    vis = attn - float(np.min(attn))
+    denom = float(np.max(vis))
+    if denom > 1e-8:
+        vis = vis / denom
+    vis_u8 = np.clip(vis * 255.0, 0, 255).astype(np.uint8)
+    vis_u8 = cv2.resize(vis_u8, (rgb_u8.shape[1], rgb_u8.shape[0]), interpolation=cv2.INTER_LINEAR)
+    colored_bgr = cv2.applyColorMap(vis_u8, cv2.COLORMAP_VIRIDIS)
+    colored_rgb = cv2.cvtColor(colored_bgr, cv2.COLOR_BGR2RGB)
+    overlay_rgb = cv2.addWeighted(rgb_u8, 1.0 - float(alpha), colored_rgb, float(alpha), 0.0)
+    cv2.imwrite(str(path.with_suffix(".png")), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
+
+
+def save_predicted_video_frames(out_dir: Path, frames: torch.Tensor) -> List[str]:
+    import cv2
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    arr = frames.detach().cpu().numpy() if torch.is_tensor(frames) else np.asarray(frames)
+    if arr.ndim == 5:
+        if arr.shape[0] != 1:
+            raise ValueError(f"expected batch size 1 for online predicted video, got shape {arr.shape}")
+        arr = arr[0]
+    if arr.ndim != 4 or arr.shape[-1] != 3:
+        raise ValueError(f"expected predicted frames [T,H,W,3], got shape {arr.shape}")
+    rel_names: List[str] = []
+    for idx, frame in enumerate(arr):
+        frame_u8 = np.asarray(frame, dtype=np.uint8)
+        path = out_dir / f"pred_{idx:03d}.png"
+        cv2.imwrite(str(path), cv2.cvtColor(frame_u8, cv2.COLOR_RGB2BGR))
+        rel_names.append(path.name)
+    return rel_names
 
 
 def _save_trajectory_3d_plot(out_dir: Path, steps: List[Dict[str, Any]]) -> None:
@@ -1099,6 +1346,8 @@ def run_online_trajectory(
     out_dir = Path(args.output_dir) / traj.scene_id / traj.trajectory_name
     rgb_out_dir = out_dir / "rgb"
     heatmap_overlay_dir = out_dir / "heatmap_overlay"
+    attention_map_dir = out_dir / "last_transformer_attention_maps"
+    predicted_video_dir = out_dir / "predicted_video"
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.save_rgb:
         rgb_out_dir.mkdir(parents=True, exist_ok=True)
@@ -1107,6 +1356,10 @@ def run_online_trajectory(
     )
     if save_heatmap_overlay_enabled:
         heatmap_overlay_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_transformer_attention_maps:
+        attention_map_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_predicted_video:
+        predicted_video_dir.mkdir(parents=True, exist_ok=True)
 
     _set_saved_assets_for_trajectory(executor, traj, args)
     _prepare_objects(executor, traj, args)
@@ -1141,6 +1394,10 @@ def run_online_trajectory(
     rssm_state = None
     prev_action = torch.zeros(1, cfg.action_dim, device=device, dtype=torch.float32)
     prev_done = torch.zeros(1, device=device, dtype=torch.float32)
+    reference_image_t: Optional[torch.Tensor] = None
+    reference_visual_tokens: Optional[torch.Tensor] = None
+    reference_target_relative_t: Optional[torch.Tensor] = None
+    target_belief_t: Optional[torch.Tensor] = None
 
     steps: List[Dict[str, Any]] = []
     distances: List[float] = []
@@ -1253,11 +1510,33 @@ def run_online_trajectory(
         if args.save_rgb:
             save_rgb(rgb_out_dir / f"frame_{t:05d}.png", rgb_img)
 
-        expert_action = traj.expert_action_physical[t] if t < len(traj.expert_action_physical) else None
+        if cfg.use_target_belief_tracker and reference_target_relative_t is None:
+            reference_target_np = rel_body / max(float(args.target_relative_scale), 1e-6)
+            reference_target_relative_t = torch.from_numpy(reference_target_np.astype(np.float32)).view(1, -1).to(device)
+            reference_image_t = rgb_to_model_tensor(rgb_img, transform, device)
+            reference_visual_tokens = model.encode_reference_visual_tokens(reference_image_t)
+
+        dataset_expert_action = traj.expert_action_physical[t] if t < len(traj.expert_action_physical) else None
+        target_next_for_expert = traj.target_traj_airsim[t + 1] if t + 1 < len(traj.target_traj_airsim) else target_now
+        expert_action = (
+            np.asarray(dataset_expert_action, dtype=np.float32)
+            if args.replay_expert_action
+            else compute_live_expert_action(
+                executor,
+                uav_state_before,
+                target_now,
+                target_next_for_expert,
+                max_speed_norm=cfg.max_speed_norm,
+                max_yaw_rate=cfg.max_yaw_rate,
+            )
+        )
+        expert_action_source = "dataset" if args.replay_expert_action else "live_planner"
         expert_action_norm = None
         action_source = "model"
         pred = None
         heatmap_overlay_relpath = None
+        attention_map_relpath = None
+        predicted_video_relpaths = None
 
         if args.replay_expert_action:
             if expert_action is None:
@@ -1268,7 +1547,11 @@ def run_online_trajectory(
             action_source = "expert"
         else:
             image_t = rgb_to_model_tensor(rgb_img, transform, device)
-            text_tokens, attention_mask = tokenize_instruction(tokenizer, instruction, cfg.text_context_length, device)
+            if cfg.use_wan22_encoders:
+                text_tokens = torch.zeros(1, 1, dtype=torch.long, device=device)
+                attention_mask = torch.ones_like(text_tokens)
+            else:
+                text_tokens, attention_mask = tokenize_instruction(tokenizer, instruction, cfg.text_context_length, device)
             target_relative_np = rel_body / max(float(args.target_relative_scale), 1e-6)
             target_relative_t = torch.from_numpy(target_relative_np.astype(np.float32)).view(1, -1).to(device)
             attention_heatmap_t = None
@@ -1297,7 +1580,31 @@ def run_online_trajectory(
                 prev_done=prev_done,
                 deterministic=args.deterministic_action,
                 num_steps=args.sampling_steps,
+                instruction=instruction,
+                save_transformer_attention=args.save_transformer_attention_maps,
+                save_predicted_video=args.save_predicted_video,
+                predicted_video_latent_frames=args.predicted_video_latent_frames,
+                latent_mpc=args.use_latent_mpc,
+                latent_mpc_candidate_count=args.latent_mpc_candidate_count,
+                target_next_relative=None,
+                reference_target_relative=reference_target_relative_t,
+                reference_image=reference_image_t,
+                reference_visual_tokens=reference_visual_tokens,
+                target_belief=target_belief_t,
             )
+            if "target_belief" in pred:
+                target_belief_t = pred["target_belief"].detach()
+            if args.save_transformer_attention_maps and "last_transformer_attention_map" in pred:
+                attention_map_path = attention_map_dir / f"frame_{t:05d}"
+                save_attention_map_overlay(attention_map_path, rgb_img, pred["last_transformer_attention_map"])
+                attention_map_relpath = str(attention_map_path.with_suffix(".png").relative_to(out_dir))
+            if args.save_predicted_video and "predicted_video_latents" in pred:
+                decoded_video = model.image_encoder.decode_video_latents(pred["predicted_video_latents"])
+                pred_frame_dir = predicted_video_dir / f"frame_{t:05d}"
+                pred_frame_names = save_predicted_video_frames(pred_frame_dir, decoded_video)
+                predicted_video_relpaths = [
+                    str((pred_frame_dir / name).relative_to(out_dir)) for name in pred_frame_names
+                ]
             action_norm = pred["action_norm"].detach().float().view(-1).cpu().numpy().astype(np.float32)
             action_physical = pred["action_physical"].detach().float().view(-1).cpu().numpy().astype(np.float32)
 
@@ -1354,6 +1661,7 @@ def run_online_trajectory(
             "action_physical": action_physical.astype(float).tolist(),
             "expert_action_physical": None if expert_action is None else expert_action.astype(float).tolist(),
             "expert_action_norm": None if expert_action_norm is None else expert_action_norm.astype(float).tolist(),
+            "expert_action_source": expert_action_source,
             "collision": bool(collision_now),
             "collision_before_action": bool(collision_before_action),
             "collision_after_action": bool(collision_after_action),
@@ -1365,6 +1673,18 @@ def run_online_trajectory(
         }
         if heatmap_overlay_relpath is not None:
             step_record["heatmap_overlay"] = heatmap_overlay_relpath
+        if attention_map_relpath is not None:
+            step_record["last_transformer_attention_map"] = attention_map_relpath
+        if predicted_video_relpaths is not None:
+            step_record["predicted_video_frames"] = predicted_video_relpaths
+        if pred is not None and "target_belief_confidence" in pred:
+            step_record["target_belief_confidence"] = (
+                pred["target_belief_confidence"].detach().float().view(-1).cpu().numpy().astype(float).tolist()
+            )
+        if pred is not None and "target_belief_entropy" in pred:
+            step_record["target_belief_entropy"] = (
+                pred["target_belief_entropy"].detach().float().view(-1).cpu().numpy().astype(float).tolist()
+            )
         if pred is not None and "candidate_scores" in pred:
             selected_candidate = int(pred["selected_candidate"].detach().view(-1)[0].cpu().item())
             candidate_scores = pred["candidate_scores"].detach().float().view(-1).cpu().numpy()
@@ -1386,6 +1706,24 @@ def run_online_trajectory(
                 if key in pred:
                     values = pred[key].detach().float().view(-1).cpu().numpy()
                     step_record["dit_candidate_selection"][key.replace("candidate_", "")] = values.astype(float).tolist()
+        if pred is not None and "latent_mpc_scores" in pred:
+            selected_mpc = int(pred["latent_mpc_selected"].detach().view(-1)[0].cpu().item())
+            mpc_scores = pred["latent_mpc_scores"].detach().float().view(-1).cpu().numpy()
+            step_record["latent_mpc"] = {
+                "selected": selected_mpc,
+                "scores": mpc_scores.astype(float).tolist(),
+                "selected_score": float(mpc_scores[selected_mpc]),
+            }
+            for key in (
+                "latent_mpc_distance",
+                "latent_mpc_smooth",
+                "latent_mpc_action_effort",
+                "latent_mpc_visual_cost",
+                "latent_mpc_visual_change",
+            ):
+                if key in pred:
+                    values = pred[key].detach().float().view(-1).cpu().numpy()
+                    step_record["latent_mpc"][key.replace("latent_mpc_", "")] = values.astype(float).tolist()
         steps.append(step_record)
 
         prev_action = torch.from_numpy(action_norm).view(1, -1).to(device).float()
@@ -1407,6 +1745,7 @@ def run_online_trajectory(
                 action=pred_act,
                 src=action_source,
                 expert=expert_act,
+                expert_src=expert_action_source,
             )
 
         prev_uav_after_pos = np.asarray(uav_state_after["position"], dtype=np.float32).copy()
@@ -1649,6 +1988,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-attention-heatmap", type=_str2bool, default=None)
     parser.add_argument("--visual-guidance-fov-deg", type=float, default=None)
     parser.add_argument("--attention-heatmap-sigma", type=float, default=None)
+    parser.add_argument("--use-target-belief-tracker", type=_str2bool, default=None)
+    parser.add_argument("--target-belief-token-scale", type=float, default=None)
+    parser.add_argument("--target-belief-update-rate", type=float, default=None)
+    parser.add_argument("--target-belief-min-confidence", type=float, default=None)
+    parser.add_argument("--target-belief-temperature", type=float, default=None)
+    parser.add_argument("--target-belief-loss-weight", type=float, default=None)
+    parser.add_argument("--target-belief-motion-weight", type=float, default=None)
+    parser.add_argument("--target-belief-update-sharpness", type=float, default=None)
+    parser.add_argument("--use-latent-mpc", type=_str2bool, default=None)
+    parser.add_argument("--latent-mpc-candidate-count", type=int, default=None)
+    parser.add_argument("--latent-mpc-distance-weight", type=float, default=None)
+    parser.add_argument("--latent-mpc-smooth-weight", type=float, default=None)
+    parser.add_argument("--latent-mpc-action-weight", type=float, default=None)
+    parser.add_argument("--latent-mpc-visual-weight", type=float, default=None)
+    parser.add_argument("--latent-mpc-latent-frames", type=int, default=None)
+    parser.add_argument("--latent-mpc-video-sampling-steps", type=int, default=None)
     parser.add_argument("--max-vel", type=float, default=DEFAULT_MODEL_CFG.max_vel)
     parser.add_argument("--max-yaw-rate", type=float, default=DEFAULT_MODEL_CFG.max_yaw_rate)
     parser.add_argument("--max-speed-norm", type=float, default=DEFAULT_MODEL_CFG.max_speed_norm)
@@ -1656,6 +2011,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--finetune-dinov2", action="store_false", dest="freeze_dinov2")
     parser.add_argument("--freeze-clip-text", action="store_true", default=True)
     parser.add_argument("--finetune-clip-text", action="store_false", dest="freeze_clip_text")
+    parser.add_argument("--use-wan22-encoders", type=_str2bool, default=None)
+    parser.add_argument("--wan22-model-base-path", type=str, default=DEFAULT_MODEL_CFG.wan22_model_base_path)
+    parser.add_argument("--wan22-fastwam-src-path", type=str, default=DEFAULT_MODEL_CFG.wan22_fastwam_src_path)
+    parser.add_argument("--wan22-skip-download", type=_str2bool, default=DEFAULT_MODEL_CFG.wan22_skip_download)
+    parser.add_argument("--wan22-text-context-length", type=int, default=DEFAULT_MODEL_CFG.wan22_text_context_length)
+    parser.add_argument("--wan22-text-encode-batch-size", type=int, default=DEFAULT_MODEL_CFG.wan22_text_encode_batch_size)
     parser.add_argument("--deterministic-action", action="store_true", default=True)
     parser.add_argument("--stochastic-action", action="store_false", dest="deterministic_action")
     parser.add_argument(
@@ -1663,6 +2024,12 @@ def parse_args() -> argparse.Namespace:
         type=_str2bool,
         default=None,
         help="true/false: override cfg.use_diffusion_actor from checkpoint. By default, use checkpoint cfg.",
+    )
+    parser.add_argument(
+        "--use-fastwam-mot",
+        type=_str2bool,
+        default=None,
+        help="true/false: override cfg.use_fastwam_mot from checkpoint. By default, infer from checkpoint cfg/keys.",
     )
     parser.add_argument(
         "--target-token-fusion-mode",
@@ -1711,6 +2078,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-save-rgb", action="store_false", dest="save_rgb")
     parser.add_argument("--save-heatmap-overlay", action="store_true", default=True)
     parser.add_argument("--no-save-heatmap-overlay", action="store_false", dest="save_heatmap_overlay")
+    parser.add_argument("--save-transformer-attention-maps", action="store_true", default=False)
+    parser.add_argument("--no-save-transformer-attention-maps", action="store_false", dest="save_transformer_attention_maps")
+    parser.add_argument("--save-predicted-video", action="store_true", default=False)
+    parser.add_argument("--no-save-predicted-video", action="store_false", dest="save_predicted_video")
+    parser.add_argument("--predicted-video-latent-frames", type=int, default=3)
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -1747,11 +2119,12 @@ def main() -> None:
     print(f"[dataset-root] {args.dataset_root}")
     print(f"[checkpoint] {args.checkpoint}")
 
-    if CLIPTokenizerFast is None:
-        raise ImportError("transformers.CLIPTokenizerFast is required for online instruction tokenization")
-    tokenizer = CLIPTokenizerFast.from_pretrained(args.tokenizer_name, local_files_only=True)
-
     model, cfg = load_model(args, device)
+    tokenizer = None
+    if not cfg.use_wan22_encoders:
+        if CLIPTokenizerFast is None:
+            raise ImportError("transformers.CLIPTokenizerFast is required for online instruction tokenization")
+        tokenizer = CLIPTokenizerFast.from_pretrained(args.tokenizer_name, local_files_only=True)
 
     # IMPORTANT: start sim_server/AirSim only after model loading has finished.
     # This avoids launching UE while DINOv2/CLIP/checkpoint tensors are being loaded.
@@ -1863,6 +2236,7 @@ def main() -> None:
             "mean_final_distance": float(np.mean(final_distances)) if final_distances else None,
             "mean_distance": float(np.mean(mean_distances)) if mean_distances else None,
             "args": vars(args),
+            "resolved_cfg": _jsonable_cfg(cfg),
             "summaries": all_summaries,
         }
         _dump_json(Path(args.output_dir) / "summary.json", agg)

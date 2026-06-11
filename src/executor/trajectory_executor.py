@@ -24,6 +24,18 @@ except ImportError:
 
 tqdm.set_lock(threading.RLock())
 
+DEFAULT_EPISODE_INSTRUCTION = (
+    "The target is the black UAV initially located near the image center. "
+    "Keep tracking the same UAV throughout the episode."
+)
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a UAV visual pursuit agent operating in the Body Frame: "
+    "X-forward, Y-right, Z-down. Track and intercept the true target UAV "
+    "from FPV images and user instructions. Ignore distractor UAVs even if "
+    "they appear closer or cross the view. Keep the target centered, pursue "
+    "smoothly, and avoid obstacles or collisions."
+)
+
 def safe_log(msg, scene_id=None):
     if scene_id:
         msg = f"[{scene_id}] {msg}"
@@ -1479,11 +1491,22 @@ class TrajectoryExecutor:
         
         u0 = uav_traj[0]
         t0 = target_traj[0]
+        planned_yaws = getattr(self, "_planned_uav_yaws_airsim", None)
+        planned_start_yaw = None
+        planned_start_quat = None
+        if planned_yaws is not None and len(planned_yaws) > 0 and planned_yaws[0] is not None:
+            try:
+                planned_start_yaw = float(planned_yaws[0])
+                planned_start_quat = airsim.to_quaternion(0, 0, planned_start_yaw)
+            except Exception:
+                planned_start_yaw = None
+                planned_start_quat = None
         
         self.teleport_object_to_start(t0[0], t0[1], t0[2])
         
         self.teleport_to_start(u0[0], u0[1], u0[2], 
-                              target_x=t0[0], target_y=t0[1], target_z=t0[2])
+                              target_x=t0[0], target_y=t0[1], target_z=t0[2],
+                              quaternion=planned_start_quat)
         
         try:
             max_retries = 3
@@ -1511,7 +1534,8 @@ class TrajectoryExecutor:
                     )
                     self.teleport_to_start(
                         u0[0], u0[1], u0[2],
-                        target_x=t0[0], target_y=t0[1], target_z=t0[2]
+                        target_x=t0[0], target_y=t0[1], target_z=t0[2],
+                        quaternion=planned_start_quat
                     )
                     try:
                         self.client.simContinueForFrames(5)
@@ -1529,9 +1553,12 @@ class TrajectoryExecutor:
                     f"error={pos_error:.2f}m (XY: {final_pos_error_xy:.2f}m, Z: {final_pos_error_z:.2f}m)"
                 )
             
-            dx = t0[0] - cur_pos[0]
-            dy = t0[1] - cur_pos[1]
-            yaw = np.arctan2(dy, dx)
+            if planned_start_yaw is not None:
+                yaw = planned_start_yaw
+            else:
+                dx = t0[0] - cur_pos[0]
+                dy = t0[1] - cur_pos[1]
+                yaw = np.arctan2(dy, dx)
             
             quat = airsim.to_quaternion(0, 0, yaw)
             
@@ -1779,7 +1806,7 @@ class TrajectoryExecutor:
         yaw_next = self._wrap_angle_rad(current_yaw + np.deg2rad(float(yaw_rate)))
         return airsim.to_quaternion(0, 0, yaw_next)
 
-    def _move_to_target_frame(self, u_target, t_target, i, num_steps, yaw_rate=None, jump_threshold=10.0):
+    def _move_to_target_frame(self, u_target, t_target, i, num_steps, yaw_rate=None, jump_threshold=1.5):
         try:
             if i == 0:
                 uav_state = None
@@ -1827,27 +1854,33 @@ class TrajectoryExecutor:
                 
                 jump_distance = np.linalg.norm(np.array([u_target[0], u_target[1], u_target[2]]) - cur_pos)
                 if jump_distance > jump_threshold:
-                    error_msg = f"Abnormal jump detected ({jump_distance:.2f}m > {jump_threshold}m) at step {i}; trajectory aborted"
-                    safe_log(f"✗ {error_msg}", scene_id=self.scene_id)
-                    raise RuntimeError(error_msg)
-                else:
-                    # Do NOT oracle-face the target after frame 0.
-                    # For i > 0, the UAV heading is controlled by yaw_rate:
-                    #     yaw_i = yaw_{i-1} + yaw_rate_{i-1}
-                    # This makes the 4th action dimension a real control signal.
-                    quat = self._quat_from_yaw_rate(
-                        current_orientation=current_orientation,
-                        yaw_rate=yaw_rate,
-                        step_idx=i,
-                    )
+                    error_msg = f"Abnormal jump detected ({jump_distance:.2f}m > {jump_threshold}m) at step {i}"
+                    if bool(getattr(self, "_recover_abnormal_jump", True)):
+                        safe_log(f"⚠ {error_msg}; recovering by forcing planner pose", scene_id=self.scene_id)
+                        try:
+                            self.reset_collision_info()
+                        except Exception:
+                            pass
+                    else:
+                        safe_log(f"✗ {error_msg}; trajectory aborted", scene_id=self.scene_id)
+                        raise RuntimeError(f"{error_msg}; trajectory aborted")
+                # Do NOT oracle-face the target after frame 0.
+                # For i > 0, the UAV heading is controlled by yaw_rate:
+                #     yaw_i = yaw_{i-1} + yaw_rate_{i-1}
+                # This makes the 4th action dimension a real control signal.
+                quat = self._quat_from_yaw_rate(
+                    current_orientation=current_orientation,
+                    yaw_rate=yaw_rate,
+                    step_idx=i,
+                )
 
-            max_position_retries = 3
+            max_position_retries = 5
             ok, verify_pos, pos_error, err_xy, err_z = self._set_vehicle_pose_paused(
                 float(u_target[0]), float(u_target[1]), float(u_target[2]),
                 quat,
                 retries=max_position_retries,
-                tol_xy=0.5,
-                tol_z=0.5
+                tol_xy=0.2,
+                tol_z=0.2
             )
             if not ok:
                 error_msg = (
@@ -1902,6 +1935,30 @@ class TrajectoryExecutor:
                     break
         
         cur1_pos = uav_state['position']
+        record_pose_error = float(np.linalg.norm(cur1_pos - u_target))
+        if record_pose_error > 0.2:
+            current_orientation = uav_state['orientation']
+            quat = airsim.Quaternionr(
+                w_val=float(current_orientation[0]),
+                x_val=float(current_orientation[1]),
+                y_val=float(current_orientation[2]),
+                z_val=float(current_orientation[3]),
+            )
+            ok, verify_pos, pos_error, err_xy, err_z = self._set_vehicle_pose_paused(
+                float(u_target[0]), float(u_target[1]), float(u_target[2]),
+                quat,
+                retries=5,
+                tol_xy=0.2,
+                tol_z=0.2,
+            )
+            if not ok:
+                verify_text = "unavailable" if verify_pos is None else f"({verify_pos[0]:.2f}, {verify_pos[1]:.2f}, {verify_pos[2]:.2f})"
+                raise RuntimeError(
+                    f"Vehicle pose set failed before save: target=({u_target[0]:.2f}, {u_target[1]:.2f}, {u_target[2]:.2f}), "
+                    f"actual={verify_text}, error={pos_error:.2f}m (XY:{err_xy:.2f}m, Z:{err_z:.2f}m)"
+                )
+            uav_state = self.get_uav_state()
+            cur1_pos = uav_state['position']
         
         pos2_now = None
         max_retries = 3
@@ -1982,11 +2039,15 @@ class TrajectoryExecutor:
                     json.dump({
                         "num_frames": num_steps,
                         "target_asset_name": selected_uav_name,
+                        "system_prompt": DEFAULT_SYSTEM_PROMPT,
+                        "instruction": DEFAULT_EPISODE_INSTRUCTION,
+                        "instructions": DEFAULT_EPISODE_INSTRUCTION,
                         "trajectory": merged_trajectory_data
                     }, f, indent=2, ensure_ascii=False)
                     f.flush()
                     os.fsync(f.fileno())
                 temp_uav_path.replace(uav_traj_path)
+                self._save_instruction_file(dataset_path, num_steps)
             except Exception as e:
                 safe_log(f"⚠ Failed to query UAV state: {e}", scene_id=self.scene_id)
                 raise
@@ -2118,7 +2179,7 @@ class TrajectoryExecutor:
                 except:
                     pass
     
-    def execute_trajectory(self, trajectory_file, dataset_base_dir="/mnt/Data20T/ysq/OurVLN/Dataset", save_dataset=True, skip_hover=False, trajectory_index=None, total_trajectories=None, max_retries=5, jump_threshold=10.0):
+    def execute_trajectory(self, trajectory_file, dataset_base_dir="/mnt/Data20T/ysq/OurVLN/Dataset", save_dataset=True, skip_hover=False, trajectory_index=None, total_trajectories=None, max_retries=5, jump_threshold=1.5):
         if not os.path.exists(trajectory_file):
             print(f"Starting trajectory execution: {trajectory_file}")
             return
@@ -2209,7 +2270,14 @@ class TrajectoryExecutor:
                 return self._execute_trajectory_internal(trajectory_file, dataset_base_dir, save_dataset, skip_hover, trajectory_index, total_trajectories, uav_traj, target_traj, jump_threshold=jump_threshold)
             except RuntimeError as e:
                 error_msg = str(e)
-                if "collision" in error_msg.lower() or "distance>=10m" in error_msg.lower() or "abnormal jump" in error_msg.lower():
+                error_msg_l = error_msg.lower()
+                if (
+                    "collision" in error_msg_l
+                    or "distance>=10m" in error_msg_l
+                    or "abnormal jump" in error_msg_l
+                    or "vehicle pose set failed" in error_msg_l
+                    or "uav teleport failed" in error_msg_l
+                ):
                     retry_count += 1
                     if retry_count <= max_retries:
                         safe_log(f"🔄 Retry {retry_count}: {error_msg}", scene_id=self.scene_id)
@@ -2224,7 +2292,7 @@ class TrajectoryExecutor:
                             elif trajectory_name.endswith('_target'):
                                 trajectory_name = trajectory_name[:-7]
                             dataset_path = Path(dataset_base_dir) / self.scene_id / trajectory_name
-                            for json_file in ['uav_trajectory.json', 'target_trajectory.json', 'jammer_trajectories.json']:
+                            for json_file in ['uav_trajectory.json', 'target_trajectory.json', 'jammer_trajectories.json', 'instruction.json']:
                                 json_path = dataset_path / json_file
                                 if json_path.exists():
                                     json_path.unlink()
@@ -2241,7 +2309,7 @@ class TrajectoryExecutor:
             except Exception as e:
                 raise
     
-    def _execute_trajectory_internal(self, trajectory_file, dataset_base_dir, save_dataset, skip_hover, trajectory_index, total_trajectories, uav_traj, target_traj, jump_threshold=10.0):
+    def _execute_trajectory_internal(self, trajectory_file, dataset_base_dir, save_dataset, skip_hover, trajectory_index, total_trajectories, uav_traj, target_traj, jump_threshold=1.5):
         
         self._jump_threshold = jump_threshold
         
@@ -2350,7 +2418,14 @@ class TrajectoryExecutor:
                 
             except RuntimeError as e:
                 error_msg = str(e)
-                if "collision" in error_msg.lower() or "distance>=10m" in error_msg.lower() or "abnormal jump" in error_msg.lower():
+                error_msg_l = error_msg.lower()
+                if (
+                    "collision" in error_msg_l
+                    or "distance>=10m" in error_msg_l
+                    or "abnormal jump" in error_msg_l
+                    or "vehicle pose set failed" in error_msg_l
+                    or "uav teleport failed" in error_msg_l
+                ):
                     safe_log(f"✗ Step {i} failed: {e}", scene_id=self.scene_id)
                     try:
                         pbar.close()
@@ -2613,6 +2688,59 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
 
         return None, None
 
+    def _extract_planned_yaw_from_frame(self, frame):
+        if not isinstance(frame, dict):
+            return None, False
+
+        if frame.get("uav_yaw_airsim") is not None:
+            return float(frame["uav_yaw_airsim"]), True
+        if frame.get("uav_yaw_deg_airsim") is not None:
+            return float(np.deg2rad(float(frame["uav_yaw_deg_airsim"]))), True
+
+        if frame.get("uav_yaw") is not None:
+            return float(frame["uav_yaw"]), False
+        if frame.get("uav_yaw_deg") is not None:
+            return float(np.deg2rad(float(frame["uav_yaw_deg"]))), False
+
+        planned_euler = frame.get("uav_orientation_euler_planned")
+        if isinstance(planned_euler, dict) and planned_euler.get("yaw") is not None:
+            return float(planned_euler["yaw"]), False
+
+        return None, False
+
+    def _load_planned_uav_yaws_from_main_trajectory(self, json_path, expected_len=None):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            return None
+
+        frames = data.get("frames")
+        if not isinstance(frames, list) or len(frames) == 0:
+            return None
+
+        planned_yaws = []
+        has_any = False
+        for frame in frames:
+            yaw, already_airsim = self._extract_planned_yaw_from_frame(frame)
+            if yaw is None:
+                planned_yaws.append(None)
+                continue
+            has_any = True
+            # Planner/export coordinates are converted with y -> -y, so horizontal
+            # yaw must be mirrored too: yaw_airsim = -yaw_planner.
+            yaw_airsim = yaw if already_airsim else -yaw
+            planned_yaws.append(float(self._wrap_angle_rad(yaw_airsim)))
+
+        if not has_any:
+            return None
+        if expected_len is not None and len(planned_yaws) < int(expected_len):
+            safe_log(
+                f"⚠ planned uav_yaw length ({len(planned_yaws)}) < trajectory length ({int(expected_len)}); using available yaws only",
+                scene_id=self.scene_id,
+            )
+        return planned_yaws
+
     def _load_jammer_from_main_trajectory(self, json_path):
         """
         Fallback jammer trajectory loader.
@@ -2734,6 +2862,15 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
     def load_trajectory_bundle(self, json_path):
         uav_traj, target_traj = super().load_trajectory(json_path)
         jammer_traj = None
+        self._planned_uav_yaws_airsim = self._load_planned_uav_yaws_from_main_trajectory(
+            json_path,
+            expected_len=min(len(uav_traj), len(target_traj)),
+        )
+        if self._planned_uav_yaws_airsim is not None:
+            safe_log(
+                f"✓ Loaded planned UAV yaw sequence: {len(self._planned_uav_yaws_airsim)} frames",
+                scene_id=self.scene_id,
+            )
         self._all_jammer_trajectories_airsim = None
         self._primary_jammer_id = None
         if self.jammer_enabled:
@@ -2996,7 +3133,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             j0 = jammer_traj[0]
             self.teleport_jammer_to_start(j0[0], j0[1], j0[2])
 
-    def _move_to_target_frame(self, u_target, t_target, i, num_steps, yaw_rate=None, jump_threshold=10.0, j_target=None, j_targets_by_id=None):
+    def _move_to_target_frame(self, u_target, t_target, i, num_steps, yaw_rate=None, jump_threshold=1.5, j_target=None, j_targets_by_id=None, planned_yaw=None):
         try:
             if i == 0:
                 uav_state = None
@@ -3011,21 +3148,24 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                             continue
                         else:
                             raise RuntimeError(f"Failed to read UAV state: {e}")
-                # Keep frame-0 orientation consistent with all later frames:
-                # the UAV always faces the current target position in the horizontal plane.
-                dx = float(t_target[0]) - float(u_target[0])
-                dy = float(t_target[1]) - float(u_target[1])
-                if abs(dx) < 1e-6 and abs(dy) < 1e-6:
-                    current_orientation = uav_state['orientation']
-                    quat = airsim.Quaternionr(
-                        w_val=current_orientation[0],
-                        x_val=current_orientation[1],
-                        y_val=current_orientation[2],
-                        z_val=current_orientation[3]
-                    )
+                if planned_yaw is not None:
+                    quat = airsim.to_quaternion(0, 0, float(planned_yaw))
                 else:
-                    yaw = np.arctan2(dy, dx)
-                    quat = airsim.to_quaternion(0, 0, yaw)
+                    # Keep frame-0 orientation consistent with legacy data:
+                    # if no planner yaw is provided, face the current target.
+                    dx = float(t_target[0]) - float(u_target[0])
+                    dy = float(t_target[1]) - float(u_target[1])
+                    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+                        current_orientation = uav_state['orientation']
+                        quat = airsim.Quaternionr(
+                            w_val=current_orientation[0],
+                            x_val=current_orientation[1],
+                            y_val=current_orientation[2],
+                            z_val=current_orientation[3]
+                        )
+                    else:
+                        yaw = np.arctan2(dy, dx)
+                        quat = airsim.to_quaternion(0, 0, yaw)
             else:
                 uav_state = None
                 max_retries = 3
@@ -3044,9 +3184,18 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
 
                 jump_distance = np.linalg.norm(np.array([u_target[0], u_target[1], u_target[2]]) - cur_pos)
                 if jump_distance > jump_threshold:
-                    error_msg = f"Abnormal jump detected ({jump_distance:.2f}m > {jump_threshold}m) at step {i}; trajectory aborted"
-                    safe_log(f"✗ {error_msg}", scene_id=self.scene_id)
-                    raise RuntimeError(error_msg)
+                    error_msg = f"Abnormal jump detected ({jump_distance:.2f}m > {jump_threshold}m) at step {i}"
+                    if bool(getattr(self, "_recover_abnormal_jump", True)):
+                        safe_log(f"⚠ {error_msg}; recovering by forcing planner pose", scene_id=self.scene_id)
+                        try:
+                            self.reset_collision_info()
+                        except Exception:
+                            pass
+                    else:
+                        safe_log(f"✗ {error_msg}; trajectory aborted", scene_id=self.scene_id)
+                        raise RuntimeError(f"{error_msg}; trajectory aborted")
+                if planned_yaw is not None:
+                    quat = airsim.to_quaternion(0, 0, float(planned_yaw))
                 else:
                     # Do NOT oracle-face the target after frame 0.
                     # For i > 0, the UAV heading is controlled by yaw_rate:
@@ -3058,13 +3207,13 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                         step_idx=i,
                     )
 
-            max_position_retries = 3
+            max_position_retries = 5
             ok, verify_pos, pos_error, err_xy, err_z = self._set_vehicle_pose_paused(
                 float(u_target[0]), float(u_target[1]), float(u_target[2]),
                 quat,
                 retries=max_position_retries,
-                tol_xy=0.5,
-                tol_z=0.5,
+                tol_xy=0.2,
+                tol_z=0.2,
             )
             if not ok:
                 error_msg = (
@@ -3216,7 +3365,8 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
     def _process_frame(self, i, uav_traj, target_traj, trajectory_name, num_steps,
                       save_dataset, dataset_dir, merged_trajectory_data, pbar,
                       target_trajectory_airsim=None, jammer_traj=None, jammer_trajectory_airsim=None,
-                      jammer_trajs_by_id=None, jammer_trajectories_airsim_by_id=None):
+                      jammer_trajs_by_id=None, jammer_trajectories_airsim_by_id=None,
+                      planned_uav_yaws=None):
         u_target = np.array([uav_traj[i][0], uav_traj[i][1], uav_traj[i][2]])
         t_target = np.array([target_traj[i][0], target_traj[i][1], target_traj[i][2]])
         j_target = None
@@ -3229,7 +3379,11 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                 if traj is not None and i < len(traj):
                     j_targets_by_id[str(did)] = np.array([traj[i][0], traj[i][1], traj[i][2]])
 
-        yaw_rate_to_apply = self._expert_yaw_rate_for_step(uav_traj, target_traj, i)
+        planned_yaw = None
+        if planned_uav_yaws is not None and i < len(planned_uav_yaws):
+            planned_yaw = planned_uav_yaws[i]
+
+        yaw_rate_to_apply = None if planned_yaw is not None else self._expert_yaw_rate_for_step(uav_traj, target_traj, i)
         jump_threshold = getattr(self, '_jump_threshold', 10.0)
         self._move_to_target_frame(
             u_target, t_target, i, num_steps,
@@ -3237,6 +3391,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             jump_threshold=jump_threshold,
             j_target=j_target,
             j_targets_by_id=j_targets_by_id,
+            planned_yaw=planned_yaw,
         )
 
         uav_state = None
@@ -3259,6 +3414,30 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                     break
 
         cur1_pos = uav_state['position']
+        record_pose_error = float(np.linalg.norm(cur1_pos - u_target))
+        if record_pose_error > 0.2:
+            current_orientation = uav_state['orientation']
+            quat = airsim.Quaternionr(
+                w_val=float(current_orientation[0]),
+                x_val=float(current_orientation[1]),
+                y_val=float(current_orientation[2]),
+                z_val=float(current_orientation[3]),
+            )
+            ok, verify_pos, pos_error, err_xy, err_z = self._set_vehicle_pose_paused(
+                float(u_target[0]), float(u_target[1]), float(u_target[2]),
+                quat,
+                retries=5,
+                tol_xy=0.2,
+                tol_z=0.2,
+            )
+            if not ok:
+                verify_text = "unavailable" if verify_pos is None else f"({verify_pos[0]:.2f}, {verify_pos[1]:.2f}, {verify_pos[2]:.2f})"
+                raise RuntimeError(
+                    f"Vehicle pose set failed before save: target=({u_target[0]:.2f}, {u_target[1]:.2f}, {u_target[2]:.2f}), "
+                    f"actual={verify_text}, error={pos_error:.2f}m (XY:{err_xy:.2f}m, Z:{err_z:.2f}m)"
+                )
+            uav_state = self.get_uav_state()
+            cur1_pos = uav_state['position']
 
         pos2_now = None
         max_retries = 3
@@ -3420,6 +3599,23 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             os.fsync(f.fileno())
         temp_path.replace(traj_path)
 
+    def _save_instruction_file(self, dataset_path, num_steps):
+        instruction_path = Path(dataset_path) / "instruction.json"
+        temp_path = Path(dataset_path) / "instruction.json.tmp"
+        payload = {
+            "scene_id": self.scene_id,
+            "trajectory_name": Path(dataset_path).name,
+            "num_frames": int(num_steps),
+            "system_prompt": DEFAULT_SYSTEM_PROMPT,
+            "instruction": DEFAULT_EPISODE_INSTRUCTION,
+            "instructions": DEFAULT_EPISODE_INSTRUCTION,
+        }
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(instruction_path)
+
     def _save_multi_jammer_trajectories(self, dataset_path, jammer_trajectories_airsim_by_id):
         if not jammer_trajectories_airsim_by_id:
             return
@@ -3486,6 +3682,9 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             payload = {
                 "num_frames": num_steps,
                 "target_asset_name": selected_uav_name,
+                "system_prompt": DEFAULT_SYSTEM_PROMPT,
+                "instruction": DEFAULT_EPISODE_INSTRUCTION,
+                "instructions": DEFAULT_EPISODE_INSTRUCTION,
                 "trajectory": merged_trajectory_data,
             }
             if isinstance(selected_jammer_name, dict):
@@ -3500,6 +3699,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                 f.flush()
                 os.fsync(f.fileno())
             temp_uav_path.replace(uav_traj_path)
+            self._save_instruction_file(dataset_path, num_steps)
         except Exception as e:
             safe_log(f"⚠ Failed to query UAV state: {e}", scene_id=self.scene_id)
             raise
@@ -3557,7 +3757,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             safe_log(f"⚠ planner positions load failed: {e}", scene_id=self.scene_id)
         return num_frames, positions_airsim
 
-    def execute_trajectory(self, trajectory_file, dataset_base_dir="/mnt/Data20T/ysq/OurVLN/Dataset", save_dataset=True, skip_hover=False, trajectory_index=None, total_trajectories=None, max_retries=5, jump_threshold=10.0):
+    def execute_trajectory(self, trajectory_file, dataset_base_dir="/mnt/Data20T/ysq/OurVLN/Dataset", save_dataset=True, skip_hover=False, trajectory_index=None, total_trajectories=None, max_retries=5, jump_threshold=1.5):
         if not os.path.exists(trajectory_file):
             print(f"Starting trajectory execution: {trajectory_file}")
             return
@@ -3636,7 +3836,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                 )
             except RuntimeError as e:
                 error_msg = str(e)
-                if "collision" in error_msg.lower() or "distance>=10m" in error_msg.lower() or "abnormal jump" in error_msg.lower():
+                if "collision" in error_msg.lower() or "distance>=10m" in error_msg.lower() or "abnormal jump" in error_msg.lower() or "vehicle pose set failed" in error_msg.lower():
                     retry_count += 1
                     if retry_count <= max_retries:
                         safe_log(f"🔄 Retry {retry_count}: {error_msg}", scene_id=self.scene_id)
@@ -3669,7 +3869,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             except Exception:
                 raise
 
-    def _execute_trajectory_internal(self, trajectory_file, dataset_base_dir, save_dataset, skip_hover, trajectory_index, total_trajectories, uav_traj, target_traj, jammer_traj=None, jump_threshold=10.0):
+    def _execute_trajectory_internal(self, trajectory_file, dataset_base_dir, save_dataset, skip_hover, trajectory_index, total_trajectories, uav_traj, target_traj, jammer_traj=None, jump_threshold=1.5):
         self._jump_threshold = jump_threshold
         self._abnormal_jumps = []
 
@@ -3715,6 +3915,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
         target_trajectory_airsim = []
         jammer_trajectory_airsim = [] if jammer_traj is not None else None
         jammer_trajectories_airsim_by_id = {str(k): [] for k in jammer_trajs_by_id.keys()} if jammer_trajs_by_id else None
+        planned_uav_yaws = getattr(self, "_planned_uav_yaws_airsim", None)
         self._prev_frame_data = None
 
         try:
@@ -3768,10 +3969,11 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                     jammer_trajectory_airsim=jammer_trajectory_airsim,
                     jammer_trajs_by_id=jammer_trajs_by_id,
                     jammer_trajectories_airsim_by_id=jammer_trajectories_airsim_by_id,
+                    planned_uav_yaws=planned_uav_yaws,
                 )
             except RuntimeError as e:
                 error_msg = str(e)
-                if "collision" in error_msg.lower() or "distance>=10m" in error_msg.lower() or "abnormal jump" in error_msg.lower():
+                if "collision" in error_msg.lower() or "distance>=10m" in error_msg.lower() or "abnormal jump" in error_msg.lower() or "vehicle pose set failed" in error_msg.lower():
                     safe_log(f"✗ Step {i} failed: {e}", scene_id=self.scene_id)
                     try:
                         pbar.close()

@@ -29,7 +29,7 @@ conda activate "$CONDA_ENV_NAME"
 # =========================
 export PYTHONPATH="$root_dir/code/src:${PYTHONPATH:-}"
 
-GPUS="${GPUS:-3}"
+GPUS="${GPUS:-5}"
 PORT="${PORT:-30000}"
 ROOT_PATH="${ROOT_PATH:-$root_dir}"
 
