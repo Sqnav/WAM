@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 DEFAULT_EXECUTOR_SCRIPT = "/data1/ysq/Worldmodel/code/src/executor/trajectory_executor.py"
 DEFAULT_TRAJECTORY_DIR = "/data1/ysq/Worldmodel/Plandataset"
 DEFAULT_DATASET_BASE_DIR = "/data1/ysq/Worldmodel/Dataset"
-DEFAULT_SCENES = [f"City_{i}" for i in range(1, 31)]
+DEFAULT_SCENES = [f"City_{i}" for i in range(1, 4)]
 DEFAULT_GPUS = [1]
 DEFAULT_SIM_SERVER_HOST = "127.0.0.1"
 DEFAULT_SIM_SERVER_PORT = 30000

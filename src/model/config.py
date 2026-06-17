@@ -42,39 +42,12 @@ class ModelConfig:
     target_token_hidden_dim: int = 128
     target_token_fusion_mode: str = "attention"  # attention | concat
 
-    # Optional visual target guidance:
-    # - global image remains unchanged
-    # - target projection is used as a patch-level attention/pooling bias
-    use_target_visual_guidance: bool = False
-    use_attention_heatmap: bool = True
-    visual_guidance_fov_deg: float = 90.0
-    attention_heatmap_sigma: float = 0.08
-    heatmap_attention_bias_strength: float = 2.0
-    heatmap_out_of_view_bias_scale: float = 0.5
-    # Encode the actual heatmap tensor into visual tokens instead of only using
-    # target-relative reprojection as an attention bias.
-    use_heatmap_tensor_encoder: bool = True
-    heatmap_token_scale: float = 1.0
-    fastwam_heatmap_context_grid: int = 4
-    # Proposed method toggles. Keep them off by default so the base FastWAM
-    # experiment remains unchanged unless an ablation enables one explicitly.
-    use_target_belief_tracker: bool = False
-    target_belief_token_scale: float = 1.0
-    target_belief_update_rate: float = 0.25
-    target_belief_min_confidence: float = 0.05
-    target_belief_temperature: float = 0.07
-    # Reference-guided temporal target belief tracker.
-    target_belief_loss_weight: float = 0.1
-    target_belief_motion_weight: float = 0.25
-    target_belief_update_sharpness: float = 10.0
-    use_latent_mpc: bool = False
-    latent_mpc_candidate_count: int = 4
-    latent_mpc_distance_weight: float = 0.0
-    latent_mpc_smooth_weight: float = 0.05
-    latent_mpc_action_weight: float = 0.02
-    latent_mpc_visual_weight: float = 0.1
-    latent_mpc_latent_frames: int = 3
-    latent_mpc_video_sampling_steps: int = 4
+    # Privileged target context. When enabled, the current target position in
+    # UAV/body coordinates is projected to one extra FastWAM text-context token.
+    use_target_relative_context: bool = False
+    target_relative_context_scale: float = 1.0
+    target_relative_token_scale: float = 1.0
+    target_relative_context_hidden_dim: int = 512
 
     # Fusion
     fusion_dim: int = 512
@@ -194,8 +167,6 @@ def migrate_legacy_config(raw_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "train_next_privileged": "train_next_target_relative",
         "next_privileged_loss_weight": "next_target_relative_loss_weight",
         "prior_privileged_loss_weight": "prior_target_relative_loss_weight",
-        "use_reference_target_grounding": "use_target_belief_tracker",
-        "reference_grounding_token_scale": "target_belief_token_scale",
     }
     out = dict(raw_cfg)
     for old, new in aliases.items():

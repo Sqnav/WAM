@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import torch
-import torch.nn.functional as F
 
 from .action_loss_utils import weighted_mean_action_squared_error
 from .config import ModelConfig
@@ -170,23 +169,6 @@ def world_model_dit_loss(
         total = total + float(getattr(cfg, "x0_action_loss_weight", 0.0)) * losses["x0_action"]
     if total.ndim > 0:
         total = total.mean()
-
-    if bool(getattr(cfg, "use_target_belief_tracker", False)) and "target_belief_sequence" in outputs:
-        pred_belief = outputs["target_belief_sequence"].float().clamp_min(1e-8)
-        gt_belief = outputs["target_belief_gt"].float().clamp_min(1e-8)
-        if pred_belief.shape != gt_belief.shape:
-            raise ValueError("target_belief_sequence and target_belief_gt must have the same shape.")
-        belief_mask = valid_mask
-        if belief_mask is not None and belief_mask.shape[:2] != pred_belief.shape[:2]:
-            src_t = belief_mask.size(1)
-            out_t = pred_belief.size(1)
-            idx = torch.linspace(0, src_t - 1, out_t, device=belief_mask.device).round().long()
-            belief_mask = belief_mask[:, idx]
-        per_t = F.kl_div(pred_belief.log(), gt_belief, reduction="none").sum(dim=-1, keepdim=True)
-        losses["target_belief"] = masked_mean(per_t, belief_mask)
-        total = total + float(getattr(cfg, "target_belief_loss_weight", 0.1)) * losses["target_belief"]
-    else:
-        losses["target_belief"] = torch.zeros((), device=device, dtype=dtype)
 
     losses["total"] = total
     return losses

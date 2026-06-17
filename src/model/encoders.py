@@ -6,7 +6,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .config import ModelConfig
 
@@ -211,53 +210,6 @@ class Wan22TextEncoder(nn.Module):
 
     def forward(self, token_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         raise RuntimeError("Wan22TextEncoder expects raw instruction strings; call encode_texts().")
-
-
-class HeatmapTokenEncoder(nn.Module):
-    """Project target heatmap tensors into per-visual-token embeddings."""
-
-    def __init__(self, cfg: ModelConfig) -> None:
-        super().__init__()
-        self.cfg = cfg
-        self.proj = nn.Sequential(
-            nn.Linear(1, cfg.image_encoder_dim),
-            nn.GELU(),
-            nn.Linear(cfg.image_encoder_dim, cfg.image_encoder_dim),
-        )
-
-    @staticmethod
-    def _token_grid(token_count: int, has_cls_token: bool) -> tuple[int, int, int]:
-        patch_count = token_count - 1 if has_cls_token else token_count
-        grid_h = int(round(patch_count ** 0.5))
-        grid_w = grid_h
-        if grid_h * grid_w != patch_count:
-            grid_h = max(int(patch_count ** 0.5), 1)
-            grid_w = int((patch_count + grid_h - 1) // grid_h)
-        return patch_count, grid_h, grid_w
-
-    def forward(
-        self,
-        heatmaps: torch.Tensor,
-        token_count: int,
-        has_cls_token: bool,
-    ) -> torch.Tensor:
-        if heatmaps.ndim != 4:
-            raise ValueError("heatmaps must have shape [B, 1, H, W].")
-        patch_count, grid_h, grid_w = self._token_grid(token_count, has_cls_token)
-        h = heatmaps.float()
-        if h.size(1) != 1:
-            h = h[:, :1]
-        pooled = F.interpolate(h, size=(grid_h, grid_w), mode="bilinear", align_corners=False)
-        flat = pooled.flatten(2).transpose(1, 2)
-        if flat.size(1) > patch_count:
-            flat = flat[:, :patch_count]
-        elif flat.size(1) < patch_count:
-            flat = F.pad(flat, (0, 0, 0, patch_count - flat.size(1)))
-        emb = self.proj(flat.to(dtype=self.proj[0].weight.dtype))
-        if has_cls_token:
-            cls = torch.zeros(emb.size(0), 1, emb.size(-1), device=emb.device, dtype=emb.dtype)
-            emb = torch.cat([cls, emb], dim=1)
-        return emb
 
 
 class Wan22VAEImageEncoder(nn.Module):

@@ -24,7 +24,6 @@ from scipy.spatial.transform import Rotation as R
 from torchvision import transforms
 
 from data.action_mapping import clamp_physical_action_speed
-from data.visual_guidance import make_attention_heatmap
 from model.config import ModelConfig, migrate_legacy_config
 from model.model import TeacherWorldModelDiT, migrate_legacy_state_dict_keys
 
@@ -90,6 +89,110 @@ def _dump_json(path: Path, payload: Any) -> None:
         f.flush()
         os.fsync(f.fileno())
     tmp.replace(path)
+
+
+def _trajectory_key(scene_id: str, trajectory_name: str) -> str:
+    return f"{scene_id}/{trajectory_name}"
+
+
+def _trajectory_index_token(trajectory_name: str) -> Optional[str]:
+    match = re.search(r"(\d+)$", str(trajectory_name))
+    if match is None:
+        return None
+    return str(int(match.group(1)))
+
+
+def _trajectory_visualization_tokens(raw: str) -> List[str]:
+    tokens = []
+    for item in re.split(r"[,\s]+", str(raw or "")):
+        token = item.strip().replace("\\", "/").replace(":", "/").strip("/")
+        if token:
+            tokens.append(token.lower())
+    return tokens
+
+
+def _visualization_enabled_for_key(args: argparse.Namespace, scene_id: str, trajectory_name: str) -> bool:
+    raw = str(getattr(args, "visualize_trajectory_keys", "") or "").strip()
+    if not raw:
+        return True
+    tokens = _trajectory_visualization_tokens(raw)
+    if any(token in {"all", "*"} for token in tokens):
+        return True
+    if not tokens or all(token in {"none", "false", "off", "0"} for token in tokens):
+        return False
+    scene = str(scene_id).lower()
+    traj = str(trajectory_name).lower()
+    candidates = {traj, f"{scene}/{traj}"}
+    idx = _trajectory_index_token(trajectory_name)
+    if idx is not None:
+        candidates.update({idx, f"{scene}/{idx}", f"{scene}/trajectory_{int(idx):04d}"})
+    return any(token in candidates for token in tokens)
+
+
+def _visualization_enabled_for_trajectory(args: argparse.Namespace, traj: "OnlineTrajectory") -> bool:
+    return _visualization_enabled_for_key(args, traj.scene_id, traj.trajectory_name)
+
+
+def _expected_visual_asset_dirs(args: argparse.Namespace, cfg: ModelConfig) -> List[str]:
+    del cfg
+    dirs: List[str] = []
+    if bool(getattr(args, "save_rgb", False)):
+        dirs.append("rgb")
+    if bool(args.save_transformer_attention_maps):
+        dirs.append("last_transformer_attention_maps")
+    if bool(args.save_predicted_video):
+        dirs.append("predicted_video")
+    return dirs
+
+
+def _visual_assets_exist_for_key(args: argparse.Namespace, cfg: ModelConfig, scene_id: str, trajectory_name: str) -> bool:
+    if not _visualization_enabled_for_key(args, scene_id, trajectory_name):
+        return True
+    expected_dirs = _expected_visual_asset_dirs(args, cfg)
+    if not expected_dirs:
+        return True
+    out_dir = Path(args.output_dir) / scene_id / trajectory_name
+    for dirname in expected_dirs:
+        path = out_dir / dirname
+        if not path.exists() or not any(path.rglob("*.png")):
+            return False
+    return True
+
+
+def _load_resumable_partial(
+    partial_path: Path,
+    expected_keys: set[str],
+    *,
+    verbose: bool = True,
+) -> List[Dict[str, Any]]:
+    if not partial_path.exists():
+        return []
+    try:
+        payload = _load_json(partial_path)
+    except Exception as exc:
+        if verbose:
+            print(f"[resume-warn] ignore unreadable partial summary {partial_path}: {exc}")
+        return []
+    summaries = payload.get("summaries", []) if isinstance(payload, dict) else []
+    if not isinstance(summaries, list):
+        if verbose:
+            print(f"[resume-warn] ignore malformed partial summary {partial_path}: summaries is not a list")
+        return []
+
+    kept: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        scene_id = str(summary.get("scene_id") or "")
+        trajectory_name = str(summary.get("trajectory_name") or "")
+        key = _trajectory_key(scene_id, trajectory_name)
+        if key in expected_keys and key not in seen:
+            kept.append(summary)
+            seen.add(key)
+    if verbose and kept:
+        print(f"[resume] loaded {len(kept)} completed trajectories from {partial_path}")
+    return kept
 
 
 def _jsonable_cfg(cfg: ModelConfig) -> Dict[str, Any]:
@@ -449,17 +552,22 @@ def discover_dataset_trajectories(
 ) -> List[Path]:
     ranges = _parse_range_spec(trajectory_range)
     all_dirs: List[Path] = []
+    seen_dirs: set[Path] = set()
     for scene_id in scene_ids:
         scene_dir = _case_insensitive_child(dataset_root, scene_id)
         if scene_dir is None:
             print(f"[warn] scene directory not found: {dataset_root / scene_id}")
             continue
+        scene_dirs: List[Path] = []
         for uav_json in scene_dir.rglob("uav_trajectory.json"):
             d = uav_json.parent
             if _in_range(scene_id, d.name, ranges):
-                all_dirs.append(d.resolve())
+                resolved = d.resolve()
+                if resolved not in seen_dirs:
+                    scene_dirs.append(resolved)
+                    seen_dirs.add(resolved)
+        all_dirs.extend(sorted(scene_dirs, key=_natural_key))
 
-    all_dirs = sorted(set(all_dirs), key=_natural_key)
     if split not in {"all", "train", "val"}:
         raise ValueError("--eval-split must be all/train/val")
     if split != "all":
@@ -470,7 +578,14 @@ def discover_dataset_trajectories(
         val_dirs = shuffled[:val_n]
         train_dirs = shuffled[val_n:] if val_n > 0 else shuffled
         all_dirs = val_dirs if split == "val" else train_dirs
-        all_dirs = sorted(all_dirs, key=_natural_key)
+        scene_rank = {str(scene_id).lower(): idx for idx, scene_id in enumerate(scene_ids)}
+        all_dirs = sorted(
+            all_dirs,
+            key=lambda p: (
+                scene_rank.get(p.parent.name.lower(), len(scene_rank)),
+                _natural_key(p),
+            ),
+        )
 
     if max_trajectories > 0:
         all_dirs = all_dirs[: int(max_trajectories)]
@@ -550,46 +665,14 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
         cfg_kwargs["dit_candidate_action_weight"] = float(args.dit_candidate_action_weight)
     if getattr(args, "dit_candidate_temporal_smooth_weight", None) is not None:
         cfg_kwargs["dit_candidate_temporal_smooth_weight"] = float(args.dit_candidate_temporal_smooth_weight)
-    if getattr(args, "use_target_visual_guidance", None) is not None:
-        cfg_kwargs["use_target_visual_guidance"] = bool(args.use_target_visual_guidance)
-    if getattr(args, "use_attention_heatmap", None) is not None:
-        cfg_kwargs["use_attention_heatmap"] = bool(args.use_attention_heatmap)
-    if getattr(args, "visual_guidance_fov_deg", None) is not None:
-        cfg_kwargs["visual_guidance_fov_deg"] = float(args.visual_guidance_fov_deg)
-    if getattr(args, "attention_heatmap_sigma", None) is not None:
-        cfg_kwargs["attention_heatmap_sigma"] = float(args.attention_heatmap_sigma)
-    if getattr(args, "use_target_belief_tracker", None) is not None:
-        cfg_kwargs["use_target_belief_tracker"] = bool(args.use_target_belief_tracker)
-    if getattr(args, "target_belief_token_scale", None) is not None:
-        cfg_kwargs["target_belief_token_scale"] = float(args.target_belief_token_scale)
-    if getattr(args, "target_belief_update_rate", None) is not None:
-        cfg_kwargs["target_belief_update_rate"] = float(args.target_belief_update_rate)
-    if getattr(args, "target_belief_min_confidence", None) is not None:
-        cfg_kwargs["target_belief_min_confidence"] = float(args.target_belief_min_confidence)
-    if getattr(args, "target_belief_temperature", None) is not None:
-        cfg_kwargs["target_belief_temperature"] = float(args.target_belief_temperature)
-    if getattr(args, "target_belief_loss_weight", None) is not None:
-        cfg_kwargs["target_belief_loss_weight"] = float(args.target_belief_loss_weight)
-    if getattr(args, "target_belief_motion_weight", None) is not None:
-        cfg_kwargs["target_belief_motion_weight"] = float(args.target_belief_motion_weight)
-    if getattr(args, "target_belief_update_sharpness", None) is not None:
-        cfg_kwargs["target_belief_update_sharpness"] = float(args.target_belief_update_sharpness)
-    if getattr(args, "use_latent_mpc", None) is not None:
-        cfg_kwargs["use_latent_mpc"] = bool(args.use_latent_mpc)
-    if getattr(args, "latent_mpc_candidate_count", None) is not None:
-        cfg_kwargs["latent_mpc_candidate_count"] = int(args.latent_mpc_candidate_count)
-    if getattr(args, "latent_mpc_distance_weight", None) is not None:
-        cfg_kwargs["latent_mpc_distance_weight"] = float(args.latent_mpc_distance_weight)
-    if getattr(args, "latent_mpc_smooth_weight", None) is not None:
-        cfg_kwargs["latent_mpc_smooth_weight"] = float(args.latent_mpc_smooth_weight)
-    if getattr(args, "latent_mpc_action_weight", None) is not None:
-        cfg_kwargs["latent_mpc_action_weight"] = float(args.latent_mpc_action_weight)
-    if getattr(args, "latent_mpc_visual_weight", None) is not None:
-        cfg_kwargs["latent_mpc_visual_weight"] = float(args.latent_mpc_visual_weight)
-    if getattr(args, "latent_mpc_latent_frames", None) is not None:
-        cfg_kwargs["latent_mpc_latent_frames"] = int(args.latent_mpc_latent_frames)
-    if getattr(args, "latent_mpc_video_sampling_steps", None) is not None:
-        cfg_kwargs["latent_mpc_video_sampling_steps"] = int(args.latent_mpc_video_sampling_steps)
+    if getattr(args, "use_target_relative_context", None) is not None:
+        cfg_kwargs["use_target_relative_context"] = bool(args.use_target_relative_context)
+    if getattr(args, "target_relative_context_scale", None) is not None:
+        cfg_kwargs["target_relative_context_scale"] = float(args.target_relative_context_scale)
+    if getattr(args, "target_relative_token_scale", None) is not None:
+        cfg_kwargs["target_relative_token_scale"] = float(args.target_relative_token_scale)
+    if getattr(args, "target_relative_context_hidden_dim", None) is not None:
+        cfg_kwargs["target_relative_context_hidden_dim"] = int(args.target_relative_context_hidden_dim)
     if getattr(args, "force_direct_action", False):
         cfg_kwargs["use_diffusion_actor"] = False
     return ModelConfig(**cfg_kwargs)
@@ -622,7 +705,6 @@ def _summarize_checkpoint_load(
             "image_encoder": 0,
             "text_encoder": 0,
             "inactive_actor": 0,
-            "inactive_visual_guidance": 0,
             "other_frozen": 0,
         }
         for name in expected_missing:
@@ -632,8 +714,6 @@ def _summarize_checkpoint_load(
                 groups["text_encoder"] += 1
             elif (not cfg.use_diffusion_actor) and name.startswith("actor."):
                 groups["inactive_actor"] += 1
-            elif (not cfg.use_target_visual_guidance) and name == "fusion.target_bias_embed":
-                groups["inactive_visual_guidance"] += 1
             else:
                 groups["other_frozen"] += 1
         group_s = ", ".join(f"{k}={v}" for k, v in groups.items() if v)
@@ -666,9 +746,8 @@ def load_model(args: argparse.Namespace, device: torch.device) -> Tuple[TeacherW
         f"dit_candidate_selection={cfg.dit_candidate_selection}, "
         f"dit_candidate_count={cfg.dit_candidate_count}, "
         f"candidate_score=tracking, "
-        f"visual_guidance={cfg.use_target_visual_guidance}, "
-        f"target_belief_tracker={cfg.use_target_belief_tracker}, "
-        f"latent_mpc={cfg.use_latent_mpc}"
+        f"target_relative_context={cfg.use_target_relative_context}, "
+        f"target_relative_token_scale={cfg.target_relative_token_scale}"
     )
     return model, cfg
 
@@ -1085,26 +1164,6 @@ def save_rgb(path: Path, rgb: np.ndarray) -> None:
     cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
 
-def save_heatmap_overlay(path: Path, rgb: np.ndarray, heatmap: torch.Tensor, alpha: float = 0.45) -> None:
-    import cv2
-
-    rgb_u8 = np.asarray(rgb, dtype=np.uint8)
-    hm = heatmap.detach().float().cpu().squeeze().numpy()
-    if hm.ndim != 2:
-        raise ValueError(f"expected 2D heatmap after squeeze, got shape {hm.shape}")
-    hm = hm - float(np.min(hm))
-    denom = float(np.max(hm))
-    if denom > 1e-8:
-        hm = hm / denom
-    hm_u8 = np.clip(hm * 255.0, 0, 255).astype(np.uint8)
-    hm_u8 = cv2.resize(hm_u8, (rgb_u8.shape[1], rgb_u8.shape[0]), interpolation=cv2.INTER_LINEAR)
-    colored_bgr = cv2.applyColorMap(hm_u8, cv2.COLORMAP_JET)
-    colored_rgb = cv2.cvtColor(colored_bgr, cv2.COLOR_BGR2RGB)
-    overlay_rgb = cv2.addWeighted(rgb_u8, 1.0 - float(alpha), colored_rgb, float(alpha), 0.0)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(path), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
-
-
 def save_attention_map_overlay(
     path: Path,
     rgb: np.ndarray,
@@ -1345,20 +1404,17 @@ def run_online_trajectory(
 ) -> Dict[str, Any]:
     out_dir = Path(args.output_dir) / traj.scene_id / traj.trajectory_name
     rgb_out_dir = out_dir / "rgb"
-    heatmap_overlay_dir = out_dir / "heatmap_overlay"
     attention_map_dir = out_dir / "last_transformer_attention_maps"
     predicted_video_dir = out_dir / "predicted_video"
     out_dir.mkdir(parents=True, exist_ok=True)
-    if args.save_rgb:
+    save_visual_assets = _visualization_enabled_for_trajectory(args, traj)
+    if args.save_rgb and save_visual_assets:
         rgb_out_dir.mkdir(parents=True, exist_ok=True)
-    save_heatmap_overlay_enabled = bool(
-        args.save_heatmap_overlay and cfg.use_target_visual_guidance and cfg.use_attention_heatmap
-    )
-    if save_heatmap_overlay_enabled:
-        heatmap_overlay_dir.mkdir(parents=True, exist_ok=True)
-    if args.save_transformer_attention_maps:
+    save_transformer_attention_maps_enabled = bool(save_visual_assets and args.save_transformer_attention_maps)
+    save_predicted_video_enabled = bool(save_visual_assets and args.save_predicted_video)
+    if save_transformer_attention_maps_enabled:
         attention_map_dir.mkdir(parents=True, exist_ok=True)
-    if args.save_predicted_video:
+    if save_predicted_video_enabled:
         predicted_video_dir.mkdir(parents=True, exist_ok=True)
 
     _set_saved_assets_for_trajectory(executor, traj, args)
@@ -1394,10 +1450,6 @@ def run_online_trajectory(
     rssm_state = None
     prev_action = torch.zeros(1, cfg.action_dim, device=device, dtype=torch.float32)
     prev_done = torch.zeros(1, device=device, dtype=torch.float32)
-    reference_image_t: Optional[torch.Tensor] = None
-    reference_visual_tokens: Optional[torch.Tensor] = None
-    reference_target_relative_t: Optional[torch.Tensor] = None
-    target_belief_t: Optional[torch.Tensor] = None
 
     steps: List[Dict[str, Any]] = []
     distances: List[float] = []
@@ -1507,14 +1559,8 @@ def run_online_trajectory(
         rgb_img, _ = executor.get_camera_images()
         if rgb_img is None:
             raise RuntimeError(f"failed to capture RGB at step {t}")
-        if args.save_rgb:
+        if args.save_rgb and save_visual_assets:
             save_rgb(rgb_out_dir / f"frame_{t:05d}.png", rgb_img)
-
-        if cfg.use_target_belief_tracker and reference_target_relative_t is None:
-            reference_target_np = rel_body / max(float(args.target_relative_scale), 1e-6)
-            reference_target_relative_t = torch.from_numpy(reference_target_np.astype(np.float32)).view(1, -1).to(device)
-            reference_image_t = rgb_to_model_tensor(rgb_img, transform, device)
-            reference_visual_tokens = model.encode_reference_visual_tokens(reference_image_t)
 
         dataset_expert_action = traj.expert_action_physical[t] if t < len(traj.expert_action_physical) else None
         target_next_for_expert = traj.target_traj_airsim[t + 1] if t + 1 < len(traj.target_traj_airsim) else target_now
@@ -1534,7 +1580,6 @@ def run_online_trajectory(
         expert_action_norm = None
         action_source = "model"
         pred = None
-        heatmap_overlay_relpath = None
         attention_map_relpath = None
         predicted_video_relpaths = None
 
@@ -1554,20 +1599,6 @@ def run_online_trajectory(
                 text_tokens, attention_mask = tokenize_instruction(tokenizer, instruction, cfg.text_context_length, device)
             target_relative_np = rel_body / max(float(args.target_relative_scale), 1e-6)
             target_relative_t = torch.from_numpy(target_relative_np.astype(np.float32)).view(1, -1).to(device)
-            attention_heatmap_t = None
-            if cfg.use_target_visual_guidance:
-                raw_target_relative_t = torch.from_numpy(rel_body.astype(np.float32)).view(1, -1).to(device)
-                if cfg.use_attention_heatmap:
-                    attention_heatmap_t = make_attention_heatmap(
-                        raw_target_relative_t,
-                        image_hw=(image_t.shape[-2], image_t.shape[-1]),
-                        fov_deg=cfg.visual_guidance_fov_deg,
-                        sigma=cfg.attention_heatmap_sigma,
-                    )
-                    if save_heatmap_overlay_enabled:
-                        heatmap_overlay_path = heatmap_overlay_dir / f"frame_{t:05d}.png"
-                        save_heatmap_overlay(heatmap_overlay_path, rgb_img, attention_heatmap_t)
-                        heatmap_overlay_relpath = str(heatmap_overlay_path.relative_to(out_dir))
 
             pred, rssm_state = model.act(
                 image=image_t,
@@ -1576,29 +1607,19 @@ def run_online_trajectory(
                 prev_action=prev_action,
                 rssm_state=rssm_state,
                 attention_mask=attention_mask,
-                attention_heatmap=attention_heatmap_t,
                 prev_done=prev_done,
                 deterministic=args.deterministic_action,
                 num_steps=args.sampling_steps,
                 instruction=instruction,
-                save_transformer_attention=args.save_transformer_attention_maps,
-                save_predicted_video=args.save_predicted_video,
+                save_transformer_attention=save_transformer_attention_maps_enabled,
+                save_predicted_video=save_predicted_video_enabled,
                 predicted_video_latent_frames=args.predicted_video_latent_frames,
-                latent_mpc=args.use_latent_mpc,
-                latent_mpc_candidate_count=args.latent_mpc_candidate_count,
-                target_next_relative=None,
-                reference_target_relative=reference_target_relative_t,
-                reference_image=reference_image_t,
-                reference_visual_tokens=reference_visual_tokens,
-                target_belief=target_belief_t,
             )
-            if "target_belief" in pred:
-                target_belief_t = pred["target_belief"].detach()
-            if args.save_transformer_attention_maps and "last_transformer_attention_map" in pred:
+            if save_transformer_attention_maps_enabled and "last_transformer_attention_map" in pred:
                 attention_map_path = attention_map_dir / f"frame_{t:05d}"
                 save_attention_map_overlay(attention_map_path, rgb_img, pred["last_transformer_attention_map"])
                 attention_map_relpath = str(attention_map_path.with_suffix(".png").relative_to(out_dir))
-            if args.save_predicted_video and "predicted_video_latents" in pred:
+            if save_predicted_video_enabled and "predicted_video_latents" in pred:
                 decoded_video = model.image_encoder.decode_video_latents(pred["predicted_video_latents"])
                 pred_frame_dir = predicted_video_dir / f"frame_{t:05d}"
                 pred_frame_names = save_predicted_video_frames(pred_frame_dir, decoded_video)
@@ -1671,20 +1692,10 @@ def run_online_trajectory(
                 str(did): _airsim_xyz_to_dataset(pos) for did, pos in jammer_positions_now.items()
             },
         }
-        if heatmap_overlay_relpath is not None:
-            step_record["heatmap_overlay"] = heatmap_overlay_relpath
         if attention_map_relpath is not None:
             step_record["last_transformer_attention_map"] = attention_map_relpath
         if predicted_video_relpaths is not None:
             step_record["predicted_video_frames"] = predicted_video_relpaths
-        if pred is not None and "target_belief_confidence" in pred:
-            step_record["target_belief_confidence"] = (
-                pred["target_belief_confidence"].detach().float().view(-1).cpu().numpy().astype(float).tolist()
-            )
-        if pred is not None and "target_belief_entropy" in pred:
-            step_record["target_belief_entropy"] = (
-                pred["target_belief_entropy"].detach().float().view(-1).cpu().numpy().astype(float).tolist()
-            )
         if pred is not None and "candidate_scores" in pred:
             selected_candidate = int(pred["selected_candidate"].detach().view(-1)[0].cpu().item())
             candidate_scores = pred["candidate_scores"].detach().float().view(-1).cpu().numpy()
@@ -1706,24 +1717,6 @@ def run_online_trajectory(
                 if key in pred:
                     values = pred[key].detach().float().view(-1).cpu().numpy()
                     step_record["dit_candidate_selection"][key.replace("candidate_", "")] = values.astype(float).tolist()
-        if pred is not None and "latent_mpc_scores" in pred:
-            selected_mpc = int(pred["latent_mpc_selected"].detach().view(-1)[0].cpu().item())
-            mpc_scores = pred["latent_mpc_scores"].detach().float().view(-1).cpu().numpy()
-            step_record["latent_mpc"] = {
-                "selected": selected_mpc,
-                "scores": mpc_scores.astype(float).tolist(),
-                "selected_score": float(mpc_scores[selected_mpc]),
-            }
-            for key in (
-                "latent_mpc_distance",
-                "latent_mpc_smooth",
-                "latent_mpc_action_effort",
-                "latent_mpc_visual_cost",
-                "latent_mpc_visual_change",
-            ):
-                if key in pred:
-                    values = pred[key].detach().float().view(-1).cpu().numpy()
-                    step_record["latent_mpc"][key.replace("latent_mpc_", "")] = values.astype(float).tolist()
         steps.append(step_record)
 
         prev_action = torch.from_numpy(action_norm).view(1, -1).to(device).float()
@@ -1743,9 +1736,7 @@ def run_online_trajectory(
             iterator.set_postfix(
                 dist=f"{distance:.2f}",
                 action=pred_act,
-                src=action_source,
                 expert=expert_act,
-                expert_src=expert_action_source,
             )
 
         prev_uav_after_pos = np.asarray(uav_state_after["position"], dtype=np.float32).copy()
@@ -1984,26 +1975,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dit-candidate-front-weight", type=float, default=None)
     parser.add_argument("--dit-candidate-action-weight", type=float, default=None)
     parser.add_argument("--dit-candidate-temporal-smooth-weight", type=float, default=None)
-    parser.add_argument("--use-target-visual-guidance", type=_str2bool, default=None)
-    parser.add_argument("--use-attention-heatmap", type=_str2bool, default=None)
-    parser.add_argument("--visual-guidance-fov-deg", type=float, default=None)
-    parser.add_argument("--attention-heatmap-sigma", type=float, default=None)
-    parser.add_argument("--use-target-belief-tracker", type=_str2bool, default=None)
-    parser.add_argument("--target-belief-token-scale", type=float, default=None)
-    parser.add_argument("--target-belief-update-rate", type=float, default=None)
-    parser.add_argument("--target-belief-min-confidence", type=float, default=None)
-    parser.add_argument("--target-belief-temperature", type=float, default=None)
-    parser.add_argument("--target-belief-loss-weight", type=float, default=None)
-    parser.add_argument("--target-belief-motion-weight", type=float, default=None)
-    parser.add_argument("--target-belief-update-sharpness", type=float, default=None)
-    parser.add_argument("--use-latent-mpc", type=_str2bool, default=None)
-    parser.add_argument("--latent-mpc-candidate-count", type=int, default=None)
-    parser.add_argument("--latent-mpc-distance-weight", type=float, default=None)
-    parser.add_argument("--latent-mpc-smooth-weight", type=float, default=None)
-    parser.add_argument("--latent-mpc-action-weight", type=float, default=None)
-    parser.add_argument("--latent-mpc-visual-weight", type=float, default=None)
-    parser.add_argument("--latent-mpc-latent-frames", type=int, default=None)
-    parser.add_argument("--latent-mpc-video-sampling-steps", type=int, default=None)
+    parser.add_argument("--use-target-relative-context", type=_str2bool, default=None)
+    parser.add_argument("--target-relative-context-scale", type=float, default=None)
+    parser.add_argument("--target-relative-token-scale", type=float, default=None)
+    parser.add_argument("--target-relative-context-hidden-dim", type=int, default=None)
     parser.add_argument("--max-vel", type=float, default=DEFAULT_MODEL_CFG.max_vel)
     parser.add_argument("--max-yaw-rate", type=float, default=DEFAULT_MODEL_CFG.max_yaw_rate)
     parser.add_argument("--max-speed-norm", type=float, default=DEFAULT_MODEL_CFG.max_speed_norm)
@@ -2076,8 +2051,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-stop-on-collision", action="store_false", dest="stop_on_collision")
     parser.add_argument("--save-rgb", action="store_true", default=True)
     parser.add_argument("--no-save-rgb", action="store_false", dest="save_rgb")
-    parser.add_argument("--save-heatmap-overlay", action="store_true", default=True)
-    parser.add_argument("--no-save-heatmap-overlay", action="store_false", dest="save_heatmap_overlay")
+    parser.add_argument(
+        "--visualize-trajectory-keys",
+        type=str,
+        default="",
+        help=(
+            "Comma/space separated whitelist for saving visual assets, "
+            "for example City_1/trajectory_0451. Empty or 'all' saves all trajectories."
+        ),
+    )
     parser.add_argument("--save-transformer-attention-maps", action="store_true", default=False)
     parser.add_argument("--no-save-transformer-attention-maps", action="store_false", dest="save_transformer_attention_maps")
     parser.add_argument("--save-predicted-video", action="store_true", default=False)
@@ -2099,21 +2081,17 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    # Force a single evaluator process and a single AirSim scene.
+    # Force a single evaluator process. Multiple scenes, if requested, are
+    # evaluated sequentially by reopening one AirSim scene at a time.
     # Keep DAGGER_MULTI_WORKER=1 even in single-GPU mode: in your TrajectoryExecutor,
     # this flag prevents connect() from proactively calling close_scenes before every
     # connection/retry. It does NOT create extra evaluator processes here.
     os.environ["DAGGER_MULTI_WORKER"] = "1"
 
     scene_ids = _parse_scene_list(args.scene_list)
-    if len(scene_ids) != 1:
-        raise ValueError(
-            "This online evaluator is single-GPU/single-process/single-scene only. "
-            f"Please pass exactly one scene in --scene-list, got: {scene_ids}"
-        )
 
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
-    print("[mode] single GPU / single Python evaluator / single AirSim scene")
+    print("[mode] single GPU / single Python evaluator / sequential AirSim scenes")
     print(f"[device] {device}")
     print(f"[DAGGER_MULTI_WORKER] {os.environ.get('DAGGER_MULTI_WORKER')}")
     print(f"[dataset-root] {args.dataset_root}")
@@ -2148,13 +2126,40 @@ def main() -> None:
     print(f"[eval] trajectories={len(traj_dirs)} split={args.eval_split} scenes={scene_ids}")
     print(f"[output] {args.output_dir}")
 
-    all_summaries: List[Dict[str, Any]] = []
+    expected_keys = {_trajectory_key(p.parent.name, p.name) for p in traj_dirs}
+    partial_path = Path(args.output_dir) / "summary_partial.json"
+    all_summaries: List[Dict[str, Any]] = _load_resumable_partial(partial_path, expected_keys)
+    completed_keys = {
+        _trajectory_key(str(s.get("scene_id") or ""), str(s.get("trajectory_name") or ""))
+        for s in all_summaries
+    }
+    if all_summaries:
+        _dump_json(partial_path, {"summaries": all_summaries, "args": vars(args)})
     current_scene = None
     executor = None
 
     try:
         for idx, dataset_dir in enumerate(traj_dirs, start=1):
             scene_id = dataset_dir.parent.name
+            traj_key = _trajectory_key(scene_id, dataset_dir.name)
+            refreshed_summaries = _load_resumable_partial(partial_path, expected_keys, verbose=False)
+            if len(refreshed_summaries) > len(all_summaries):
+                all_summaries = refreshed_summaries
+                completed_keys = {
+                    _trajectory_key(str(s.get("scene_id") or ""), str(s.get("trajectory_name") or ""))
+                    for s in all_summaries
+                }
+            if traj_key in completed_keys:
+                if _visual_assets_exist_for_key(args, cfg, scene_id, dataset_dir.name):
+                    print(f"[resume-skip] {traj_key} ({idx}/{len(traj_dirs)})")
+                    continue
+                print(f"[resume-visualize] {traj_key} ({idx}/{len(traj_dirs)}): rerun to create requested visual assets")
+                all_summaries = [
+                    summary
+                    for summary in all_summaries
+                    if _trajectory_key(str(summary.get("scene_id") or ""), str(summary.get("trajectory_name") or "")) != traj_key
+                ]
+                completed_keys.discard(traj_key)
             traj = load_online_trajectory(dataset_dir, scene_id)
             if current_scene != scene_id or executor is None:
                 cleanup_executor(executor)
@@ -2167,7 +2172,8 @@ def main() -> None:
             print(f"frames={traj.num_frames}, target_asset={traj.target_asset_name}, jammers={list(traj.jammer_trajs_airsim.keys())}")
             summary = run_online_trajectory(model, cfg, tokenizer, transform, executor, traj, args, device)
             all_summaries.append(summary)
-            _dump_json(Path(args.output_dir) / "summary_partial.json", {"summaries": all_summaries})
+            completed_keys.add(traj_key)
+            _dump_json(partial_path, {"summaries": all_summaries, "args": vars(args)})
 
         success_values = [1.0 if s.get("success") else 0.0 for s in all_summaries]
         collision_values = [1.0 if s.get("collision") else 0.0 for s in all_summaries]
@@ -2210,6 +2216,7 @@ def main() -> None:
         ]
         final_close_values = [1.0 if s.get("final_close_enough") else 0.0 for s in all_summaries]
         final_visible_values = [1.0 if s.get("final_visible_by_geometry") else 0.0 for s in all_summaries]
+
         failure_reasons: Dict[str, int] = {}
         for summary in all_summaries:
             reason = str(summary.get("failure_reason") or "unknown")

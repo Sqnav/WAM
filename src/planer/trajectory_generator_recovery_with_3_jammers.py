@@ -28,7 +28,7 @@ MAP_DIR = os.environ.get("MAP_DIR", "/data1/ysq/OurVLN/Plandataset/map")
 UDF_CACHE_DIR = os.environ.get("UDF_CACHE_DIR", "/data1/ysq/OurVLN/Plandataset/udf_cache")
 OUTPUT_DIR = os.environ.get("RECOVERY_OUTPUT_DIR", "/data1/ysq/Worldmodel/Plandataset")
 
-DEFAULT_CITY_LIST = ",".join(f"city_{i}" for i in range(1, 31))
+DEFAULT_CITY_LIST = ",".join(f"city_{i}" for i in range(1, 3))
 CITY_LIST = [c.strip() for c in os.environ.get("RECOVERY_CITY_LIST", DEFAULT_CITY_LIST).split(",") if c.strip()]
 NUM_TRAJECTORIES = int(os.environ.get("RECOVERY_NUM_TRAJECTORIES", os.environ.get("NUM_TRAJECTORIES", "500")))
 
@@ -46,6 +46,7 @@ RECOVERY_START_LATERAL_DEG_MIN = float(os.environ.get("RECOVERY_START_LATERAL_DE
 RECOVERY_START_LATERAL_DEG_MAX = float(os.environ.get("RECOVERY_START_LATERAL_DEG_MAX", "22.0"))
 RECOVERY_TRACKER_STEP_TOL = float(os.environ.get("RECOVERY_TRACKER_STEP_TOL", "1e-4"))
 RECOVERY_VERTICAL_HALF_ANGLE_DEG = float(os.environ.get("RECOVERY_VERTICAL_HALF_ANGLE_DEG", "45.0"))
+RECOVERY_MIN_FORWARD_DOT = float(os.environ.get("RECOVERY_MIN_FORWARD_DOT", "0.0"))
 
 START_SEPARATION_MIN = float(os.environ.get("START_SEPARATION_MIN", "3.0"))
 START_SEPARATION_MAX = float(os.environ.get("START_SEPARATION_MAX", "5.0"))
@@ -504,12 +505,13 @@ def sample_jammer_count_tasks() -> List[int]:
     if not JAMMER_ENABLED:
         return [0] * NUM_TRAJECTORIES
     counts: List[int] = []
-    base_count = NUM_TRAJECTORIES // RECOVERY_MAX_JAMMERS
-    remainder = NUM_TRAJECTORIES % RECOVERY_MAX_JAMMERS
-    for n in range(1, RECOVERY_MAX_JAMMERS + 1):
+    jammer_options = list(range(0, RECOVERY_MAX_JAMMERS + 1))
+    base_count = NUM_TRAJECTORIES // len(jammer_options)
+    remainder = NUM_TRAJECTORIES % len(jammer_options)
+    for n in jammer_options:
         counts.extend([n] * base_count)
     if remainder > 0:
-        extra = list(range(1, RECOVERY_MAX_JAMMERS + 1))
+        extra = list(jammer_options)
         random.shuffle(extra)
         counts.extend(extra[:remainder])
     random.shuffle(counts)
@@ -889,6 +891,15 @@ def validate_recovery_tracker(
                 return False
             if not is_segment_free(tracker_traj[i - 1], tracker_pos, prox, SAFETY_RADIUS, udf_grid):
                 return False
+            move_xy = np.asarray(tracker_pos[:2], dtype=float) - np.asarray(tracker_traj[i - 1][:2], dtype=float)
+            move_norm = float(np.linalg.norm(move_xy))
+            if move_norm > 1e-8:
+                prev_forward = yaw_to_forward(yaws[i - 1])[:2]
+                forward_norm = float(np.linalg.norm(prev_forward))
+                if forward_norm > 1e-8:
+                    forward_dot = float(np.dot(move_xy / move_norm, prev_forward / forward_norm))
+                    if forward_dot < RECOVERY_MIN_FORWARD_DOT:
+                        return False
         if not is_point_in_camera_fov(
             tracker_pos,
             yaw_to_forward(yaw),
@@ -1452,7 +1463,7 @@ def summarize_city_output(city_output_dir: str, map_name: str) -> Dict[str, Any]
     lengths = []
     frame_counts = []
     bearing_abs = []
-    jammer_dist = {str(i): 0 for i in range(0 if not JAMMER_ENABLED else 1, RECOVERY_MAX_JAMMERS + 1)}
+    jammer_dist = {str(i): 0 for i in range(0, RECOVERY_MAX_JAMMERS + 1)}
     found = 0
 
     for idx in range(1, NUM_TRAJECTORIES + 1):
@@ -1494,6 +1505,7 @@ def summarize_city_output(city_output_dir: str, map_name: str) -> Dict[str, Any]
             "recovery_steps_max": RECOVERY_STEPS_MAX,
             "recovery_steps_ratio_min": RECOVERY_STEPS_RATIO_MIN,
             "recovery_steps_ratio_max": RECOVERY_STEPS_RATIO_MAX,
+            "min_forward_dot": RECOVERY_MIN_FORWARD_DOT,
             "start_bearing_deg_min": RECOVERY_START_BEARING_DEG_MIN,
             "start_bearing_deg_max": RECOVERY_START_BEARING_DEG_MAX,
             "start_lateral_deg_min": RECOVERY_START_LATERAL_DEG_MIN,

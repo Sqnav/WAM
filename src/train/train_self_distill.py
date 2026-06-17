@@ -326,14 +326,14 @@ def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] 
         cfg_kwargs["action_sequence_horizon"] = int(args.action_sequence_horizon)
     if args.action_video_freq_ratio is not None:
         cfg_kwargs["fastwam_action_video_freq_ratio"] = max(int(args.action_video_freq_ratio), 1)
-    if args.use_target_visual_guidance is not None:
-        cfg_kwargs["use_target_visual_guidance"] = bool(args.use_target_visual_guidance)
-    if args.use_attention_heatmap is not None:
-        cfg_kwargs["use_attention_heatmap"] = bool(args.use_attention_heatmap)
-    if args.visual_guidance_fov_deg is not None:
-        cfg_kwargs["visual_guidance_fov_deg"] = float(args.visual_guidance_fov_deg)
-    if args.attention_heatmap_sigma is not None:
-        cfg_kwargs["attention_heatmap_sigma"] = float(args.attention_heatmap_sigma)
+    if args.use_target_relative_context is not None:
+        cfg_kwargs["use_target_relative_context"] = bool(args.use_target_relative_context)
+    if args.target_relative_context_scale is not None:
+        cfg_kwargs["target_relative_context_scale"] = float(args.target_relative_context_scale)
+    if args.target_relative_token_scale is not None:
+        cfg_kwargs["target_relative_token_scale"] = float(args.target_relative_token_scale)
+    if args.target_relative_context_hidden_dim is not None:
+        cfg_kwargs["target_relative_context_hidden_dim"] = int(args.target_relative_context_hidden_dim)
     if args.use_wan22_encoders is not None:
         cfg_kwargs["use_wan22_encoders"] = bool(args.use_wan22_encoders)
     if args.wan22_model_base_path is not None:
@@ -348,24 +348,6 @@ def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] 
             cfg_kwargs["text_context_length"] = int(args.wan22_text_context_length)
     if args.wan22_text_encode_batch_size is not None:
         cfg_kwargs["wan22_text_encode_batch_size"] = int(args.wan22_text_encode_batch_size)
-    if args.fastwam_heatmap_context_grid is not None:
-        cfg_kwargs["fastwam_heatmap_context_grid"] = int(args.fastwam_heatmap_context_grid)
-    if args.use_target_belief_tracker is not None:
-        cfg_kwargs["use_target_belief_tracker"] = bool(args.use_target_belief_tracker)
-    if args.target_belief_token_scale is not None:
-        cfg_kwargs["target_belief_token_scale"] = float(args.target_belief_token_scale)
-    if args.target_belief_update_rate is not None:
-        cfg_kwargs["target_belief_update_rate"] = float(args.target_belief_update_rate)
-    if args.target_belief_min_confidence is not None:
-        cfg_kwargs["target_belief_min_confidence"] = float(args.target_belief_min_confidence)
-    if args.target_belief_temperature is not None:
-        cfg_kwargs["target_belief_temperature"] = float(args.target_belief_temperature)
-    if args.target_belief_loss_weight is not None:
-        cfg_kwargs["target_belief_loss_weight"] = float(args.target_belief_loss_weight)
-    if args.target_belief_motion_weight is not None:
-        cfg_kwargs["target_belief_motion_weight"] = float(args.target_belief_motion_weight)
-    if args.target_belief_update_sharpness is not None:
-        cfg_kwargs["target_belief_update_sharpness"] = float(args.target_belief_update_sharpness)
     if args.fastwam_skip_dit_load_from_pretrain is not None:
         cfg_kwargs["fastwam_skip_dit_load_from_pretrain"] = bool(args.fastwam_skip_dit_load_from_pretrain)
     if args.fastwam_action_dit_pretrained_path is not None:
@@ -377,12 +359,8 @@ def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] 
 
 def make_student_cfg(args: argparse.Namespace, teacher_cfg: ModelConfig) -> ModelConfig:
     updates: Dict[str, Any] = {}
-    if args.student_use_target_visual_guidance is not None:
-        updates["use_target_visual_guidance"] = bool(args.student_use_target_visual_guidance)
-    if args.student_use_attention_heatmap is not None:
-        updates["use_attention_heatmap"] = bool(args.student_use_attention_heatmap)
-    if args.student_use_target_belief_tracker is not None:
-        updates["use_target_belief_tracker"] = bool(args.student_use_target_belief_tracker)
+    if args.student_use_target_relative_context is not None:
+        updates["use_target_relative_context"] = bool(args.student_use_target_relative_context)
     return replace(teacher_cfg, **updates)
 
 
@@ -600,14 +578,11 @@ def evaluate_distill(
             target_relative=batch["target_relative"],
             prev_actions=batch["prev_actions"],
             attention_mask=batch["attention_mask"],
-            attention_heatmaps=batch.get("attention_heatmaps"),
             expert_action=teacher_policy_target,
             valid_mask=batch["valid_mask"] if teacher_policy_target is not None else None,
             done=batch.get("done"),
             instructions=batch.get("instructions"),
             video_latents=batch.get("video_latents"),
-            reference_target_relative=batch.get("reference_target_relative"),
-            reference_images=batch.get("reference_images"),
         )
 
         student_out = student(
@@ -616,14 +591,11 @@ def evaluate_distill(
             target_relative=batch["target_relative"],
             prev_actions=batch["prev_actions"],
             attention_mask=batch["attention_mask"],
-            attention_heatmaps=batch.get("attention_heatmaps"),
             expert_action=batch["expert_action"],
             valid_mask=batch["valid_mask"],
             done=batch.get("done"),
             instructions=batch.get("instructions"),
             video_latents=batch.get("video_latents"),
-            reference_target_relative=batch.get("reference_target_relative"),
-            reference_images=batch.get("reference_images"),
         )
 
         losses = self_distill_losses(
@@ -682,13 +654,8 @@ def build_loaders(
         distance_bins=cfg.distance_bins,
         text_context_length=cfg.text_context_length,
         random_crop=True,
-        use_target_visual_guidance=cfg.use_target_visual_guidance,
-        use_attention_heatmap=cfg.use_attention_heatmap,
-        visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
-        attention_heatmap_sigma=cfg.attention_heatmap_sigma,
         wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
         action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
-        use_target_belief_tracker=cfg.use_target_belief_tracker,
     )
 
     train_sampler = (
@@ -728,13 +695,8 @@ def build_loaders(
             distance_bins=cfg.distance_bins,
             text_context_length=cfg.text_context_length,
             random_crop=False,
-            use_target_visual_guidance=cfg.use_target_visual_guidance,
-            use_attention_heatmap=cfg.use_attention_heatmap,
-            visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
-            attention_heatmap_sigma=cfg.attention_heatmap_sigma,
             wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
             action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
-            use_target_belief_tracker=cfg.use_target_belief_tracker,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -782,28 +744,17 @@ def parse_args() -> argparse.Namespace:
         choices=["attention", "concat"],
         help="Override teacher checkpoint cfg.target_token_fusion_mode. Default uses checkpoint cfg.",
     )
-    parser.add_argument("--use-target-visual-guidance", type=_str2bool, default=None)
-    parser.add_argument("--use-attention-heatmap", type=_str2bool, default=None)
-    parser.add_argument("--student-use-target-visual-guidance", type=_str2bool, default=None)
-    parser.add_argument("--student-use-attention-heatmap", type=_str2bool, default=None)
-    parser.add_argument("--use-target-belief-tracker", type=_str2bool, default=None)
-    parser.add_argument("--student-use-target-belief-tracker", type=_str2bool, default=None)
-    parser.add_argument("--target-belief-token-scale", type=float, default=None)
-    parser.add_argument("--target-belief-update-rate", type=float, default=None)
-    parser.add_argument("--target-belief-min-confidence", type=float, default=None)
-    parser.add_argument("--target-belief-temperature", type=float, default=None)
-    parser.add_argument("--target-belief-loss-weight", type=float, default=None)
-    parser.add_argument("--target-belief-motion-weight", type=float, default=None)
-    parser.add_argument("--target-belief-update-sharpness", type=float, default=None)
-    parser.add_argument("--visual-guidance-fov-deg", type=float, default=None)
-    parser.add_argument("--attention-heatmap-sigma", type=float, default=None)
+    parser.add_argument("--use-target-relative-context", type=_str2bool, default=None)
+    parser.add_argument("--student-use-target-relative-context", type=_str2bool, default=None)
+    parser.add_argument("--target-relative-context-scale", type=float, default=None)
+    parser.add_argument("--target-relative-token-scale", type=float, default=None)
+    parser.add_argument("--target-relative-context-hidden-dim", type=int, default=None)
     parser.add_argument("--use-wan22-encoders", type=_str2bool, default=None)
     parser.add_argument("--wan22-model-base-path", type=str, default=None)
     parser.add_argument("--wan22-fastwam-src-path", type=str, default=None)
     parser.add_argument("--wan22-skip-download", type=_str2bool, default=None)
     parser.add_argument("--wan22-text-context-length", type=int, default=None)
     parser.add_argument("--wan22-text-encode-batch-size", type=int, default=None)
-    parser.add_argument("--fastwam-heatmap-context-grid", type=int, default=None)
     parser.add_argument("--fastwam-skip-dit-load-from-pretrain", type=_str2bool, default=None)
     parser.add_argument("--fastwam-action-dit-pretrained-path", type=str, default=None)
     parser.add_argument("--fastwam-mot-checkpoint-mixed-attn", type=_str2bool, default=None)
@@ -899,15 +850,7 @@ def main() -> None:
             f"got sampled_video_len={sampled_video_len}."
         )
 
-    dataset_cfg = replace(
-        student_cfg,
-        use_target_visual_guidance=bool(teacher_cfg.use_target_visual_guidance or student_cfg.use_target_visual_guidance),
-        use_attention_heatmap=bool(teacher_cfg.use_attention_heatmap or student_cfg.use_attention_heatmap),
-        use_target_belief_tracker=bool(
-            teacher_cfg.use_target_belief_tracker or student_cfg.use_target_belief_tracker
-        ),
-    )
-    train_loader, val_loader, total_n, train_n, val_n = build_loaders(args, dataset_cfg, use_ddp=use_distributed)
+    train_loader, val_loader, total_n, train_n, val_n = build_loaders(args, student_cfg, use_ddp=use_distributed)
     train_sampler = getattr(train_loader, "sampler_for_epoch", None)
 
     if _is_main_process():
@@ -935,11 +878,11 @@ def main() -> None:
             if windows > 0 and hits == 0:
                 print("[wan-latents] WARNING: no matching cached latents; training will encode RGB videos online.")
         print(
-            f"[teacher cfg] guidance={teacher_cfg.use_target_visual_guidance}, heatmap={teacher_cfg.use_attention_heatmap}, "
+            f"[teacher cfg] target_relative_context={teacher_cfg.use_target_relative_context}, "
             f"use_fastwam_mot={teacher_cfg.use_fastwam_mot}, use_wan22_encoders={teacher_cfg.use_wan22_encoders}"
         )
         print(
-            f"[student cfg] guidance={student_cfg.use_target_visual_guidance}, heatmap={student_cfg.use_attention_heatmap}, "
+            f"[student cfg] target_relative_context={student_cfg.use_target_relative_context}, "
             f"low_dim_target_input=off, fusion={student_cfg.target_token_fusion_mode}, "
             f"train_next_target_relative={student_cfg.train_next_target_relative}, rollout_head=false"
         )
@@ -1009,7 +952,9 @@ def main() -> None:
     swanlab_run = _init_swanlab(args, student_cfg, run_name)
     total_pbar = None
 
-    if use_ddp:
+    if use_deepspeed:
+        pass
+    elif use_ddp:
         student = DDP(
             student,
             device_ids=[_get_local_rank()],
@@ -1033,8 +978,8 @@ def main() -> None:
             "[running-model] "
             f"model={save_dir.name} | run={run_name} | save_dir={save_dir} | "
             f"teacher_ckpt={args.teacher_ckpt} | "
-            f"teacher_target_belief_tracker={teacher_cfg.use_target_belief_tracker} | "
-            f"student_target_belief_tracker={student_cfg.use_target_belief_tracker}"
+            f"teacher_target_relative_context={teacher_cfg.use_target_relative_context} | "
+            f"student_target_relative_context={student_cfg.use_target_relative_context}"
         )
 
     if tqdm is not None and _is_main_process():
@@ -1095,14 +1040,11 @@ def main() -> None:
                         target_relative=batch["target_relative"],
                         prev_actions=batch["prev_actions"],
                         attention_mask=batch["attention_mask"],
-                        attention_heatmaps=batch.get("attention_heatmaps"),
                         expert_action=teacher_policy_target,
                         valid_mask=batch["valid_mask"] if teacher_policy_target is not None else None,
                         done=batch.get("done"),
                         instructions=batch.get("instructions"),
                         video_latents=batch.get("video_latents"),
-                        reference_target_relative=batch.get("reference_target_relative"),
-                        reference_images=batch.get("reference_images"),
                     )
 
                 student_out = student(
@@ -1111,14 +1053,11 @@ def main() -> None:
                     target_relative=batch["target_relative"],
                     prev_actions=batch["prev_actions"],
                     attention_mask=batch["attention_mask"],
-                    attention_heatmaps=batch.get("attention_heatmaps"),
                     expert_action=batch["expert_action"],
                     valid_mask=batch["valid_mask"],
                     done=batch.get("done"),
                     instructions=batch.get("instructions"),
                     video_latents=batch.get("video_latents"),
-                    reference_target_relative=batch.get("reference_target_relative"),
-                    reference_images=batch.get("reference_images"),
                 )
 
                 losses = self_distill_losses(

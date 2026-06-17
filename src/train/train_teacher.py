@@ -18,7 +18,6 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 
-from data.visual_guidance import make_attention_heatmap
 from data.teacher_dataset_builder import build_records
 from model.config import ModelConfig
 from model.losses import summarize_losses, world_model_dit_loss
@@ -101,18 +100,12 @@ class TrajectoryDataset(Dataset):
         distance_bins: int = 6,
         text_context_length: int = 77,
         random_crop: bool = True,
-        use_target_visual_guidance: bool = False,
-        use_attention_heatmap: bool = True,
-        visual_guidance_fov_deg: float = 90.0,
-        attention_heatmap_sigma: float = 0.08,
         wan_latent_cache_root: Optional[str] = None,
         action_video_freq_ratio: int = 1,
-        use_target_belief_tracker: bool = False,
     ) -> None:
         self.records = records
         self.seq_len = seq_len
         self.action_video_freq_ratio = max(int(action_video_freq_ratio), 1)
-        self.use_target_belief_tracker = bool(use_target_belief_tracker)
         self.image_size = int(image_size)
         self.target_relative_dim = target_relative_dim
         self.action_dim = action_dim
@@ -120,10 +113,6 @@ class TrajectoryDataset(Dataset):
         self.distance_bins = distance_bins
         self.text_context_length = text_context_length
         self.random_crop = random_crop
-        self.use_target_visual_guidance = bool(use_target_visual_guidance)
-        self.use_attention_heatmap = bool(use_attention_heatmap)
-        self.visual_guidance_fov_deg = float(visual_guidance_fov_deg)
-        self.attention_heatmap_sigma = float(attention_heatmap_sigma)
         self.wan_latent_cache_root = Path(wan_latent_cache_root) if wan_latent_cache_root else None
         self.transform = transforms.Compose(
             [
@@ -187,9 +176,6 @@ class TrajectoryDataset(Dataset):
         if len(frames) == 0:
             raise ValueError("rgb_paths 不能为空。")
         return torch.stack(frames, dim=0)
-
-    def _load_rgb_frame(self, record: Dict[str, Any], frame_index: int) -> torch.Tensor:
-        return self._load_rgb_sequence(record, start=frame_index, end=frame_index + 1)[0]
 
     def _latent_cache_path(self, record: Dict[str, Any], start: int, end: int) -> Optional[Path]:
         if self.wan_latent_cache_root is None:
@@ -295,7 +281,7 @@ class TrajectoryDataset(Dataset):
 
     def _crop_or_pad(self, item: Dict[str, Optional[torch.Tensor]]) -> Dict[str, Optional[torch.Tensor]]:
         length = item["images"].shape[0]  # type: ignore[union-attr]
-        static_keys = {"reference_images", "reference_target_relative"}
+        static_keys = set()
         if length >= self.seq_len:
             start = random.randint(0, length - self.seq_len) if self.random_crop else 0
             end = start + self.seq_len
@@ -391,19 +377,8 @@ class TrajectoryDataset(Dataset):
             "expert_action": expert_action[start:end].float(),
             "instructions": instruction_text,
         }
-        if self.use_target_belief_tracker:
-            item["reference_images"] = self._load_rgb_frame(record, 0).float()
-            item["reference_target_relative"] = target_relative[0].float()
         if video_latents is not None:
             item["video_latents"] = video_latents
-        if self.use_target_visual_guidance:
-            if self.use_attention_heatmap:
-                item["attention_heatmaps"] = make_attention_heatmap(
-                    item["target_relative"].float(),  # type: ignore[union-attr]
-                    image_hw=(images.shape[-2], images.shape[-1]),
-                    fov_deg=self.visual_guidance_fov_deg,
-                    sigma=self.attention_heatmap_sigma,
-                )
         return self._crop_or_pad(item)
 
 
@@ -694,14 +669,11 @@ def evaluate(model: TeacherWorldModelDiT, loader: DataLoader, cfg: ModelConfig, 
             target_relative=batch["target_relative"],
             prev_actions=batch["prev_actions"],
             attention_mask=batch["attention_mask"],
-            attention_heatmaps=batch.get("attention_heatmaps"),
             expert_action=batch["expert_action"],
             valid_mask=batch["valid_mask"],
             done=batch.get("done"),
             instructions=batch.get("instructions"),
             video_latents=batch.get("video_latents"),
-            reference_target_relative=batch.get("reference_target_relative"),
-            reference_images=batch.get("reference_images"),
         )
         losses = world_model_dit_loss(outputs, batch, cfg, valid_mask=batch["valid_mask"])
         summary = summarize_losses(losses)
@@ -794,21 +766,10 @@ def main() -> None:
     parser.add_argument("--direct-action-loss-weight", type=float, default=1.0)
     parser.add_argument("--action-yaw-loss-weight", type=float, default=_DEFAULT_CFG.action_yaw_loss_weight)
     parser.add_argument("--x0-action-loss-weight", type=float, default=_DEFAULT_CFG.x0_action_loss_weight)
-    parser.add_argument("--use-target-visual-guidance", type=_str2bool, default=_DEFAULT_CFG.use_target_visual_guidance)
-    parser.add_argument("--use-attention-heatmap", type=_str2bool, default=_DEFAULT_CFG.use_attention_heatmap)
-    parser.add_argument("--visual-guidance-fov-deg", type=float, default=_DEFAULT_CFG.visual_guidance_fov_deg)
-    parser.add_argument("--attention-heatmap-sigma", type=float, default=_DEFAULT_CFG.attention_heatmap_sigma)
-    parser.add_argument("--use-heatmap-tensor-encoder", type=_str2bool, default=_DEFAULT_CFG.use_heatmap_tensor_encoder)
-    parser.add_argument("--heatmap-token-scale", type=float, default=_DEFAULT_CFG.heatmap_token_scale)
-    parser.add_argument("--fastwam-heatmap-context-grid", type=int, default=_DEFAULT_CFG.fastwam_heatmap_context_grid)
-    parser.add_argument("--use-target-belief-tracker", type=_str2bool, default=_DEFAULT_CFG.use_target_belief_tracker)
-    parser.add_argument("--target-belief-token-scale", type=float, default=_DEFAULT_CFG.target_belief_token_scale)
-    parser.add_argument("--target-belief-update-rate", type=float, default=_DEFAULT_CFG.target_belief_update_rate)
-    parser.add_argument("--target-belief-min-confidence", type=float, default=_DEFAULT_CFG.target_belief_min_confidence)
-    parser.add_argument("--target-belief-temperature", type=float, default=_DEFAULT_CFG.target_belief_temperature)
-    parser.add_argument("--target-belief-loss-weight", type=float, default=_DEFAULT_CFG.target_belief_loss_weight)
-    parser.add_argument("--target-belief-motion-weight", type=float, default=_DEFAULT_CFG.target_belief_motion_weight)
-    parser.add_argument("--target-belief-update-sharpness", type=float, default=_DEFAULT_CFG.target_belief_update_sharpness)
+    parser.add_argument("--use-target-relative-context", type=_str2bool, default=_DEFAULT_CFG.use_target_relative_context)
+    parser.add_argument("--target-relative-context-scale", type=float, default=_DEFAULT_CFG.target_relative_context_scale)
+    parser.add_argument("--target-relative-token-scale", type=float, default=_DEFAULT_CFG.target_relative_token_scale)
+    parser.add_argument("--target-relative-context-hidden-dim", type=int, default=_DEFAULT_CFG.target_relative_context_hidden_dim)
     parser.add_argument("--fastwam-lambda-action", type=float, default=_DEFAULT_CFG.fastwam_lambda_action)
     parser.add_argument("--fastwam-lambda-video", type=float, default=_DEFAULT_CFG.fastwam_lambda_video)
     parser.add_argument("--fastwam-skip-dit-load-from-pretrain", type=_str2bool, default=_DEFAULT_CFG.fastwam_skip_dit_load_from_pretrain)
@@ -857,21 +818,10 @@ def main() -> None:
         max_yaw_rate=args.max_yaw_rate,
         max_speed_norm=args.max_speed_norm,
         target_token_fusion_mode=args.target_token_fusion_mode,
-        use_target_visual_guidance=args.use_target_visual_guidance,
-        use_attention_heatmap=args.use_attention_heatmap,
-        visual_guidance_fov_deg=args.visual_guidance_fov_deg,
-        attention_heatmap_sigma=args.attention_heatmap_sigma,
-        use_heatmap_tensor_encoder=args.use_heatmap_tensor_encoder,
-        heatmap_token_scale=args.heatmap_token_scale,
-        fastwam_heatmap_context_grid=args.fastwam_heatmap_context_grid,
-        use_target_belief_tracker=args.use_target_belief_tracker,
-        target_belief_token_scale=args.target_belief_token_scale,
-        target_belief_update_rate=args.target_belief_update_rate,
-        target_belief_min_confidence=args.target_belief_min_confidence,
-        target_belief_temperature=args.target_belief_temperature,
-        target_belief_loss_weight=args.target_belief_loss_weight,
-        target_belief_motion_weight=args.target_belief_motion_weight,
-        target_belief_update_sharpness=args.target_belief_update_sharpness,
+        use_target_relative_context=args.use_target_relative_context,
+        target_relative_context_scale=args.target_relative_context_scale,
+        target_relative_token_scale=args.target_relative_token_scale,
+        target_relative_context_hidden_dim=args.target_relative_context_hidden_dim,
         use_diffusion_actor=args.use_diffusion_actor,
         use_fastwam_mot=args.use_fastwam_mot,
         use_rssm=False,
@@ -951,8 +901,8 @@ def main() -> None:
             f"kl={cfg.train_kl} direct_action={cfg.train_direct_action} | "
             f"action_w={cfg.direct_action_loss_weight} yaw_w={cfg.action_yaw_loss_weight} | "
             f"WAM auxiliary: next_target_relative={cfg.train_next_target_relative} rollout_head=false | "
-            f"visual_guidance={cfg.use_target_visual_guidance} heatmap={cfg.use_attention_heatmap} | "
-            f"target_belief_tracker={cfg.use_target_belief_tracker} belief_w={cfg.target_belief_loss_weight}"
+            f"target_relative_context={cfg.use_target_relative_context} "
+            f"target_relative_token_scale={cfg.target_relative_token_scale}"
         )
     train_dataset = TrajectoryDataset(
         records=train_records,
@@ -964,13 +914,8 @@ def main() -> None:
         distance_bins=cfg.distance_bins,
         text_context_length=cfg.text_context_length,
         random_crop=True,
-        use_target_visual_guidance=cfg.use_target_visual_guidance,
-        use_attention_heatmap=cfg.use_attention_heatmap,
-        visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
-        attention_heatmap_sigma=cfg.attention_heatmap_sigma,
         wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
         action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
-        use_target_belief_tracker=cfg.use_target_belief_tracker,
     )
     train_sampler = (
         DistributedSampler(
@@ -1008,13 +953,8 @@ def main() -> None:
             distance_bins=cfg.distance_bins,
             text_context_length=cfg.text_context_length,
             random_crop=False,
-            use_target_visual_guidance=cfg.use_target_visual_guidance,
-            use_attention_heatmap=cfg.use_attention_heatmap,
-            visual_guidance_fov_deg=cfg.visual_guidance_fov_deg,
-            attention_heatmap_sigma=cfg.attention_heatmap_sigma,
             wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
             action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
-            use_target_belief_tracker=cfg.use_target_belief_tracker,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -1029,6 +969,11 @@ def main() -> None:
 
     model = TeacherWorldModelDiT(cfg).to(device)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters found; check training mode and freeze settings.")
+    if _is_main_process():
+        trainable_count = sum(int(p.numel()) for p in trainable_params)
+        print(f"[train] trainable parameters: {trainable_count:,}")
     optimizer = torch.optim.AdamW(
         trainable_params,
         lr=args.lr,
@@ -1095,8 +1040,7 @@ def main() -> None:
         print(
             "[running-model] "
             f"model={save_dir.name} | run={run_name} | save_dir={save_dir} | "
-            f"target_belief_tracker={cfg.use_target_belief_tracker} | "
-            f"visual_guidance={cfg.use_target_visual_guidance} | "
+            f"target_relative_context={cfg.use_target_relative_context} | "
             f"fastwam_mot={cfg.use_fastwam_mot}"
         )
     if tqdm is not None and _is_main_process():
@@ -1153,14 +1097,11 @@ def main() -> None:
                         target_relative=batch["target_relative"],
                         prev_actions=batch["prev_actions"],
                         attention_mask=batch["attention_mask"],
-                        attention_heatmaps=batch.get("attention_heatmaps"),
                         expert_action=batch["expert_action"],
                         valid_mask=batch["valid_mask"],
                         done=batch.get("done"),
                         instructions=batch.get("instructions"),
                         video_latents=batch.get("video_latents"),
-                        reference_target_relative=batch.get("reference_target_relative"),
-                        reference_images=batch.get("reference_images"),
                     )
                     losses = world_model_dit_loss(
                         outputs,
@@ -1240,6 +1181,7 @@ def main() -> None:
                     "optimizer": {} if (use_deepspeed or not args.save_optimizer_state) else optimizer.state_dict(),
                     "scheduler": {} if (use_deepspeed or not args.save_optimizer_state) else scheduler.state_dict(),
                     "cfg": cfg.__dict__,
+                    "run_args": vars(args),
                     "best_val": best_val,
                 }
                 torch.save(ckpt, save_dir / "last.pt")

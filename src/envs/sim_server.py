@@ -133,6 +133,29 @@ _global_port = 30000
 _global_gpu_ids = [0]
 
 
+def _parse_gpu_adapter_map(raw: str) -> dict[int, int]:
+    """Parse nvidia-smi GPU id -> UE -GraphicsAdapter id mapping."""
+    result = {}
+    for item in str(raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        gpu_id, adapter_id = item.split(":", 1)
+        result[int(gpu_id.strip())] = int(adapter_id.strip())
+    return result
+
+
+def _gpu_id_to_graphics_adapter(gpu_id: int) -> int:
+    """Map nvidia-smi GPU id to UE/Vulkan GraphicsAdapter id."""
+    raw_map = os.environ.get("UE_GRAPHICS_ADAPTER_MAP", "0:1,1:3,2:4,3:0,4:5,5:2")
+    try:
+        adapter_map = _parse_gpu_adapter_map(raw_map)
+    except Exception as e:
+        print(f"Warning: failed to parse UE_GRAPHICS_ADAPTER_MAP={raw_map!r}; using gpu_id directly: {e}")
+        return int(gpu_id)
+    return int(adapter_map.get(int(gpu_id), int(gpu_id)))
+
+
 def create_drones(port: int) -> dict:
     return {
         "SettingsVersion": 1.2,
@@ -232,8 +255,11 @@ class EventHandler(object):
         ]
 
     def _kill_untracked_scene_processes_for_gpus_locked(self, gpu_ids) -> None:
-        target_gpus = {str(gpu_id) for gpu_id in gpu_ids}
-        if not target_gpus:
+        target_adapters = {
+            str(_gpu_id_to_graphics_adapter(int(gpu_id)))
+            for gpu_id in gpu_ids
+        }
+        if not target_adapters:
             return
         tracked_pids = {
             info.get('process').pid
@@ -265,9 +291,9 @@ class EventHandler(object):
             if 'LinuxNoEditor' not in cmdline and '/Binaries/Linux/' not in cmdline:
                 continue
             match = re.search(r'-GraphicsAdapter=(\S+)', cmdline)
-            if match is None or match.group(1) not in target_gpus:
+            if match is None or match.group(1) not in target_adapters:
                 continue
-            print(f"Closing untracked scene process pid={pid}, gpu={match.group(1)}, reason=same_gpu_untracked, cmd={cmdline}")
+            print(f"Closing untracked scene process pid={pid}, GraphicsAdapter={match.group(1)}, reason=same_gpu_untracked, cmd={cmdline}")
             try:
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
             except Exception:
@@ -411,7 +437,7 @@ class EventHandler(object):
                 except Exception as e:
                     raise Exception(f"Scene script not executable: {env_path}; failed to chmod +x: {e}")
 
-            vulkan_gpu_id = gpu_id
+            vulkan_gpu_id = _gpu_id_to_graphics_adapter(int(gpu_id))
             settings_path = str(settings_dir / 'settings.json')
             import getpass
             current_user = getpass.getuser()
@@ -449,7 +475,7 @@ class EventHandler(object):
                     self.scene_processes[scen_id] = {'process': p, 'port': ports[index], 'gpu_id': gpu_id}
                     if ports[index] not in self.scene_used_ports:
                         self.scene_used_ports.append(ports[index])
-                print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tScene {scen_id} starting, GPU {gpu_id}, log: {log_file_path}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tScene {scen_id} starting, GPU {gpu_id} -> GraphicsAdapter {vulkan_gpu_id}, log: {log_file_path}")
             except Exception as e:
                 raise Exception(f"Failed to start scene: {e}")
 
