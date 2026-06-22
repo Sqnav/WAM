@@ -45,9 +45,37 @@ class ModelConfig:
     # Privileged target context. When enabled, the current target position in
     # UAV/body coordinates is projected to one extra FastWAM text-context token.
     use_target_relative_context: bool = False
+    target_relative_context_input_mode: str = "xyz"  # xyz | yz
     target_relative_context_scale: float = 1.0
     target_relative_token_scale: float = 1.0
     target_relative_context_hidden_dim: int = 512
+
+    # History-aware pixel/patch target similarity guidance.
+    use_target_similarity_guidance: bool = False
+    target_similarity_feature_source: str = "wan_vae_latent"  # wan_vae_latent | rgb_cnn
+    target_similarity_context_mode: str = "dense"  # dense | camera_yz_text
+    target_similarity_condition_dim: int = 5
+    target_similarity_hidden_dim: int = 256
+    target_similarity_patch_size: int = 16
+    target_similarity_vae_downsample_factor: int = 8
+    target_similarity_history_size: int = 4
+    target_similarity_decay: float = 0.8
+    target_similarity_grid_pool_size: int = 4
+    target_similarity_temperature: float = 10.0
+    target_similarity_token_scale: float = 1.0
+    target_similarity_condition_mode: str = "image_center"  # image_center | camera_yz
+    target_similarity_condition_source: str = "predicted"  # predicted | gt | mixed
+    target_similarity_condition_gt_mix_prob: float = 0.25
+    target_similarity_fov_deg: float = 90.0
+    target_similarity_camera_offset_body: Tuple[float, float, float] = (0.46, 0.0, 0.0)
+    target_similarity_heatmap_sigma: float = 0.05
+    target_similarity_center_loss_weight: float = 1.0
+    target_similarity_heatmap_loss_weight: float = 1.0
+    target_similarity_identity_loss_weight: float = 0.1
+    target_similarity_reacquire_confidence_min: float = 0.02
+    target_similarity_reacquire_confidence_ratio: float = 2.5
+    target_similarity_reacquire_entropy_max: float = 0.98
+    target_similarity_reacquire_margin_min: float = 0.0
 
     # Fusion
     fusion_dim: int = 512
@@ -103,8 +131,11 @@ class ModelConfig:
     dit_candidate_action_weight: float = 0.02
     dit_candidate_temporal_smooth_weight: float = 0.05
     action_loss_weight: float = 1.0
-    # MSE over action dims: yaw (norm space, index 3 when action_dim=4) vs vx,vy,vz.
+    # MSE over action dims: yaw delta (norm space, index 3 when action_dim=4)
+    # vs body-frame translation deltas.
     action_yaw_loss_weight: float = 5.0
+    # Historical names kept for checkpoint compatibility:
+    # max_vel scales translation deltas, max_yaw_rate scales yaw deltas.
     max_vel: float = 1.0
     max_yaw_rate: float = 15.0
     max_speed_norm: float = 1.0
@@ -150,6 +181,11 @@ class ModelConfig:
     fastwam_skip_dit_load_from_pretrain: bool = False
     fastwam_action_dit_pretrained_path: str = ""
     fastwam_mot_checkpoint_mixed_attn: bool = True
+    use_fastwam_attention_heatmap_loss: bool = False
+    fastwam_attention_heatmap_loss_weight: float = 0.1
+    fastwam_attention_heatmap_sigma: float = 0.08
+    fastwam_attention_heatmap_fov_deg: float = 90.0
+    fastwam_attention_heatmap_camera_offset_body: Tuple[float, float, float] = (0.46, 0.0, 0.0)
 
     @property
     def feature_dim(self) -> int:

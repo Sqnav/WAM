@@ -102,6 +102,7 @@ class TrajectoryDataset(Dataset):
         random_crop: bool = True,
         wan_latent_cache_root: Optional[str] = None,
         action_video_freq_ratio: int = 1,
+        force_load_rgb: bool = False,
     ) -> None:
         self.records = records
         self.seq_len = seq_len
@@ -114,6 +115,7 @@ class TrajectoryDataset(Dataset):
         self.text_context_length = text_context_length
         self.random_crop = random_crop
         self.wan_latent_cache_root = Path(wan_latent_cache_root) if wan_latent_cache_root else None
+        self.force_load_rgb = bool(force_load_rgb)
         self.transform = transforms.Compose(
             [
                 transforms.Resize((image_size, image_size)),
@@ -330,7 +332,7 @@ class TrajectoryDataset(Dataset):
         images = None
         if end - start == self.seq_len:
             video_latents = self._load_cached_wan_latents(record, start=start, end=end)
-        if video_latents is None:
+        if video_latents is None or self.force_load_rgb:
             images = self._load_rgb_sequence(record, start=start, end=end)
         else:
             images = torch.zeros(end - start, 3, self.image_size, self.image_size, dtype=torch.float32)
@@ -413,6 +415,10 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
         "total",
         "action",
         "video",
+        "fastwam_attention_heatmap",
+        "target_similarity_center",
+        "target_similarity_heatmap",
+        "target_similarity_identity",
         "next_target_relative",
         "prior_next_target_relative",
         "kl",
@@ -421,6 +427,10 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
         "kl",
         "next_target_relative",
         "prior_next_target_relative",
+        "target_similarity_center",
+        "target_similarity_heatmap",
+        "target_similarity_identity",
+        "fastwam_attention_heatmap",
         "video_x0",
         "x0_action",
     }
@@ -443,6 +453,10 @@ def _tqdm_train_postfix(avg: Dict[str, float]) -> Dict[str, str]:
         "total",
         "action",
         "video",
+        "fastwam_attention_heatmap",
+        "target_similarity_center",
+        "target_similarity_heatmap",
+        "target_similarity_identity",
         "next_target_relative",
         "prior_next_target_relative",
         "kl",
@@ -451,6 +465,10 @@ def _tqdm_train_postfix(avg: Dict[str, float]) -> Dict[str, str]:
         "kl",
         "next_target_relative",
         "prior_next_target_relative",
+        "target_similarity_center",
+        "target_similarity_heatmap",
+        "target_similarity_identity",
+        "fastwam_attention_heatmap",
         "video_x0",
         "x0_action",
     }
@@ -592,6 +610,11 @@ def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 def _init_swanlab(args: argparse.Namespace, cfg: ModelConfig, run_name: str):
     if not bool(getattr(args, "use_swanlab", False)) or not _is_main_process():
         return None
+    mode = str(getattr(args, "swanlab_mode", "offline") or "offline")
+    if mode == "cloud" and not os.environ.get("SWANLAB_API_KEY"):
+        print("[swanlab] SWANLAB_MODE=cloud but SWANLAB_API_KEY is not set; using offline mode.")
+        mode = "offline"
+    os.environ.setdefault("SWANLAB_NO_INTERACTIVE", "1")
     try:
         import swanlab
     except Exception as exc:
@@ -603,7 +626,7 @@ def _init_swanlab(args: argparse.Namespace, cfg: ModelConfig, run_name: str):
             workspace=args.swanlab_workspace or None,
             experiment_name=run_name,
             logdir=args.swanlab_log_dir or None,
-            mode=args.swanlab_mode,
+            mode=mode,
             config={
                 **cfg.__dict__,
                 "epochs": args.epochs,
@@ -626,6 +649,10 @@ def _swanlab_log(run, metrics: Dict[str, float], step: int, prefix: str) -> None
         "kl",
         "next_target_relative",
         "prior_next_target_relative",
+        "target_similarity_center",
+        "target_similarity_heatmap",
+        "target_similarity_identity",
+        "fastwam_attention_heatmap",
         "video_x0",
         "x0_action",
     }
@@ -690,9 +717,9 @@ def main() -> None:
     parser.add_argument("--trajectory-range", type=str, default="")
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--split-seed", type=int, default=42)
-    parser.add_argument("--max-vel", type=float, default=_DEFAULT_CFG.max_vel, help="Physical max velocity for action normalization.")
-    parser.add_argument("--max-yaw-rate", type=float, default=_DEFAULT_CFG.max_yaw_rate, help="Physical max yaw rate for action normalization.")
-    parser.add_argument("--max-speed-norm", type=float, default=_DEFAULT_CFG.max_speed_norm, help="Physical speed-norm cap used both in training targets and online action execution.")
+    parser.add_argument("--max-vel", type=float, default=_DEFAULT_CFG.max_vel, help="Body-frame translation delta scale for action normalization.")
+    parser.add_argument("--max-yaw-rate", type=float, default=_DEFAULT_CFG.max_yaw_rate, help="Yaw delta scale for action normalization.")
+    parser.add_argument("--max-speed-norm", type=float, default=_DEFAULT_CFG.max_speed_norm, help="Body-frame translation delta norm cap used in training targets and online action execution.")
     parser.add_argument("--save-dir", type=str, required=True)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--seq-len", type=int, default=16)
@@ -712,6 +739,12 @@ def main() -> None:
     parser.add_argument("--diffusion-steps", type=int, default=20)
     parser.add_argument("--sampling-steps", type=int, default=20)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--init-from-checkpoint",
+        type=str,
+        default=None,
+        help="Load model weights from a checkpoint before training, without restoring optimizer/epoch state.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-every-epochs", type=int, default=1, help="Write last.pt every N epochs; always save on final epoch.")
     parser.add_argument("--save-best-checkpoint", type=_str2bool, default=True, help="Whether to write best.pt on checkpoint epochs.")
@@ -767,14 +800,50 @@ def main() -> None:
     parser.add_argument("--action-yaw-loss-weight", type=float, default=_DEFAULT_CFG.action_yaw_loss_weight)
     parser.add_argument("--x0-action-loss-weight", type=float, default=_DEFAULT_CFG.x0_action_loss_weight)
     parser.add_argument("--use-target-relative-context", type=_str2bool, default=_DEFAULT_CFG.use_target_relative_context)
+    parser.add_argument("--target-relative-context-input-mode", type=str, default=_DEFAULT_CFG.target_relative_context_input_mode, choices=["xyz", "yz", "no_x", "without_x", "lateral_vertical"])
     parser.add_argument("--target-relative-context-scale", type=float, default=_DEFAULT_CFG.target_relative_context_scale)
     parser.add_argument("--target-relative-token-scale", type=float, default=_DEFAULT_CFG.target_relative_token_scale)
     parser.add_argument("--target-relative-context-hidden-dim", type=int, default=_DEFAULT_CFG.target_relative_context_hidden_dim)
+    parser.add_argument("--use-target-similarity-guidance", type=_str2bool, default=_DEFAULT_CFG.use_target_similarity_guidance)
+    parser.add_argument("--target-similarity-feature-source", type=str, default=_DEFAULT_CFG.target_similarity_feature_source, choices=["wan_vae_latent", "rgb_cnn"])
+    parser.add_argument("--target-similarity-context-mode", type=str, default=_DEFAULT_CFG.target_similarity_context_mode, choices=["dense", "camera_yz_text"])
+    parser.add_argument("--target-similarity-condition-dim", type=int, default=_DEFAULT_CFG.target_similarity_condition_dim)
+    parser.add_argument("--target-similarity-hidden-dim", type=int, default=_DEFAULT_CFG.target_similarity_hidden_dim)
+    parser.add_argument("--target-similarity-patch-size", type=int, default=_DEFAULT_CFG.target_similarity_patch_size)
+    parser.add_argument("--target-similarity-vae-downsample-factor", type=int, default=_DEFAULT_CFG.target_similarity_vae_downsample_factor)
+    parser.add_argument("--target-similarity-history-size", type=int, default=_DEFAULT_CFG.target_similarity_history_size)
+    parser.add_argument("--target-similarity-decay", type=float, default=_DEFAULT_CFG.target_similarity_decay)
+    parser.add_argument("--target-similarity-grid-pool-size", type=int, default=_DEFAULT_CFG.target_similarity_grid_pool_size)
+    parser.add_argument("--target-similarity-temperature", type=float, default=_DEFAULT_CFG.target_similarity_temperature)
+    parser.add_argument("--target-similarity-token-scale", type=float, default=_DEFAULT_CFG.target_similarity_token_scale)
+    parser.add_argument("--target-similarity-condition-mode", type=str, default=_DEFAULT_CFG.target_similarity_condition_mode, choices=["image_center", "center", "pixel_center", "normalized_center", "camera_yz", "camera_bearing", "bearing", "ray_yz"])
+    parser.add_argument("--target-similarity-condition-source", type=str, default=_DEFAULT_CFG.target_similarity_condition_source, choices=["predicted", "gt", "ground_truth", "oracle", "mixed", "gt_mix", "mix"])
+    parser.add_argument("--target-similarity-condition-gt-mix-prob", type=float, default=_DEFAULT_CFG.target_similarity_condition_gt_mix_prob)
+    parser.add_argument("--target-similarity-fov-deg", type=float, default=_DEFAULT_CFG.target_similarity_fov_deg)
+    parser.add_argument("--target-similarity-camera-offset-body", nargs=3, type=float, default=list(_DEFAULT_CFG.target_similarity_camera_offset_body))
+    parser.add_argument("--target-similarity-heatmap-sigma", type=float, default=_DEFAULT_CFG.target_similarity_heatmap_sigma)
+    parser.add_argument("--target-similarity-center-loss-weight", type=float, default=_DEFAULT_CFG.target_similarity_center_loss_weight)
+    parser.add_argument("--target-similarity-heatmap-loss-weight", type=float, default=_DEFAULT_CFG.target_similarity_heatmap_loss_weight)
+    parser.add_argument("--target-similarity-identity-loss-weight", type=float, default=_DEFAULT_CFG.target_similarity_identity_loss_weight)
+    parser.add_argument("--target-similarity-reacquire-confidence-min", type=float, default=_DEFAULT_CFG.target_similarity_reacquire_confidence_min)
+    parser.add_argument("--target-similarity-reacquire-confidence-ratio", type=float, default=_DEFAULT_CFG.target_similarity_reacquire_confidence_ratio)
+    parser.add_argument("--target-similarity-reacquire-entropy-max", type=float, default=_DEFAULT_CFG.target_similarity_reacquire_entropy_max)
+    parser.add_argument("--target-similarity-reacquire-margin-min", type=float, default=_DEFAULT_CFG.target_similarity_reacquire_margin_min)
     parser.add_argument("--fastwam-lambda-action", type=float, default=_DEFAULT_CFG.fastwam_lambda_action)
     parser.add_argument("--fastwam-lambda-video", type=float, default=_DEFAULT_CFG.fastwam_lambda_video)
     parser.add_argument("--fastwam-skip-dit-load-from-pretrain", type=_str2bool, default=_DEFAULT_CFG.fastwam_skip_dit_load_from_pretrain)
     parser.add_argument("--fastwam-action-dit-pretrained-path", type=str, default=_DEFAULT_CFG.fastwam_action_dit_pretrained_path)
     parser.add_argument("--fastwam-mot-checkpoint-mixed-attn", type=_str2bool, default=_DEFAULT_CFG.fastwam_mot_checkpoint_mixed_attn)
+    parser.add_argument("--use-fastwam-attention-heatmap-loss", type=_str2bool, default=_DEFAULT_CFG.use_fastwam_attention_heatmap_loss)
+    parser.add_argument("--fastwam-attention-heatmap-loss-weight", type=float, default=_DEFAULT_CFG.fastwam_attention_heatmap_loss_weight)
+    parser.add_argument("--fastwam-attention-heatmap-sigma", type=float, default=_DEFAULT_CFG.fastwam_attention_heatmap_sigma)
+    parser.add_argument("--fastwam-attention-heatmap-fov-deg", type=float, default=_DEFAULT_CFG.fastwam_attention_heatmap_fov_deg)
+    parser.add_argument(
+        "--fastwam-attention-heatmap-camera-offset-body",
+        nargs=3,
+        type=float,
+        default=list(_DEFAULT_CFG.fastwam_attention_heatmap_camera_offset_body),
+    )
     args = parser.parse_args()
 
     seed_everything(args.seed + _get_rank())
@@ -819,9 +888,35 @@ def main() -> None:
         max_speed_norm=args.max_speed_norm,
         target_token_fusion_mode=args.target_token_fusion_mode,
         use_target_relative_context=args.use_target_relative_context,
+        target_relative_context_input_mode=args.target_relative_context_input_mode,
         target_relative_context_scale=args.target_relative_context_scale,
         target_relative_token_scale=args.target_relative_token_scale,
         target_relative_context_hidden_dim=args.target_relative_context_hidden_dim,
+        use_target_similarity_guidance=args.use_target_similarity_guidance,
+        target_similarity_feature_source=args.target_similarity_feature_source,
+        target_similarity_context_mode=args.target_similarity_context_mode,
+        target_similarity_condition_dim=args.target_similarity_condition_dim,
+        target_similarity_hidden_dim=args.target_similarity_hidden_dim,
+        target_similarity_patch_size=args.target_similarity_patch_size,
+        target_similarity_vae_downsample_factor=args.target_similarity_vae_downsample_factor,
+        target_similarity_history_size=args.target_similarity_history_size,
+        target_similarity_decay=args.target_similarity_decay,
+        target_similarity_grid_pool_size=args.target_similarity_grid_pool_size,
+        target_similarity_temperature=args.target_similarity_temperature,
+        target_similarity_token_scale=args.target_similarity_token_scale,
+        target_similarity_condition_mode=args.target_similarity_condition_mode,
+        target_similarity_condition_source=args.target_similarity_condition_source,
+        target_similarity_condition_gt_mix_prob=args.target_similarity_condition_gt_mix_prob,
+        target_similarity_fov_deg=args.target_similarity_fov_deg,
+        target_similarity_camera_offset_body=tuple(float(v) for v in args.target_similarity_camera_offset_body),
+        target_similarity_heatmap_sigma=args.target_similarity_heatmap_sigma,
+        target_similarity_center_loss_weight=args.target_similarity_center_loss_weight,
+        target_similarity_heatmap_loss_weight=args.target_similarity_heatmap_loss_weight,
+        target_similarity_identity_loss_weight=args.target_similarity_identity_loss_weight,
+        target_similarity_reacquire_confidence_min=args.target_similarity_reacquire_confidence_min,
+        target_similarity_reacquire_confidence_ratio=args.target_similarity_reacquire_confidence_ratio,
+        target_similarity_reacquire_entropy_max=args.target_similarity_reacquire_entropy_max,
+        target_similarity_reacquire_margin_min=args.target_similarity_reacquire_margin_min,
         use_diffusion_actor=args.use_diffusion_actor,
         use_fastwam_mot=args.use_fastwam_mot,
         use_rssm=False,
@@ -841,6 +936,13 @@ def main() -> None:
         fastwam_skip_dit_load_from_pretrain=args.fastwam_skip_dit_load_from_pretrain,
         fastwam_action_dit_pretrained_path=args.fastwam_action_dit_pretrained_path,
         fastwam_mot_checkpoint_mixed_attn=args.fastwam_mot_checkpoint_mixed_attn,
+        use_fastwam_attention_heatmap_loss=args.use_fastwam_attention_heatmap_loss,
+        fastwam_attention_heatmap_loss_weight=args.fastwam_attention_heatmap_loss_weight,
+        fastwam_attention_heatmap_sigma=args.fastwam_attention_heatmap_sigma,
+        fastwam_attention_heatmap_fov_deg=args.fastwam_attention_heatmap_fov_deg,
+        fastwam_attention_heatmap_camera_offset_body=tuple(
+            float(v) for v in args.fastwam_attention_heatmap_camera_offset_body
+        ),
     )
     action_video_freq_ratio = max(int(args.action_video_freq_ratio), 1)
     if (args.seq_len - 1) % action_video_freq_ratio != 0:
@@ -902,7 +1004,17 @@ def main() -> None:
             f"action_w={cfg.direct_action_loss_weight} yaw_w={cfg.action_yaw_loss_weight} | "
             f"WAM auxiliary: next_target_relative={cfg.train_next_target_relative} rollout_head=false | "
             f"target_relative_context={cfg.use_target_relative_context} "
-            f"target_relative_token_scale={cfg.target_relative_token_scale}"
+            f"target_relative_context_input_mode={cfg.target_relative_context_input_mode} "
+            f"target_relative_token_scale={cfg.target_relative_token_scale} | "
+            f"target_similarity={cfg.use_target_similarity_guidance} "
+            f"context_mode={cfg.target_similarity_context_mode} "
+            f"condition_source={cfg.target_similarity_condition_source} "
+            f"condition_gt_mix_prob={cfg.target_similarity_condition_gt_mix_prob} "
+            f"center_w={cfg.target_similarity_center_loss_weight} "
+            f"heatmap_w={cfg.target_similarity_heatmap_loss_weight} "
+            f"identity_w={cfg.target_similarity_identity_loss_weight} | "
+            f"fastwam_attention_heatmap={cfg.use_fastwam_attention_heatmap_loss} "
+            f"attn_heatmap_w={cfg.fastwam_attention_heatmap_loss_weight}"
         )
     train_dataset = TrajectoryDataset(
         records=train_records,
@@ -916,6 +1028,7 @@ def main() -> None:
         random_crop=True,
         wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
         action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
+        force_load_rgb=cfg.use_target_similarity_guidance and cfg.target_similarity_feature_source == "rgb_cnn",
     )
     train_sampler = (
         DistributedSampler(
@@ -955,6 +1068,7 @@ def main() -> None:
             random_crop=False,
             wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
             action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
+            force_load_rgb=cfg.use_target_similarity_guidance and cfg.target_similarity_feature_source == "rgb_cnn",
         )
         val_loader = DataLoader(
             val_dataset,
@@ -968,6 +1082,21 @@ def main() -> None:
         )
 
     model = TeacherWorldModelDiT(cfg).to(device)
+    if args.init_from_checkpoint:
+        init_path = Path(args.init_from_checkpoint)
+        if not init_path.exists():
+            raise FileNotFoundError(f"--init-from-checkpoint does not exist: {init_path}")
+        ckpt = torch.load(init_path, map_location="cpu")
+        state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+        missing, unexpected = _unwrap_model(model).load_state_dict(
+            migrate_legacy_state_dict_keys(state),
+            strict=False,
+        )
+        if _is_main_process():
+            print(
+                f"[init-from-checkpoint] {init_path} "
+                f"strict=False missing={len(missing)} unexpected={len(unexpected)}"
+            )
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters found; check training mode and freeze settings.")
@@ -1041,7 +1170,9 @@ def main() -> None:
             "[running-model] "
             f"model={save_dir.name} | run={run_name} | save_dir={save_dir} | "
             f"target_relative_context={cfg.use_target_relative_context} | "
-            f"fastwam_mot={cfg.use_fastwam_mot}"
+            f"fastwam_mot={cfg.use_fastwam_mot} | "
+            f"target_similarity={cfg.use_target_similarity_guidance} | "
+            f"fastwam_attention_heatmap={cfg.use_fastwam_attention_heatmap_loss}"
         )
     if tqdm is not None and _is_main_process():
         if int(args.max_train_steps) > 0:

@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 DEFAULT_EXECUTOR_SCRIPT = "/data1/ysq/Worldmodel/code/src/executor/trajectory_executor.py"
 DEFAULT_TRAJECTORY_DIR = "/data1/ysq/Worldmodel/Plandataset"
 DEFAULT_DATASET_BASE_DIR = "/data1/ysq/Worldmodel/Dataset"
-DEFAULT_SCENES = [f"City_{i}" for i in range(1, 4)]
+DEFAULT_SCENES = [f"City_{i}" for i in range(1, 31)]
 DEFAULT_GPUS = [1]
 DEFAULT_SIM_SERVER_HOST = "127.0.0.1"
 DEFAULT_SIM_SERVER_PORT = 30000
@@ -452,6 +452,7 @@ def _check_frame_numeric(frame: Dict[str, Any], idx: int, scene: str, traj: str,
         "uav_position",
         "target_position",
         "target_position_in_body_frame",
+        "body_frame_delta",
         "velocity_in_body_frame",
         "next_target_position",
         "relative_position",
@@ -459,7 +460,7 @@ def _check_frame_numeric(frame: Dict[str, Any], idx: int, scene: str, traj: str,
         "jammer_relative_position",
         "jammer_position_in_body_frame",
     ]
-    scalar_keys = ["distance", "yaw_rate", "jammer_distance"]
+    scalar_keys = ["distance", "body_frame_yaw_delta", "yaw_rate", "jammer_distance"]
 
     for key in vec_keys:
         if key in frame and frame[key] is not None and _xyz_from_any(frame[key]) is None:

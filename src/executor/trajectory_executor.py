@@ -41,6 +41,22 @@ def safe_log(msg, scene_id=None):
         msg = f"[{scene_id}] {msg}"
     tqdm.write(msg, file=sys.stderr)
 
+
+def _scene_object_exists_exact(client, object_name):
+    if client is None or not object_name:
+        return None
+    try:
+        objects = client.simListSceneObjects("^" + str(object_name) + "$")
+        if objects:
+            return True
+    except Exception:
+        pass
+    try:
+        objects = client.simListSceneObjects(str(object_name) + ".*")
+        return bool(objects)
+    except Exception:
+        return None
+
 try:
     import msgpackrpc
     MSGPACKRPC_AVAILABLE = True
@@ -1172,8 +1188,9 @@ class TrajectoryExecutor:
         import numpy as np
 
         try:
+            exists = _scene_object_exists_exact(self.client, self.target_object_name)
             test_pose = self.client.simGetObjectPose(self.target_object_name)
-            if test_pose is None:
+            if exists is False or test_pose is None:
                 if self.target_asset_name is None:
                     self.target_asset_name = self.target_object_name
                 if not self.spawn_target_object(float(target_pos[0]), float(target_pos[1]), float(target_pos[2])):
@@ -1648,7 +1665,7 @@ class TrajectoryExecutor:
             
             position_diff_world = uav_pos - np.array([prev_pos['x'], prev_pos['y'], prev_pos['z']])
             
-            velocity_body = self._world_to_body_frame(
+            body_delta = self._world_to_body_frame(
                 position_diff_world,
                 prev_quat['w'], prev_quat['x'], prev_quat['y'], prev_quat['z']
             )
@@ -1659,14 +1676,14 @@ class TrajectoryExecutor:
             
             yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))
             
-            yaw_rate_deg = np.degrees(yaw_diff)
+            yaw_delta_deg = np.degrees(yaw_diff)
             
-            prev_frame_data["velocity_in_body_frame"] = {
-                "x": float(velocity_body[0]),
-                "y": float(velocity_body[1]),
-                "z": float(velocity_body[2])
+            prev_frame_data["body_frame_delta"] = {
+                "x": float(body_delta[0]),
+                "y": float(body_delta[1]),
+                "z": float(body_delta[2])
             }
-            prev_frame_data["yaw_rate"] = float(yaw_rate_deg)
+            prev_frame_data["body_frame_yaw_delta"] = float(yaw_delta_deg)
         
         frame_data = {
             "frame_idx": frame_idx,
@@ -1721,8 +1738,8 @@ class TrajectoryExecutor:
             frame_data["target_position_in_body_frame"] = None
             frame_data["distance"] = None
         
-        frame_data["velocity_in_body_frame"] = None
-        frame_data["yaw_rate"] = None
+        frame_data["body_frame_delta"] = None
+        frame_data["body_frame_yaw_delta"] = None
         
         self._prev_frame_data = {
             "frame_data": frame_data,
@@ -1880,7 +1897,7 @@ class TrajectoryExecutor:
                 quat,
                 retries=max_position_retries,
                 tol_xy=0.2,
-                tol_z=0.2
+                tol_z=0.5
             )
             if not ok:
                 error_msg = (
@@ -1949,7 +1966,7 @@ class TrajectoryExecutor:
                 quat,
                 retries=5,
                 tol_xy=0.2,
-                tol_z=0.2,
+                tol_z=0.5,
             )
             if not ok:
                 verify_text = "unavailable" if verify_pos is None else f"({verify_pos[0]:.2f}, {verify_pos[1]:.2f}, {verify_pos[2]:.2f})"
@@ -3020,8 +3037,9 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
 
     def move_named_object(self, object_name, asset_name, object_scale, target_pos):
         try:
+            exists = _scene_object_exists_exact(self.client, object_name)
             test_pose = self.client.simGetObjectPose(object_name)
-            if test_pose is None:
+            if exists is False or test_pose is None:
                 if not self._spawn_named_object(object_name, asset_name, object_scale,
                                                 float(target_pos[0]), float(target_pos[1]), float(target_pos[2])):
                     safe_log(f"⚠ failed to respawn {object_name}", scene_id=self.scene_id)
@@ -3213,7 +3231,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                 quat,
                 retries=max_position_retries,
                 tol_xy=0.2,
-                tol_z=0.2,
+                tol_z=0.5,
             )
             if not ok:
                 error_msg = (
@@ -3270,7 +3288,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             prev_euler = self._prev_frame_data['uav_orientation_euler']
 
             position_diff_world = uav_pos - np.array([prev_pos['x'], prev_pos['y'], prev_pos['z']])
-            velocity_body = self._world_to_body_frame(
+            body_delta = self._world_to_body_frame(
                 position_diff_world,
                 prev_quat['w'], prev_quat['x'], prev_quat['y'], prev_quat['z']
             )
@@ -3279,14 +3297,14 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             current_yaw = uav_euler['yaw']
             yaw_diff = current_yaw - prev_yaw
             yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))
-            yaw_rate_deg = np.degrees(yaw_diff)
+            yaw_delta_deg = np.degrees(yaw_diff)
 
-            prev_frame_data["velocity_in_body_frame"] = {
-                "x": float(velocity_body[0]),
-                "y": float(velocity_body[1]),
-                "z": float(velocity_body[2])
+            prev_frame_data["body_frame_delta"] = {
+                "x": float(body_delta[0]),
+                "y": float(body_delta[1]),
+                "z": float(body_delta[2])
             }
-            prev_frame_data["yaw_rate"] = float(yaw_rate_deg)
+            prev_frame_data["body_frame_yaw_delta"] = float(yaw_delta_deg)
 
         frame_data = {
             "frame_idx": frame_idx,
@@ -3351,8 +3369,8 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
         else:
             frame_data["next_target_position"] = None
 
-        frame_data["velocity_in_body_frame"] = None
-        frame_data["yaw_rate"] = None
+        frame_data["body_frame_delta"] = None
+        frame_data["body_frame_yaw_delta"] = None
 
         self._prev_frame_data = {
             "frame_data": frame_data,
@@ -3428,7 +3446,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                 quat,
                 retries=5,
                 tol_xy=0.2,
-                tol_z=0.2,
+                tol_z=0.5,
             )
             if not ok:
                 verify_text = "unavailable" if verify_pos is None else f"({verify_pos[0]:.2f}, {verify_pos[1]:.2f}, {verify_pos[2]:.2f})"

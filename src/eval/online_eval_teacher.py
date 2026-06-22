@@ -12,6 +12,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,8 @@ from PIL import Image
 from scipy.spatial.transform import Rotation as R
 from torchvision import transforms
 
-from data.action_mapping import clamp_physical_action_speed
+from data.action_mapping import clamp_physical_action_speed, norm_action_to_physical
+from data.visual_guidance import project_body_to_image
 from model.config import ModelConfig, migrate_legacy_config
 from model.model import TeacherWorldModelDiT, migrate_legacy_state_dict_keys
 
@@ -91,6 +93,251 @@ def _dump_json(path: Path, payload: Any) -> None:
     tmp.replace(path)
 
 
+def _sync_cuda_for_profile(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:
+        pass
+
+
+def _mean_step_time_profile(records: Sequence[Dict[str, float]]) -> Dict[str, float]:
+    totals: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    for record in records:
+        for key, value in record.items():
+            totals[key] = totals.get(key, 0.0) + float(value)
+            counts[key] = counts.get(key, 0) + 1
+    return {key: totals[key] / max(counts.get(key, 1), 1) for key in totals}
+
+
+def _format_step_time_profile(prefix: str, averages: Dict[str, float]) -> str:
+    ordered = sorted(
+        (key for key in averages if key != "total"),
+        key=lambda key: averages[key],
+        reverse=True,
+    )
+    parts = [f"total={averages.get('total', 0.0):.3f}s"]
+    parts.extend(f"{key}={averages[key]:.3f}s" for key in ordered[:6])
+    return f"{prefix} " + ", ".join(parts)
+
+
+class AsyncCameraCache:
+    """Continuously poll AirSim images on a separate RPC client."""
+
+    def __init__(
+        self,
+        *,
+        ip: str,
+        port: int,
+        camera_name: str,
+        vehicle_name: str,
+        poll_interval: float = 0.0,
+        timeout_value: float = 3600.0,
+        direct_set_camera_pose: bool = False,
+        direct_camera_external: bool = True,
+        camera_offset_body: Sequence[float] = (0.46, 0.0, 0.0),
+    ) -> None:
+        self.ip = str(ip)
+        self.port = int(port)
+        self.camera_name = str(camera_name)
+        self.vehicle_name = str(vehicle_name)
+        self.poll_interval = max(float(poll_interval), 0.0)
+        self.timeout_value = float(timeout_value)
+        self.direct_set_camera_pose = bool(direct_set_camera_pose)
+        self.direct_camera_external = bool(direct_camera_external)
+        self.camera_offset_body = tuple(float(v) for v in list(camera_offset_body)[:3])
+
+        self._condition = threading.Condition()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._latest_rgb: Optional[np.ndarray] = None
+        self._latest_meta: Dict[str, Any] = {}
+        self._sequence = 0
+        self._last_error: Optional[str] = None
+        self._direct_pose_state: Optional[Dict[str, Any]] = None
+        self._direct_pose_sequence = 0
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"AsyncCameraCache:{self.port}:{self.camera_name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop_event.set()
+        with self._condition:
+            self._condition.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=max(float(timeout), 0.0))
+        self._thread = None
+
+    def _run(self) -> None:
+        client = None
+        try:
+            import airsim
+            import cv2
+
+            client = airsim.MultirotorClient(
+                ip=self.ip,
+                port=self.port,
+                timeout_value=self.timeout_value,
+            )
+            try:
+                client.ping()
+            except Exception:
+                pass
+            request = [airsim.ImageRequest(self.camera_name, airsim.ImageType.Scene, False, False)]
+
+            while not self._stop_event.is_set():
+                direct_camera_pose_meta = None
+                if self.direct_set_camera_pose:
+                    with self._condition:
+                        while self._direct_pose_state is None and not self._stop_event.is_set():
+                            self._condition.wait(timeout=0.05)
+                        if self._stop_event.is_set():
+                            break
+                        direct_pose_state = _copy_uav_state(self._direct_pose_state)
+                        direct_pose_sequence = int(self._direct_pose_sequence)
+                        camera_offset_body = tuple(float(v) for v in self.camera_offset_body)
+                    direct_camera_pose_meta = set_direct_camera_pose_on_client(
+                        client,
+                        self.camera_name,
+                        self.vehicle_name,
+                        direct_pose_state,
+                        camera_offset_body,
+                        external=self.direct_camera_external,
+                    )
+                    direct_camera_pose_meta["direct_pose_sequence"] = direct_pose_sequence
+
+                capture_start = time.perf_counter()
+                try:
+                    use_external_camera = bool(self.direct_set_camera_pose and self.direct_camera_external)
+                    responses = client.simGetImages(
+                        request,
+                        vehicle_name="" if use_external_camera else self.vehicle_name,
+                        external=use_external_camera,
+                    )
+                    capture_end = time.perf_counter()
+                    rgb_img = None
+                    if responses:
+                        response = responses[0]
+                        if response.image_data_uint8:
+                            rgb_img = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
+                            rgb_img = rgb_img.reshape(response.height, response.width, 3)
+                            rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
+                    if rgb_img is not None:
+                        response_meta = _camera_response_meta(response, capture_start, capture_end)
+                        response_meta = _attach_direct_camera_pose_meta(
+                            response_meta,
+                            direct_camera_pose_meta,
+                        )
+                        with self._condition:
+                            self._sequence += 1
+                            self._latest_rgb = rgb_img
+                            self._latest_meta = {
+                                **response_meta,
+                                "sequence": self._sequence,
+                            }
+                            self._last_error = None
+                            self._condition.notify_all()
+                    elif self.poll_interval <= 0.0:
+                        time.sleep(0.005)
+                except Exception as exc:
+                    with self._condition:
+                        self._last_error = str(exc)
+                        self._condition.notify_all()
+                    time.sleep(0.2)
+
+                if self.poll_interval > 0.0:
+                    self._stop_event.wait(self.poll_interval)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def get_latest(
+        self,
+        *,
+        min_capture_start: Optional[float] = None,
+        min_direct_pose_sequence: Optional[int] = None,
+        timeout: float = 5.0,
+    ) -> Tuple[Optional[np.ndarray], None, Dict[str, Any]]:
+        deadline = time.perf_counter() + max(float(timeout), 0.0)
+        with self._condition:
+            while True:
+                if self._latest_rgb is not None:
+                    meta = dict(self._latest_meta)
+                    capture_start = float(meta.get("capture_start", 0.0))
+                    direct_pose_ok = True
+                    if min_direct_pose_sequence is not None:
+                        direct_pose_ok = int(meta.get("direct_pose_sequence", 0)) >= int(min_direct_pose_sequence)
+                    capture_time_ok = min_capture_start is None or capture_start >= float(min_capture_start)
+                    if capture_time_ok and direct_pose_ok:
+                        return self._latest_rgb.copy(), None, meta
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    msg = "timed out waiting for async camera frame"
+                    if self._last_error:
+                        msg += f"; last error: {self._last_error}"
+                    raise TimeoutError(msg)
+                self._condition.wait(timeout=min(remaining, 0.05))
+
+    def update_direct_pose(
+        self,
+        uav_state: Dict[str, Any],
+        camera_offset_body: Sequence[float] = (0.46, 0.0, 0.0),
+    ) -> int:
+        """Publish the next held UAV pose for direct camera capture."""
+        with self._condition:
+            self._direct_pose_state = _copy_uav_state(uav_state)
+            self.camera_offset_body = tuple(float(v) for v in list(camera_offset_body)[:3])
+            self._direct_pose_sequence += 1
+            sequence = int(self._direct_pose_sequence)
+            self._condition.notify_all()
+            return sequence
+
+
+def _resolve_executor_airsim_port(executor) -> int:
+    sim_tool = getattr(executor, "sim_client_tool", None)
+    ports = getattr(sim_tool, "airsim_ports", None)
+    if ports:
+        return int(ports[0])
+    raise RuntimeError("Cannot resolve AirSim scene port for async camera cache")
+
+
+def start_async_camera_cache_if_needed(executor, args: argparse.Namespace) -> Optional[AsyncCameraCache]:
+    if not bool(getattr(args, "async_camera_cache", False)):
+        return None
+    port = _resolve_executor_airsim_port(executor)
+    cache = AsyncCameraCache(
+        ip=getattr(executor, "sim_server_host", args.sim_server_host),
+        port=port,
+        camera_name=getattr(executor, "camera_name", args.camera_name),
+        vehicle_name=getattr(executor, "uav_vehicle_name", args.uav_vehicle_name),
+        poll_interval=float(getattr(args, "async_camera_poll_interval", 0.0)),
+        direct_set_camera_pose=bool(getattr(args, "direct_set_camera_pose", False)),
+        direct_camera_external=bool(getattr(args, "direct_camera_external", True)),
+        camera_offset_body=tuple(float(v) for v in getattr(args, "camera_offset_body", (0.46, 0.0, 0.0))),
+    )
+    cache.start()
+    print(
+        f"[async-camera] enabled ip={cache.ip} port={cache.port} "
+        f"camera={cache.camera_name} vehicle={cache.vehicle_name} "
+        f"poll_interval={cache.poll_interval:.4f}s "
+        f"direct_set_camera_pose={cache.direct_set_camera_pose} "
+        f"direct_camera_external={cache.direct_camera_external}"
+    )
+    return cache
+
+
 def _trajectory_key(scene_id: str, trajectory_name: str) -> str:
     return f"{scene_id}/{trajectory_name}"
 
@@ -133,22 +380,35 @@ def _visualization_enabled_for_trajectory(args: argparse.Namespace, traj: "Onlin
     return _visualization_enabled_for_key(args, traj.scene_id, traj.trajectory_name)
 
 
-def _expected_visual_asset_dirs(args: argparse.Namespace, cfg: ModelConfig) -> List[str]:
-    del cfg
+def _expected_visual_asset_dirs(
+    args: argparse.Namespace,
+    cfg: ModelConfig,
+    *,
+    include_optional_visual_assets: bool = True,
+) -> List[str]:
     dirs: List[str] = []
     if bool(getattr(args, "save_rgb", False)):
         dirs.append("rgb")
-    if bool(args.save_transformer_attention_maps):
+    if include_optional_visual_assets and bool(args.save_transformer_attention_maps):
         dirs.append("last_transformer_attention_maps")
-    if bool(args.save_predicted_video):
+    if include_optional_visual_assets and bool(args.save_predicted_video):
         dirs.append("predicted_video")
+    if include_optional_visual_assets and bool(getattr(args, "save_predicted_action_trajectories", False)):
+        dirs.append("predicted_action_trajectories")
+    if include_optional_visual_assets and bool(getattr(args, "save_target_similarity_maps", False)) and bool(getattr(cfg, "use_target_similarity_guidance", False)):
+        dirs.append("target_similarity_maps")
+        dirs.append("target_crops")
+        dirs.append("object_projection_debug")
     return dirs
 
 
 def _visual_assets_exist_for_key(args: argparse.Namespace, cfg: ModelConfig, scene_id: str, trajectory_name: str) -> bool:
-    if not _visualization_enabled_for_key(args, scene_id, trajectory_name):
-        return True
-    expected_dirs = _expected_visual_asset_dirs(args, cfg)
+    save_optional_visual_assets = _visualization_enabled_for_key(args, scene_id, trajectory_name)
+    expected_dirs = _expected_visual_asset_dirs(
+        args,
+        cfg,
+        include_optional_visual_assets=save_optional_visual_assets,
+    )
     if not expected_dirs:
         return True
     out_dir = Path(args.output_dir) / scene_id / trajectory_name
@@ -159,10 +419,27 @@ def _visual_assets_exist_for_key(args: argparse.Namespace, cfg: ModelConfig, sce
     return True
 
 
+def _scene_object_exists(executor, object_name: Optional[str]) -> Optional[bool]:
+    if not object_name:
+        return None
+    try:
+        objects = executor.client.simListSceneObjects(f"^{re.escape(str(object_name))}$")
+        if objects:
+            return True
+    except Exception:
+        pass
+    try:
+        objects = executor.client.simListSceneObjects(str(object_name) + ".*")
+        return bool(objects)
+    except Exception:
+        return None
+
+
 def _load_resumable_partial(
     partial_path: Path,
     expected_keys: set[str],
     *,
+    current_args: Optional[argparse.Namespace] = None,
     verbose: bool = True,
 ) -> List[Dict[str, Any]]:
     if not partial_path.exists():
@@ -178,6 +455,10 @@ def _load_resumable_partial(
         if verbose:
             print(f"[resume-warn] ignore malformed partial summary {partial_path}: summaries is not a list")
         return []
+    # Resume is intentionally trajectory-based. If a trajectory already has a
+    # summary, keep it even if runtime-only eval knobs changed, so reruns only
+    # fill missing trajectories instead of repeating completed work.
+    del current_args
 
     kept: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -223,6 +504,41 @@ def _xyz_from_any(obj: Any) -> Optional[np.ndarray]:
     return None
 
 
+def _quat_wxyz_from_any(obj: Any) -> Optional[np.ndarray]:
+    if obj is None:
+        return None
+    if isinstance(obj, dict) and all(k in obj for k in ("w", "x", "y", "z")):
+        quat = np.asarray(
+            [float(obj["w"]), float(obj["x"]), float(obj["y"]), float(obj["z"])],
+            dtype=np.float32,
+        )
+    elif all(hasattr(obj, k) for k in ("w_val", "x_val", "y_val", "z_val")):
+        quat = np.asarray(
+            [float(obj.w_val), float(obj.x_val), float(obj.y_val), float(obj.z_val)],
+            dtype=np.float32,
+        )
+    elif isinstance(obj, np.ndarray) and obj.size >= 4:
+        flat = np.asarray(obj, dtype=np.float64).reshape(-1)
+        quat = np.asarray([float(flat[0]), float(flat[1]), float(flat[2]), float(flat[3])], dtype=np.float32)
+    elif isinstance(obj, (list, tuple)) and len(obj) >= 4:
+        quat = np.asarray([float(obj[0]), float(obj[1]), float(obj[2]), float(obj[3])], dtype=np.float32)
+    else:
+        return None
+    if not np.all(np.isfinite(quat)):
+        return None
+    norm = float(np.linalg.norm(quat))
+    if norm < 1e-8:
+        return None
+    return (quat / norm).astype(np.float32)
+
+
+def _quat_wxyz_to_dict(quat: Any) -> Optional[Dict[str, float]]:
+    arr = _quat_wxyz_from_any(quat)
+    if arr is None:
+        return None
+    return {"w": float(arr[0]), "x": float(arr[1]), "y": float(arr[2]), "z": float(arr[3])}
+
+
 def _dataset_xyz_to_airsim(pos: Any) -> Optional[np.ndarray]:
     """Saved Dataset coordinates use z-up; AirSim uses z-down.
 
@@ -241,6 +557,36 @@ def _airsim_xyz_to_dataset(pos: Any) -> Optional[Dict[str, float]]:
     if xyz is None:
         return None
     return {"x": float(xyz[0]), "y": float(xyz[1]), "z": float(-xyz[2])}
+
+
+def _airsim_xyz_to_dict(pos: Any) -> Optional[Dict[str, float]]:
+    xyz = _xyz_from_any(pos)
+    if xyz is None:
+        return None
+    return {"x": float(xyz[0]), "y": float(xyz[1]), "z": float(xyz[2])}
+
+
+def _camera_response_meta(response: Any, capture_start: float, capture_end: float) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "capture_start": float(capture_start),
+        "capture_end": float(capture_end),
+        "request_duration": float(capture_end - capture_start),
+    }
+    if response is None:
+        return meta
+    for key in ("width", "height", "time_stamp"):
+        value = getattr(response, key, None)
+        if value is not None:
+            try:
+                meta[key] = int(value)
+            except Exception:
+                meta[key] = value
+    camera_pos = getattr(response, "camera_position", None)
+    camera_quat = getattr(response, "camera_orientation", None)
+    meta["camera_position"] = _airsim_xyz_to_dataset(camera_pos)
+    meta["camera_position_airsim"] = _airsim_xyz_to_dict(camera_pos)
+    meta["camera_orientation"] = _quat_wxyz_to_dict(camera_quat)
+    return meta
 
 
 def _natural_key(path: Path) -> List[Any]:
@@ -353,6 +699,7 @@ class OnlineTrajectory:
     trajectory_name: str
     dataset_dir: Path
     uav_start_airsim: np.ndarray
+    uav_start_quat_wxyz: Optional[np.ndarray]
     target_traj_airsim: np.ndarray
     jammer_trajs_airsim: Dict[str, np.ndarray]
     target_asset_name: Optional[str]
@@ -493,8 +840,8 @@ def _load_expert_actions(uav_frames: List[Dict[str, Any]]) -> List[Optional[np.n
         if not isinstance(frame, dict):
             actions.append(None)
             continue
-        vel = frame.get("velocity_in_body_frame")
-        yaw = frame.get("yaw_rate")
+        vel = frame.get("velocity_in_body_frame") or frame.get("body_frame_delta")
+        yaw = frame.get("yaw_rate", frame.get("body_frame_yaw_delta"))
         vel_xyz = _xyz_from_any(vel)
         if vel_xyz is None or yaw is None:
             actions.append(None)
@@ -515,6 +862,7 @@ def load_online_trajectory(dataset_dir: Path, scene_id: str) -> OnlineTrajectory
     uav0 = _dataset_xyz_to_airsim(frames[0].get("uav_position"))
     if uav0 is None:
         raise ValueError(f"missing first uav_position in {uav_path}")
+    uav0_quat = _quat_wxyz_from_any(frames[0].get("uav_orientation_quaternion"))
 
     target = _load_target_trajectory(dataset_dir, frames)
     jammers, jammer_assets = _load_jammer_trajectories(dataset_dir, frames)
@@ -531,6 +879,7 @@ def load_online_trajectory(dataset_dir: Path, scene_id: str) -> OnlineTrajectory
         trajectory_name=dataset_dir.name,
         dataset_dir=dataset_dir,
         uav_start_airsim=uav0.astype(np.float32),
+        uav_start_quat_wxyz=None if uav0_quat is None else uav0_quat.astype(np.float32),
         target_traj_airsim=target[:num_frames],
         jammer_trajs_airsim={k: v[:num_frames] for k, v in jammers.items()},
         target_asset_name=uav_payload.get("target_asset_name"),
@@ -667,12 +1016,60 @@ def _make_cfg_from_checkpoint(ckpt: Dict[str, Any], args: argparse.Namespace) ->
         cfg_kwargs["dit_candidate_temporal_smooth_weight"] = float(args.dit_candidate_temporal_smooth_weight)
     if getattr(args, "use_target_relative_context", None) is not None:
         cfg_kwargs["use_target_relative_context"] = bool(args.use_target_relative_context)
+    if getattr(args, "target_relative_context_input_mode", None) is not None:
+        cfg_kwargs["target_relative_context_input_mode"] = str(args.target_relative_context_input_mode)
     if getattr(args, "target_relative_context_scale", None) is not None:
         cfg_kwargs["target_relative_context_scale"] = float(args.target_relative_context_scale)
     if getattr(args, "target_relative_token_scale", None) is not None:
         cfg_kwargs["target_relative_token_scale"] = float(args.target_relative_token_scale)
     if getattr(args, "target_relative_context_hidden_dim", None) is not None:
         cfg_kwargs["target_relative_context_hidden_dim"] = int(args.target_relative_context_hidden_dim)
+    if getattr(args, "use_target_similarity_guidance", None) is not None:
+        cfg_kwargs["use_target_similarity_guidance"] = bool(args.use_target_similarity_guidance)
+    if getattr(args, "target_similarity_feature_source", None) is not None:
+        cfg_kwargs["target_similarity_feature_source"] = str(args.target_similarity_feature_source)
+    if getattr(args, "target_similarity_context_mode", None) is not None:
+        cfg_kwargs["target_similarity_context_mode"] = str(args.target_similarity_context_mode)
+    if getattr(args, "target_similarity_condition_dim", None) is not None:
+        cfg_kwargs["target_similarity_condition_dim"] = int(args.target_similarity_condition_dim)
+    if getattr(args, "target_similarity_hidden_dim", None) is not None:
+        cfg_kwargs["target_similarity_hidden_dim"] = int(args.target_similarity_hidden_dim)
+    if getattr(args, "target_similarity_patch_size", None) is not None:
+        cfg_kwargs["target_similarity_patch_size"] = int(args.target_similarity_patch_size)
+    if getattr(args, "target_similarity_vae_downsample_factor", None) is not None:
+        cfg_kwargs["target_similarity_vae_downsample_factor"] = int(args.target_similarity_vae_downsample_factor)
+    if getattr(args, "target_similarity_history_size", None) is not None:
+        cfg_kwargs["target_similarity_history_size"] = int(args.target_similarity_history_size)
+    if getattr(args, "target_similarity_decay", None) is not None:
+        cfg_kwargs["target_similarity_decay"] = float(args.target_similarity_decay)
+    if getattr(args, "target_similarity_grid_pool_size", None) is not None:
+        cfg_kwargs["target_similarity_grid_pool_size"] = int(args.target_similarity_grid_pool_size)
+    if getattr(args, "target_similarity_temperature", None) is not None:
+        cfg_kwargs["target_similarity_temperature"] = float(args.target_similarity_temperature)
+    if getattr(args, "target_similarity_token_scale", None) is not None:
+        cfg_kwargs["target_similarity_token_scale"] = float(args.target_similarity_token_scale)
+    if getattr(args, "target_similarity_condition_mode", None) is not None:
+        cfg_kwargs["target_similarity_condition_mode"] = str(args.target_similarity_condition_mode)
+    if getattr(args, "target_similarity_condition_source", None) is not None:
+        cfg_kwargs["target_similarity_condition_source"] = str(args.target_similarity_condition_source)
+    if getattr(args, "target_similarity_condition_gt_mix_prob", None) is not None:
+        cfg_kwargs["target_similarity_condition_gt_mix_prob"] = float(args.target_similarity_condition_gt_mix_prob)
+    if getattr(args, "target_similarity_fov_deg", None) is not None:
+        cfg_kwargs["target_similarity_fov_deg"] = float(args.target_similarity_fov_deg)
+    if getattr(args, "target_similarity_camera_offset_body", None) is not None:
+        cfg_kwargs["target_similarity_camera_offset_body"] = tuple(
+            float(v) for v in args.target_similarity_camera_offset_body
+        )
+    if getattr(args, "target_similarity_heatmap_sigma", None) is not None:
+        cfg_kwargs["target_similarity_heatmap_sigma"] = float(args.target_similarity_heatmap_sigma)
+    if getattr(args, "target_similarity_reacquire_confidence_min", None) is not None:
+        cfg_kwargs["target_similarity_reacquire_confidence_min"] = float(args.target_similarity_reacquire_confidence_min)
+    if getattr(args, "target_similarity_reacquire_confidence_ratio", None) is not None:
+        cfg_kwargs["target_similarity_reacquire_confidence_ratio"] = float(args.target_similarity_reacquire_confidence_ratio)
+    if getattr(args, "target_similarity_reacquire_entropy_max", None) is not None:
+        cfg_kwargs["target_similarity_reacquire_entropy_max"] = float(args.target_similarity_reacquire_entropy_max)
+    if getattr(args, "target_similarity_reacquire_margin_min", None) is not None:
+        cfg_kwargs["target_similarity_reacquire_margin_min"] = float(args.target_similarity_reacquire_margin_min)
     if getattr(args, "force_direct_action", False):
         cfg_kwargs["use_diffusion_actor"] = False
     return ModelConfig(**cfg_kwargs)
@@ -747,7 +1144,8 @@ def load_model(args: argparse.Namespace, device: torch.device) -> Tuple[TeacherW
         f"dit_candidate_count={cfg.dit_candidate_count}, "
         f"candidate_score=tracking, "
         f"target_relative_context={cfg.use_target_relative_context}, "
-        f"target_relative_token_scale={cfg.target_relative_token_scale}"
+        f"target_relative_token_scale={cfg.target_relative_token_scale}, "
+        f"target_similarity={cfg.use_target_similarity_guidance}"
     )
     return model, cfg
 
@@ -801,9 +1199,65 @@ def _wxyz_quat_to_airsim_quat(quat_wxyz: Sequence[float]):
     )
 
 
+def _airsim_quat_to_wxyz(quat) -> np.ndarray:
+    return np.asarray(
+        [
+            float(quat.w_val),
+            float(quat.x_val),
+            float(quat.y_val),
+            float(quat.z_val),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _make_logical_uav_state(position_airsim: np.ndarray, quat) -> Dict[str, Any]:
+    return {
+        "position": np.asarray(position_airsim, dtype=np.float32).reshape(3).copy(),
+        "orientation": _airsim_quat_to_wxyz(quat),
+        "has_collided": False,
+        "collision_time_stamp": None,
+    }
+
+
+def _copy_uav_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    copied = dict(state)
+    if "position" in copied and copied["position"] is not None:
+        copied["position"] = np.asarray(copied["position"], dtype=np.float32).copy()
+    if "orientation" in copied and copied["orientation"] is not None:
+        copied["orientation"] = np.asarray(copied["orientation"], dtype=np.float32).copy()
+    return copied
+
+
 def _yaw_to_airsim_quat(yaw_rad: float):
     quat_xyzw = R.from_euler("xyz", [0.0, 0.0, float(yaw_rad)], degrees=False).as_quat()
     return _quat_to_airsim_quat(quat_xyzw)
+
+
+def _zero_vehicle_kinematics(executor, position_airsim: np.ndarray, quat) -> None:
+    """Pin pose and clear latent velocity so a refresh tick cannot inherit free-fall."""
+    import airsim
+
+    try:
+        state = airsim.KinematicsState()
+        state.position = airsim.Vector3r(
+            float(position_airsim[0]),
+            float(position_airsim[1]),
+            float(position_airsim[2]),
+        )
+        state.orientation = quat
+        zero = airsim.Vector3r(0.0, 0.0, 0.0)
+        state.linear_velocity = zero
+        state.angular_velocity = zero
+        state.linear_acceleration = zero
+        state.angular_acceleration = zero
+        executor.client.simSetKinematics(
+            state,
+            ignore_collision=True,
+            vehicle_name=executor.uav_vehicle_name,
+        )
+    except Exception:
+        pass
 
 
 def set_vehicle_pose_static(
@@ -829,12 +1283,16 @@ def set_vehicle_pose_static(
             ignore_collision=True,
             vehicle_name=executor.uav_vehicle_name,
         )
+        _zero_vehicle_kinematics(executor, pos, quat)
         last_state = executor.get_uav_state()
         actual = np.asarray(last_state["position"], dtype=np.float32)
         err_xy = float(np.linalg.norm(actual[:2] - pos[:2]))
         err_z = float(abs(actual[2] - pos[2]))
         if err_xy <= float(tol_xy) and err_z <= float(tol_z):
-            return last_state
+            logical_state = _make_logical_uav_state(pos, quat)
+            logical_state["has_collided"] = bool(last_state.get("has_collided", False))
+            logical_state["collision_time_stamp"] = last_state.get("collision_time_stamp")
+            return logical_state
     if last_state is not None:
         actual = np.asarray(last_state["position"], dtype=np.float32)
         raise RuntimeError(
@@ -842,6 +1300,237 @@ def set_vehicle_pose_static(
             f"actual=({actual[0]:.2f},{actual[1]:.2f},{actual[2]:.2f})"
         )
     raise RuntimeError("static pose set failed: no UAV state returned")
+
+
+def set_vehicle_pose_and_refresh_camera(
+    executor,
+    position_airsim: np.ndarray,
+    quat,
+    refresh_frames: int = 1,
+    retries: int = 2,
+    tol_xy: float = 0.8,
+    tol_z: float = 0.8,
+) -> Tuple[Dict[str, Any], Optional[np.ndarray]]:
+    """Set UAV pose and tick AirSim so the rendered camera follows it.
+
+    AirSim can report a correct multirotor state immediately after
+    simSetVehiclePose while the next simGetImages call still uses the previous
+    rendered camera transform. A short deterministic frame tick refreshes that
+    camera transform; the returned delta is the post-refresh drift from the
+    requested pose.
+    """
+    pos = np.asarray(position_airsim, dtype=np.float32).reshape(3)
+    frames = max(int(refresh_frames or 0), 0)
+    last_state = None
+    last_delta = None
+    for _ in range(max(int(retries), 1)):
+        held_state = set_vehicle_pose_static(
+            executor,
+            pos,
+            quat,
+            retries=1,
+            tol_xy=tol_xy,
+            tol_z=tol_z,
+        )
+        if frames <= 0:
+            return held_state, np.zeros(3, dtype=np.float32)
+        if frames > 0:
+            executor._safe_continue_for_frames(frames)
+        last_state = executor.get_uav_state()
+        actual = np.asarray(last_state["position"], dtype=np.float32)
+        last_delta = actual - pos
+        # The frame tick above is only to refresh the rendered camera transform.
+        # Do not let any physics drift from that tick become the logical rollout
+        # state used for action integration.
+        held_state = set_vehicle_pose_static(
+            executor,
+            pos,
+            quat,
+            retries=1,
+            tol_xy=tol_xy,
+            tol_z=tol_z,
+        )
+        err_xy = float(np.linalg.norm(last_delta[:2]))
+        err_z = float(abs(last_delta[2]))
+        if err_xy <= float(tol_xy) and err_z <= float(tol_z):
+            return held_state, last_delta.astype(np.float32)
+    if last_state is not None:
+        held_state = set_vehicle_pose_static(
+            executor,
+            pos,
+            quat,
+            retries=1,
+            tol_xy=tol_xy,
+            tol_z=tol_z,
+        )
+        return held_state, None if last_delta is None else last_delta.astype(np.float32)
+    raise RuntimeError("camera pose refresh failed: no UAV state returned")
+
+
+def _camera_offset_body_array(camera_offset_body: Sequence[float] = (0.46, 0.0, 0.0)) -> np.ndarray:
+    offset = np.asarray(list(camera_offset_body)[:3], dtype=np.float32)
+    if offset.size < 3:
+        offset = np.pad(offset, (0, 3 - offset.size), mode="constant")
+    return offset.reshape(3)
+
+
+def _expected_camera_pose_from_uav_state(
+    uav_state: Dict[str, Any],
+    camera_offset_body: Sequence[float] = (0.46, 0.0, 0.0),
+) -> Tuple[np.ndarray, np.ndarray]:
+    uav_pos = np.asarray(uav_state.get("position"), dtype=np.float32).reshape(3)
+    q = np.asarray(uav_state.get("orientation"), dtype=np.float32).reshape(4)
+    rot = R.from_quat([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
+    offset = _camera_offset_body_array(camera_offset_body)
+    # camera_offset_body is body-frame x-forward/y-right/z-up in the training
+    # config. AirSim world is NED, so flip only the body z before rotation.
+    offset_airsim_body = np.asarray([offset[0], offset[1], -offset[2]], dtype=np.float32)
+    camera_pos = uav_pos + rot.apply(offset_airsim_body).astype(np.float32)
+    return camera_pos.astype(np.float32), q.astype(np.float32)
+
+
+def set_direct_camera_pose_on_client(
+    client,
+    camera_name: str,
+    vehicle_name: str,
+    uav_state: Dict[str, Any],
+    camera_offset_body: Sequence[float] = (0.46, 0.0, 0.0),
+    *,
+    external: bool = True,
+) -> Dict[str, Any]:
+    """Set the render camera pose directly without advancing AirSim physics."""
+    import airsim
+
+    expected_pos, expected_quat = _expected_camera_pose_from_uav_state(uav_state, camera_offset_body)
+    offset = _camera_offset_body_array(camera_offset_body)
+    relative_offset_airsim = np.asarray([offset[0], offset[1], -offset[2]], dtype=np.float32)
+    relative_quat = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    pose_pos = expected_pos if external else relative_offset_airsim
+    pose_quat = expected_quat if external else relative_quat
+    camera_pose = airsim.Pose(
+        airsim.Vector3r(
+            float(pose_pos[0]),
+            float(pose_pos[1]),
+            float(pose_pos[2]),
+        ),
+        _wxyz_quat_to_airsim_quat(pose_quat),
+    )
+    client.simSetCameraPose(
+        str(camera_name),
+        camera_pose,
+        vehicle_name="" if external else str(vehicle_name),
+        external=bool(external),
+    )
+    return {
+        "direct_set_camera_pose_used": True,
+        "direct_camera_external": bool(external),
+        "expected_camera_position": _airsim_xyz_to_dataset(expected_pos),
+        "expected_camera_position_airsim": _airsim_xyz_to_dict(expected_pos),
+        "expected_camera_orientation": _quat_wxyz_to_dict(expected_quat),
+        "direct_camera_pose_input_position": _airsim_xyz_to_dict(pose_pos),
+        "direct_camera_pose_input_orientation": _quat_wxyz_to_dict(pose_quat),
+        "camera_offset_body": offset.astype(float).tolist(),
+    }
+
+
+def set_direct_camera_pose(
+    executor,
+    uav_state: Dict[str, Any],
+    camera_offset_body: Sequence[float] = (0.46, 0.0, 0.0),
+    *,
+    external: bool = True,
+) -> Dict[str, Any]:
+    return set_direct_camera_pose_on_client(
+        executor.client,
+        str(executor.camera_name),
+        str(executor.uav_vehicle_name),
+        uav_state,
+        camera_offset_body,
+        external=external,
+    )
+
+
+def _attach_direct_camera_pose_meta(
+    camera_meta: Dict[str, Any],
+    direct_meta: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not direct_meta:
+        return camera_meta
+    out = dict(camera_meta)
+    out.update(direct_meta)
+    actual_pos = _xyz_from_any(out.get("camera_position_airsim"))
+    expected_pos = _xyz_from_any(out.get("expected_camera_position_airsim"))
+    if actual_pos is not None and expected_pos is not None:
+        out["actual_camera_position"] = _airsim_xyz_to_dataset(actual_pos)
+        out["actual_camera_position_airsim"] = _airsim_xyz_to_dict(actual_pos)
+        out["camera_pose_error"] = float(np.linalg.norm(actual_pos - expected_pos))
+    else:
+        out["actual_camera_position"] = out.get("camera_position")
+        out["actual_camera_position_airsim"] = out.get("camera_position_airsim")
+        out["camera_pose_error"] = None
+    return out
+
+
+def capture_camera_images_with_meta(
+    executor,
+    *,
+    direct_camera_pose_meta: Optional[Dict[str, Any]] = None,
+    external_camera: bool = False,
+) -> Tuple[Optional[np.ndarray], None, Dict[str, Any]]:
+    """Synchronous image capture that also returns AirSim response pose metadata."""
+    import airsim
+    import cv2
+
+    request = [airsim.ImageRequest(executor.camera_name, airsim.ImageType.Scene, False, False)]
+    max_retries = 5
+    retry_delay = 2.0
+    for attempt in range(max_retries):
+        capture_start = time.perf_counter()
+        try:
+            responses = executor.client.simGetImages(
+                request,
+                vehicle_name="" if external_camera else executor.uav_vehicle_name,
+                external=bool(external_camera),
+            )
+            capture_end = time.perf_counter()
+            response = responses[0] if responses else None
+            rgb_img = None
+            if response is not None and response.image_data_uint8:
+                rgb_img = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
+                rgb_img = rgb_img.reshape(response.height, response.width, 3)
+                rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
+            meta = _camera_response_meta(response, capture_start, capture_end)
+            meta = _attach_direct_camera_pose_meta(meta, direct_camera_pose_meta)
+            if rgb_img is not None:
+                return rgb_img, None, meta
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                print(f"[warn] sync camera request failed ({attempt + 1}/{max_retries}): {exc}")
+                time.sleep(retry_delay)
+                continue
+            raise
+    return None, None, {}
+
+
+def _camera_meta_position_error(
+    camera_meta: Optional[Dict[str, Any]],
+    uav_state: Dict[str, Any],
+    camera_offset_body: Sequence[float] = (0.46, 0.0, 0.0),
+) -> Optional[float]:
+    if not isinstance(camera_meta, dict):
+        return None
+    camera_pos = _xyz_from_any(camera_meta.get("camera_position_airsim"))
+    if camera_pos is None:
+        return None
+    uav_pos = np.asarray(uav_state.get("position"), dtype=np.float32).reshape(3)
+    q = uav_state.get("orientation")
+    if q is None:
+        return None
+    expected_camera_pos, _ = _expected_camera_pose_from_uav_state(
+        {"position": uav_pos, "orientation": q},
+        camera_offset_body,
+    )
+    return float(np.linalg.norm(np.asarray(camera_pos, dtype=np.float32) - expected_camera_pos))
 
 
 def _get_yaw_from_state(uav_state: Dict[str, Any]) -> float:
@@ -1052,44 +1741,108 @@ def physical_action_to_norm(action_physical: np.ndarray, max_vel: float, max_yaw
     return np.clip(out, -1.0, 1.0)
 
 
+def integrate_pose_action_state(
+    start_state: Dict[str, Any],
+    action_physical: np.ndarray,
+    max_step_norm: float,
+) -> Dict[str, Any]:
+    pos = np.asarray(start_state["position"], dtype=np.float32)
+    q = start_state["orientation"]
+    rot = R.from_quat([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
+
+    action = np.asarray(action_physical, dtype=np.float32).copy()
+    body_ned = np.asarray([action[0], action[1], action[2]], dtype=np.float32)
+    step_norm = float(np.linalg.norm(body_ned))
+    if max_step_norm > 0 and step_norm > max_step_norm:
+        body_ned *= float(max_step_norm / max(step_norm, 1e-6))
+
+    delta_world_airsim = rot.apply(body_ned)
+    new_pos = pos + delta_world_airsim.astype(np.float32)
+
+    euler = rot.as_euler("xyz", degrees=False)
+    new_yaw = float(euler[2]) + math.radians(float(action[3]))
+    new_rot = R.from_euler("xyz", [float(euler[0]), float(euler[1]), new_yaw], degrees=False)
+    new_quat_xyzw = new_rot.as_quat().astype(np.float32)
+    new_quat_wxyz = np.asarray(
+        [new_quat_xyzw[3], new_quat_xyzw[0], new_quat_xyzw[1], new_quat_xyzw[2]],
+        dtype=np.float32,
+    )
+
+    out = dict(start_state)
+    out["position"] = new_pos.astype(np.float32)
+    out["orientation"] = new_quat_wxyz
+    return out
+
+
+def action_sequence_norm_to_physical(
+    action_sequence_norm: Any,
+    max_vel: float,
+    max_yaw_rate: float,
+    max_speed_norm: float,
+) -> np.ndarray:
+    if torch.is_tensor(action_sequence_norm):
+        arr = action_sequence_norm.detach().float().cpu().numpy()
+    else:
+        arr = np.asarray(action_sequence_norm, dtype=np.float32)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    elif arr.ndim > 2:
+        arr = arr.reshape(-1, arr.shape[-1])
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.shape[-1] != 4:
+        raise ValueError(f"expected action sequence last dim 4, got shape={arr.shape}")
+    arr = np.clip(np.asarray(arr, dtype=np.float32), -1.0, 1.0)
+    return np.asarray(
+        norm_action_to_physical(
+            arr,
+            max_vel=max_vel,
+            max_yaw_rate=max_yaw_rate,
+            max_speed_norm=max_speed_norm,
+        ),
+        dtype=np.float32,
+    )
+
+
+def rollout_action_sequence_states(
+    start_state: Dict[str, Any],
+    action_sequence_physical: np.ndarray,
+    max_step_norm: float,
+) -> List[Dict[str, Any]]:
+    states: List[Dict[str, Any]] = []
+    state = _copy_uav_state(start_state)
+    actions = np.asarray(action_sequence_physical, dtype=np.float32)
+    if actions.ndim == 1:
+        actions = actions.reshape(1, -1)
+    for action in actions:
+        if action.shape[-1] != 4:
+            continue
+        state = integrate_pose_action_state(state, action, max_step_norm)
+        states.append(_copy_uav_state(state))
+    return states
+
+
 def apply_action_by_pose(
     executor,
     action_physical: np.ndarray,
-    dt: float,
     max_step_norm: float,
+    start_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Apply predicted action by deterministic pose integration.
+    """Apply predicted per-step body-frame delta by deterministic pose integration.
 
     This matches your data-collection executor style better than a fully dynamic AirSim
     velocity command, because dataset generation itself used pose setting and frame stepping.
     """
-    uav_state = executor.get_uav_state()
-    pos = np.asarray(uav_state["position"], dtype=np.float32)
-    q = uav_state["orientation"]
-    rot = R.from_quat([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
-
-    action = np.asarray(action_physical, dtype=np.float32).copy()
     # The dataset action z comes from TrajectoryExecutor._world_to_body_frame(),
     # which already uses AirSim's body-frame z sign after its saved-coordinate
     # conversion. Execute it directly here; flipping it again makes vertical
     # tracking diverge.
-    body_ned = np.asarray([action[0], action[1], action[2]], dtype=np.float32)
-    step_norm = float(np.linalg.norm(body_ned) * dt)
-    if max_step_norm > 0 and step_norm > max_step_norm:
-        body_ned *= float(max_step_norm / max(step_norm, 1e-6))
-
-    delta_world_airsim = rot.apply(body_ned) * float(dt)
-    new_pos = pos + delta_world_airsim.astype(np.float32)
-
-    euler = rot.as_euler("xyz", degrees=False)
-    new_yaw = float(euler[2]) + math.radians(float(action[3]) * float(dt))
-    new_rot = R.from_euler("xyz", [float(euler[0]), float(euler[1]), new_yaw], degrees=False)
-    new_quat_xyzw = new_rot.as_quat()
-
-    quat = _quat_to_airsim_quat(new_quat_xyzw)
+    uav_state = start_state if start_state is not None else executor.get_uav_state()
+    next_state = integrate_pose_action_state(uav_state, action_physical, max_step_norm)
+    quat = _wxyz_quat_to_airsim_quat(next_state["orientation"])
     return set_vehicle_pose_static(
         executor,
-        new_pos,
+        np.asarray(next_state["position"], dtype=np.float32),
         quat,
         retries=3,
         tol_xy=0.8,
@@ -1097,16 +1850,17 @@ def apply_action_by_pose(
     )
 
 
-def apply_action_by_velocity(executor, action_physical: np.ndarray, dt: float) -> Dict[str, Any]:
+def apply_action_by_velocity(executor, action_physical: np.ndarray) -> Dict[str, Any]:
     import airsim
 
     action = np.asarray(action_physical, dtype=np.float32)
+    command_duration = 1.0
     executor._safe_sim_pause(False)
     executor.client.moveByVelocityBodyFrameAsync(
         float(action[0]),
         float(action[1]),
         float(action[2]),
-        float(dt),
+        command_duration,
         yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=float(action[3])),
         vehicle_name=executor.uav_vehicle_name,
     ).join()
@@ -1189,6 +1943,498 @@ def save_attention_map_overlay(
     cv2.imwrite(str(path.with_suffix(".png")), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
 
 
+def _tensor_map_2d(value: torch.Tensor) -> np.ndarray:
+    arr = value.detach().float().cpu().squeeze().numpy()
+    if arr.ndim != 2:
+        raise ValueError(f"expected 2D map after squeeze, got shape {arr.shape}")
+    return np.asarray(arr, dtype=np.float32)
+
+
+def _normalize_map_u8(value: np.ndarray) -> np.ndarray:
+    vis = np.asarray(value, dtype=np.float32)
+    vis = vis - float(np.min(vis))
+    denom = float(np.max(vis))
+    if denom > 1e-8:
+        vis = vis / denom
+    return np.clip(vis * 255.0, 0, 255).astype(np.uint8)
+
+
+def _center_to_pixel(center_xy: Any, width: int, height: int) -> Optional[Tuple[int, int]]:
+    if center_xy is None:
+        return None
+    arr = center_xy.detach().float().cpu().reshape(-1).numpy() if torch.is_tensor(center_xy) else np.asarray(center_xy, dtype=np.float32).reshape(-1)
+    if arr.size < 2 or not np.all(np.isfinite(arr[:2])):
+        return None
+    x = int(round(float(np.clip(arr[0], 0.0, 1.0)) * max(width - 1, 1)))
+    y = int(round(float(np.clip(arr[1], 0.0, 1.0)) * max(height - 1, 1)))
+    return x, y
+
+
+def _draw_crosshair(
+    image_rgb: np.ndarray,
+    center_xy: Any,
+    color_rgb: Tuple[int, int, int],
+    label: Optional[str] = None,
+) -> Optional[Tuple[float, float]]:
+    import cv2
+
+    h, w = image_rgb.shape[:2]
+    pt = _center_to_pixel(center_xy, w, h)
+    if pt is None:
+        return None
+    x, y = pt
+    color = (int(color_rgb[0]), int(color_rgb[1]), int(color_rgb[2]))
+    cv2.drawMarker(
+        image_rgb,
+        (x, y),
+        color,
+        markerType=cv2.MARKER_CROSS,
+        markerSize=max(12, min(h, w) // 18),
+        thickness=2,
+        line_type=cv2.LINE_AA,
+    )
+    cv2.circle(image_rgb, (x, y), max(4, min(h, w) // 80), color, 2, lineType=cv2.LINE_AA)
+    if label:
+        cv2.putText(
+            image_rgb,
+            label,
+            (min(x + 6, max(w - 40, 0)), max(y - 6, 14)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    return (float(x) / max(w - 1, 1), float(y) / max(h - 1, 1))
+
+
+def save_target_similarity_visuals(
+    out_dir: Path,
+    rgb: np.ndarray,
+    pred: Dict[str, torch.Tensor],
+    frame_idx: int,
+    gt_center_xy: Any = None,
+    gt_visible: Optional[bool] = None,
+) -> Dict[str, Any]:
+    import cv2
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rgb_u8 = np.asarray(rgb, dtype=np.uint8)
+    h, w = rgb_u8.shape[:2]
+    relpaths: Dict[str, Any] = {}
+
+    map_specs = [
+        ("target_similarity_heatmap", "hist", 0.45),
+        ("target_similarity_raw_heatmap", "raw", 0.45),
+        ("target_similarity_gt_heatmap", "gt", 0.35),
+    ]
+    for pred_key, name, alpha in map_specs:
+        if pred_key not in pred:
+            continue
+        map_2d = _tensor_map_2d(pred[pred_key])
+        vis_u8 = _normalize_map_u8(map_2d)
+        resized = cv2.resize(vis_u8, (w, h), interpolation=cv2.INTER_LINEAR)
+        heat_path = out_dir / f"frame_{frame_idx:05d}_{name}.png"
+        cv2.imwrite(str(heat_path), resized)
+        relpaths[f"{name}_heatmap"] = heat_path.name
+
+        colored_bgr = cv2.applyColorMap(resized, cv2.COLORMAP_VIRIDIS)
+        colored_rgb = cv2.cvtColor(colored_bgr, cv2.COLOR_BGR2RGB)
+        overlay_rgb = cv2.addWeighted(rgb_u8, 1.0 - float(alpha), colored_rgb, float(alpha), 0.0)
+        _draw_crosshair(overlay_rgb, pred.get("target_similarity_center"), (255, 64, 64), "pred")
+        _draw_crosshair(
+            overlay_rgb,
+            gt_center_xy if gt_center_xy is not None else pred.get("target_similarity_gt_center"),
+            (64, 255, 96),
+            "gt",
+        )
+        overlay_path = out_dir / f"frame_{frame_idx:05d}_{name}_overlay.png"
+        cv2.imwrite(str(overlay_path), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
+        relpaths[f"{name}_overlay"] = overlay_path.name
+
+    centers_rgb = rgb_u8.copy()
+    pred_center_norm = _draw_crosshair(centers_rgb, pred.get("target_similarity_center"), (255, 64, 64), "pred")
+    gt_center_norm = _draw_crosshair(
+        centers_rgb,
+        gt_center_xy if gt_center_xy is not None else pred.get("target_similarity_gt_center"),
+        (64, 255, 96),
+        "gt",
+    )
+    centers_path = out_dir / f"frame_{frame_idx:05d}_centers.png"
+    cv2.imwrite(str(centers_path), cv2.cvtColor(centers_rgb, cv2.COLOR_RGB2BGR))
+    relpaths["centers_overlay"] = centers_path.name
+    if pred_center_norm is not None:
+        relpaths["pred_center_xy"] = list(pred_center_norm)
+    if gt_center_norm is not None:
+        relpaths["gt_center_xy"] = list(gt_center_norm)
+    if gt_visible is not None:
+        relpaths["gt_visible"] = bool(gt_visible)
+    elif "target_similarity_visible" in pred:
+        visible = pred["target_similarity_visible"].detach().float().reshape(-1).cpu()
+        if visible.numel() > 0:
+            relpaths["gt_visible"] = bool(visible[0].item() > 0.5)
+    return relpaths
+
+
+def save_target_crop(
+    out_dir: Path,
+    rgb: np.ndarray,
+    center_xy: Any,
+    frame_idx: int,
+    crop_frac: float = 0.16,
+) -> Optional[Dict[str, Any]]:
+    import cv2
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rgb_u8 = np.asarray(rgb, dtype=np.uint8)
+    h, w = rgb_u8.shape[:2]
+    pt = _center_to_pixel(center_xy, w, h)
+    if pt is None:
+        return None
+    cx, cy = pt
+    side = max(int(round(min(h, w) * max(float(crop_frac), 0.02))), 8)
+    half = side // 2
+    x1 = max(cx - half, 0)
+    y1 = max(cy - half, 0)
+    x2 = min(x1 + side, w)
+    y2 = min(y1 + side, h)
+    x1 = max(x2 - side, 0)
+    y1 = max(y2 - side, 0)
+    crop = rgb_u8[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    crop_path = out_dir / f"frame_{frame_idx:05d}_target_crop.png"
+    cv2.imwrite(str(crop_path), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+
+    marked = rgb_u8.copy()
+    cv2.rectangle(marked, (x1, y1), (max(x2 - 1, x1), max(y2 - 1, y1)), (96, 255, 96), 2, lineType=cv2.LINE_AA)
+    cv2.drawMarker(marked, (cx, cy), (96, 255, 96), markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2, line_type=cv2.LINE_AA)
+    marked_path = out_dir / f"frame_{frame_idx:05d}_target_crop_box.png"
+    cv2.imwrite(str(marked_path), cv2.cvtColor(marked, cv2.COLOR_RGB2BGR))
+    return {
+        "crop": crop_path.name,
+        "crop_box_overlay": marked_path.name,
+        "center_xy": [float(cx) / max(w - 1, 1), float(cy) / max(h - 1, 1)],
+        "box_xyxy": [int(x1), int(y1), int(x2), int(y2)],
+    }
+
+
+def save_object_projection_debug(
+    out_dir: Path,
+    rgb: np.ndarray,
+    frame_idx: int,
+    projections: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+    import cv2
+
+    if not projections:
+        return None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    image = np.asarray(rgb, dtype=np.uint8).copy()
+    h, w = image.shape[:2]
+    colors = {
+        "target": (64, 255, 96),
+        "jammer_1": (255, 80, 80),
+        "jammer_2": (255, 210, 80),
+        "jammer_3": (80, 180, 255),
+        "jammer_4": (255, 80, 220),
+        "jammer_5": (180, 255, 80),
+    }
+
+    for label, item in projections.items():
+        center_xy = item.get("center_xy") if isinstance(item, dict) else None
+        if center_xy is None:
+            continue
+        color = colors.get(str(label), (240, 240, 240))
+        pt = _center_to_pixel(center_xy, w, h)
+        if pt is None:
+            continue
+        x, y = pt
+        is_visible = bool(item.get("visible", False)) if isinstance(item, dict) else False
+        marker = cv2.MARKER_CROSS if is_visible else cv2.MARKER_TILTED_CROSS
+        cv2.drawMarker(
+            image,
+            (x, y),
+            color,
+            markerType=marker,
+            markerSize=18,
+            thickness=2,
+            line_type=cv2.LINE_AA,
+        )
+        cv2.circle(image, (x, y), 7, color, 2, lineType=cv2.LINE_AA)
+        text = str(label)
+        if not is_visible:
+            text += " off"
+        cv2.putText(
+            image,
+            text,
+            (min(x + 8, max(w - 90, 0)), max(y - 8, 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    path = out_dir / f"frame_{frame_idx:05d}_objects.png"
+    cv2.imwrite(str(path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    return path.name
+
+
+def save_predicted_action_trajectory_overlay(
+    out_dir: Path,
+    rgb: np.ndarray,
+    frame_idx: int,
+    start_state: Dict[str, Any],
+    trajectory_states: Sequence[Dict[str, Any]],
+    executor,
+    camera_meta: Optional[Dict[str, Any]],
+    camera_offset_body: Sequence[float],
+    fov_deg: float,
+    action_sequence_physical: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    import cv2
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    image = np.asarray(rgb, dtype=np.uint8).copy()
+    h, w = image.shape[:2]
+    line_thickness = max(5, min(h, w) // 42)
+    image_scale = float(min(h, w)) / 640.0
+    forward_px_per_meter = max(4.0, 12.0 * image_scale)
+    lateral_px_per_meter = max(6.0, 22.0 * image_scale)
+    vertical_px_per_meter = max(6.0, 22.0 * image_scale)
+
+    def _trajectory_color(step_index: int, total_steps: int) -> Tuple[int, int, int]:
+        if total_steps <= 1:
+            t = 0.0
+        else:
+            t = float(np.clip((step_index - 1) / max(total_steps - 1, 1), 0.0, 1.0))
+        dark = np.asarray([0, 42, 220], dtype=np.float32)
+        light = np.asarray([120, 210, 255], dtype=np.float32)
+        color = (1.0 - t) * dark + t * light
+        return tuple(int(x) for x in np.clip(color, 0, 255))
+
+    projected: List[Dict[str, Any]] = []
+    projected_pixels: List[Tuple[Optional[Tuple[int, int]], bool]] = []
+    for idx, state in enumerate(trajectory_states, start=1):
+        pos = np.asarray(state.get("position"), dtype=np.float32).reshape(3)
+        rel_camera_body = compute_camera_relative_body(
+            executor,
+            start_state,
+            pos,
+            camera_meta=camera_meta,
+            camera_offset_body=camera_offset_body,
+        )
+        center_xy, visible = project_target_center_for_rgb(
+            rel_camera_body,
+            image,
+            fov_deg=fov_deg,
+        )
+        pt = _center_to_pixel(center_xy, w, h)
+        item = {
+            "index": int(idx),
+            "position": _airsim_xyz_to_dataset(pos),
+            "relative_camera_body": rel_camera_body.astype(float).tolist(),
+            "center_xy": None if center_xy is None else center_xy.astype(float).tolist(),
+            "pixel_xy": None if pt is None else [int(pt[0]), int(pt[1])],
+            "visible": bool(visible),
+        }
+        projected.append(item)
+        projected_pixels.append((pt, bool(visible)))
+
+    visible_segments: List[List[Tuple[int, Tuple[int, int]]]] = []
+    current_segment: List[Tuple[int, Tuple[int, int]]] = []
+    action_sequence_arr = None
+    if action_sequence_physical is not None:
+        action_sequence_arr = np.asarray(action_sequence_physical, dtype=np.float32)
+        if action_sequence_arr.ndim == 1:
+            action_sequence_arr = action_sequence_arr.reshape(1, -1)
+        if action_sequence_arr.ndim > 2:
+            action_sequence_arr = action_sequence_arr.reshape(-1, action_sequence_arr.shape[-1])
+        if action_sequence_arr.shape[-1] != 4:
+            action_sequence_arr = None
+
+    visualization_mode = "projected_3d"
+    if action_sequence_arr is not None and len(action_sequence_arr) > 0:
+        visualization_mode = "body_forward_to_rgb_length"
+        n = min(len(action_sequence_arr), max(len(projected), 1))
+        actions_xyz = np.asarray(action_sequence_arr[:n, :3], dtype=np.float32)
+        cumulative_body = np.cumsum(actions_xyz, axis=0)
+        deltas_px = np.stack(
+            [
+                cumulative_body[:, 1] * lateral_px_per_meter,
+                -cumulative_body[:, 0] * forward_px_per_meter + cumulative_body[:, 2] * vertical_px_per_meter,
+            ],
+            axis=1,
+        )
+
+        bottom_margin = float(max(line_thickness + 2, int(round(12.0 * image_scale))))
+        origin = np.asarray(
+            [
+                float(w - 1) * 0.5,
+                max(0.0, float(h - 1) - bottom_margin),
+            ],
+            dtype=np.float32,
+        )
+        points = origin.reshape(1, 2) + deltas_px
+        current_segment = [(0, (int(round(origin[0])), int(round(origin[1]))))]
+        for idx, pt_arr in enumerate(points, start=1):
+            current_segment.append((idx, (int(round(pt_arr[0])), int(round(pt_arr[1])))))
+        visible_segments.append(current_segment)
+    else:
+        current_segment = []
+        for idx, (pt, visible) in enumerate(projected_pixels, start=1):
+            if pt is None:
+                if current_segment:
+                    visible_segments.append(current_segment)
+                    current_segment = []
+                continue
+            if visible:
+                current_segment.append((idx, pt))
+            else:
+                if current_segment:
+                    visible_segments.append(current_segment)
+                    current_segment = []
+    if current_segment:
+        visible_segments.append(current_segment)
+
+    draw_segments: List[Tuple[int, Tuple[int, int], Tuple[int, int]]] = []
+    draw_points: List[Tuple[int, Tuple[int, int]]] = []
+    for segment in visible_segments:
+        if len(segment) >= 2:
+            for (idx0, p0), (idx1, p1) in zip(segment[:-1], segment[1:]):
+                del idx1
+                draw_segments.append((idx0, p0, p1))
+        elif len(segment) == 1:
+            idx0, p0 = segment[0]
+            draw_points.append((idx0, p0))
+
+    for idx0, p0, p1 in reversed(draw_segments):
+        cv2.line(
+            image,
+            p0,
+            p1,
+            _trajectory_color(idx0, len(projected)),
+            line_thickness,
+            lineType=cv2.LINE_AA,
+        )
+    for idx0, p0 in reversed(draw_points):
+        cv2.circle(
+            image,
+            p0,
+            max(3, line_thickness // 2),
+            _trajectory_color(idx0, len(projected)),
+            -1,
+            lineType=cv2.LINE_AA,
+        )
+
+    path = out_dir / f"frame_{frame_idx:05d}_action_traj.png"
+    cv2.imwrite(str(path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    origin_pixel = current_segment[0][1] if visualization_mode == "body_forward_to_rgb_length" and current_segment else None
+    return {
+        "overlay": path.name,
+        "points": projected,
+        "num_points": int(len(projected)),
+        "num_visible_points": int(sum(1 for item in projected if bool(item.get("visible", False)))),
+        "visualization_mode": visualization_mode,
+        "overlay_origin": "bottom_center",
+        "overlay_origin_pixel": None if origin_pixel is None else [int(origin_pixel[0]), int(origin_pixel[1])],
+        "forward_px_per_meter": float(forward_px_per_meter),
+        "lateral_px_per_meter": float(lateral_px_per_meter),
+        "vertical_px_per_meter": float(vertical_px_per_meter),
+    }
+
+
+def project_objects_for_rgb(
+    executor,
+    uav_state: Dict[str, Any],
+    rgb: np.ndarray,
+    target_pos_airsim: np.ndarray,
+    jammer_positions_airsim: Dict[str, np.ndarray],
+    fov_deg: float,
+    camera_meta: Optional[Dict[str, Any]] = None,
+    camera_offset_body: Sequence[float] = (0.46, 0.0, 0.0),
+) -> Dict[str, Dict[str, Any]]:
+    objects: Dict[str, np.ndarray] = {"target": np.asarray(target_pos_airsim, dtype=np.float32)}
+    for did, pos in sorted(jammer_positions_airsim.items(), key=lambda x: str(x[0])):
+        objects[f"jammer_{did}"] = np.asarray(pos, dtype=np.float32)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for label, pos in objects.items():
+        rel = compute_target_relative_body(executor, uav_state, pos)
+        rel_camera = compute_camera_relative_body(executor, uav_state, pos, camera_meta, camera_offset_body)
+        center_xy, visible = project_target_center_for_rgb(rel_camera, rgb, fov_deg=fov_deg)
+        out[label] = {
+            "center_xy": None if center_xy is None else center_xy.astype(float).tolist(),
+            "visible": bool(visible),
+            "relative_body": rel.astype(float).tolist(),
+            "relative_camera_body": rel_camera.astype(float).tolist(),
+            "position": _airsim_xyz_to_dataset(pos),
+        }
+    return out
+
+
+def compute_camera_relative_body(
+    executor,
+    uav_state: Dict[str, Any],
+    target_pos_airsim: np.ndarray,
+    camera_meta: Optional[Dict[str, Any]] = None,
+    camera_offset_body: Sequence[float] = (0.46, 0.0, 0.0),
+) -> np.ndarray:
+    """Return target vector in camera body frame for pixel projection."""
+    camera_pos_airsim = None
+    camera_quat = None
+    if isinstance(camera_meta, dict):
+        camera_pos_airsim = _xyz_from_any(camera_meta.get("camera_position_airsim"))
+        camera_quat = _quat_wxyz_from_any(camera_meta.get("camera_orientation"))
+    if camera_pos_airsim is not None and camera_quat is not None:
+        target_dataset = np.asarray(
+            [target_pos_airsim[0], target_pos_airsim[1], -target_pos_airsim[2]],
+            dtype=np.float32,
+        )
+        camera_dataset = np.asarray(
+            [camera_pos_airsim[0], camera_pos_airsim[1], -camera_pos_airsim[2]],
+            dtype=np.float32,
+        )
+        rel_dataset = target_dataset - camera_dataset
+        rel_body = executor._world_to_body_frame(
+            rel_dataset,
+            float(camera_quat[0]),
+            float(camera_quat[1]),
+            float(camera_quat[2]),
+            float(camera_quat[3]),
+        )
+        return np.asarray(rel_body, dtype=np.float32)
+
+    rel_body = compute_target_relative_body(executor, uav_state, target_pos_airsim)
+    offset = np.asarray(list(camera_offset_body)[:3], dtype=np.float32)
+    if offset.size < 3:
+        offset = np.pad(offset, (0, 3 - offset.size), mode="constant")
+    return rel_body - offset.reshape(3)
+
+
+def project_target_center_for_rgb(
+    rel_body: np.ndarray,
+    rgb: np.ndarray,
+    fov_deg: float,
+    camera_offset_body: Optional[Sequence[float]] = None,
+) -> Tuple[Optional[np.ndarray], bool]:
+    arr = np.asarray(rel_body, dtype=np.float32).reshape(-1)
+    if arr.size < 3:
+        return None, False
+    h, w = np.asarray(rgb).shape[:2]
+    rel_t = torch.from_numpy(arr[:3]).view(1, 3)
+    center, visible = project_body_to_image(
+        rel_t,
+        (int(h), int(w)),
+        fov_deg=float(fov_deg),
+        camera_offset_body=camera_offset_body,
+    )
+    center_np = center.detach().float().cpu().reshape(-1).numpy()
+    visible_bool = bool(visible.detach().float().reshape(-1)[0].item() > 0.5)
+    return center_np.astype(np.float32), visible_bool
+
+
 def save_predicted_video_frames(out_dir: Path, frames: torch.Tensor) -> List[str]:
     import cv2
 
@@ -1201,11 +2447,29 @@ def save_predicted_video_frames(out_dir: Path, frames: torch.Tensor) -> List[str
     if arr.ndim != 4 or arr.shape[-1] != 3:
         raise ValueError(f"expected predicted frames [T,H,W,3], got shape {arr.shape}")
     rel_names: List[str] = []
+    montage_frames: List[np.ndarray] = []
     for idx, frame in enumerate(arr):
         frame_u8 = np.asarray(frame, dtype=np.uint8)
         path = out_dir / f"pred_{idx:03d}.png"
         cv2.imwrite(str(path), cv2.cvtColor(frame_u8, cv2.COLOR_RGB2BGR))
         rel_names.append(path.name)
+        panel = frame_u8.copy()
+        cv2.putText(
+            panel,
+            f"t+{idx}",
+            (6, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        montage_frames.append(panel)
+    if montage_frames:
+        montage = np.concatenate(montage_frames, axis=1)
+        montage_path = out_dir / "montage.png"
+        cv2.imwrite(str(montage_path), cv2.cvtColor(montage, cv2.COLOR_RGB2BGR))
+        rel_names.append(montage_path.name)
     return rel_names
 
 
@@ -1401,24 +2665,56 @@ def run_online_trajectory(
     traj: OnlineTrajectory,
     args: argparse.Namespace,
     device: torch.device,
+    camera_cache: Optional[AsyncCameraCache] = None,
 ) -> Dict[str, Any]:
     out_dir = Path(args.output_dir) / traj.scene_id / traj.trajectory_name
     rgb_out_dir = out_dir / "rgb"
     attention_map_dir = out_dir / "last_transformer_attention_maps"
     predicted_video_dir = out_dir / "predicted_video"
+    predicted_action_trajectory_dir = out_dir / "predicted_action_trajectories"
+    target_similarity_dir = out_dir / "target_similarity_maps"
+    target_crop_dir = out_dir / "target_crops"
+    object_projection_debug_dir = out_dir / "object_projection_debug"
     out_dir.mkdir(parents=True, exist_ok=True)
+    save_rgb_assets = bool(args.save_rgb)
     save_visual_assets = _visualization_enabled_for_trajectory(args, traj)
-    if args.save_rgb and save_visual_assets:
+    if save_rgb_assets:
         rgb_out_dir.mkdir(parents=True, exist_ok=True)
     save_transformer_attention_maps_enabled = bool(save_visual_assets and args.save_transformer_attention_maps)
     save_predicted_video_enabled = bool(save_visual_assets and args.save_predicted_video)
+    save_predicted_action_trajectories_enabled = bool(
+        save_visual_assets and bool(getattr(args, "save_predicted_action_trajectories", False))
+    )
+    save_target_similarity_maps_enabled = bool(
+        save_visual_assets
+        and bool(getattr(args, "save_target_similarity_maps", False))
+        and bool(getattr(cfg, "use_target_similarity_guidance", False))
+    )
     if save_transformer_attention_maps_enabled:
         attention_map_dir.mkdir(parents=True, exist_ok=True)
     if save_predicted_video_enabled:
         predicted_video_dir.mkdir(parents=True, exist_ok=True)
+    if save_predicted_action_trajectories_enabled:
+        predicted_action_trajectory_dir.mkdir(parents=True, exist_ok=True)
+    if save_target_similarity_maps_enabled:
+        target_similarity_dir.mkdir(parents=True, exist_ok=True)
+        target_crop_dir.mkdir(parents=True, exist_ok=True)
+        object_projection_debug_dir.mkdir(parents=True, exist_ok=True)
 
     _set_saved_assets_for_trajectory(executor, traj, args)
     _prepare_objects(executor, traj, args)
+    target_object_name = str(getattr(executor, "target_object_name", ""))
+    target_asset_name = str(getattr(executor, "target_asset_name", ""))
+    jammer_object_names = dict(getattr(executor, "_jammer_object_names_by_id", {}) or {})
+    jammer_asset_names = dict(getattr(executor, "_jammer_asset_names_by_id", {}) or {})
+    direct_set_camera_pose = bool(getattr(args, "direct_set_camera_pose", False))
+    direct_camera_external = bool(getattr(args, "direct_camera_external", True))
+    disable_camera_physics_refresh = bool(getattr(args, "disable_camera_physics_refresh", False)) or direct_set_camera_pose
+    camera_offset_body = tuple(float(v) for v in getattr(args, "camera_offset_body", (0.46, 0.0, 0.0)))
+    effective_camera_pose_refresh_frames = 0 if disable_camera_physics_refresh else max(
+        int(getattr(args, "camera_pose_refresh_frames", 1) or 0),
+        0,
+    )
 
     # Initialize from the already collected Dataset trajectory, not from Plandataset.
     executor._initialize_simulation(
@@ -1432,24 +2728,64 @@ def run_online_trajectory(
         executor.client.armDisarm(True, vehicle_name=executor.uav_vehicle_name)
     except Exception:
         pass
-    executor._ensure_uav_flying_state()
-    init_yaw = math.atan2(
-        float(traj.target_traj_airsim[0][1] - traj.uav_start_airsim[1]),
-        float(traj.target_traj_airsim[0][0] - traj.uav_start_airsim[0]),
-    )
-    set_vehicle_pose_static(
+    # `TrajectoryExecutor._initialize_simulation()` faces the UAV toward the
+    # target. For replaying collected Dataset frames, reuse the saved camera
+    # orientation instead; otherwise frame-0 target/jammer projections can shift
+    # enough to crop the wrong UAV.
+    if traj.uav_start_quat_wxyz is not None:
+        init_quat = _wxyz_quat_to_airsim_quat(traj.uav_start_quat_wxyz)
+    else:
+        init_yaw = math.atan2(
+            float(traj.target_traj_airsim[0][1] - traj.uav_start_airsim[1]),
+            float(traj.target_traj_airsim[0][0] - traj.uav_start_airsim[0]),
+        )
+        init_quat = _yaw_to_airsim_quat(init_yaw)
+    initial_uav_state = set_vehicle_pose_static(
         executor,
         traj.uav_start_airsim,
-        _yaw_to_airsim_quat(init_yaw),
+        init_quat,
         retries=3,
         tol_xy=0.8,
         tol_z=0.8,
     )
+    forced_target_spawn_ok = False
+    try:
+        forced_target_spawn_ok = bool(
+            executor.spawn_target_object(
+                float(traj.target_traj_airsim[0][0]),
+                float(traj.target_traj_airsim[0][1]),
+                float(traj.target_traj_airsim[0][2]),
+            )
+        )
+        executor.move_target_object(traj.target_traj_airsim[0])
+    except Exception as exc:
+        print(f"[warn] forced target spawn failed for {traj.scene_id}/{traj.trajectory_name}: {exc}")
+    # Object spawning may internally advance physics frames. Re-pin the UAV
+    # before the first camera read so frame 0 matches the dataset pose.
+    try:
+        initial_uav_state, _ = set_vehicle_pose_and_refresh_camera(
+            executor,
+            traj.uav_start_airsim,
+            init_quat,
+            refresh_frames=effective_camera_pose_refresh_frames,
+            retries=3,
+            tol_xy=0.8,
+            tol_z=0.8,
+        )
+    except Exception as exc:
+        print(f"[warn] failed to re-hold UAV after target spawn for {traj.scene_id}/{traj.trajectory_name}: {exc}")
+    forced_target_scene_exists = _scene_object_exists(executor, target_object_name)
 
     num_steps = traj.num_frames if args.max_steps <= 0 else min(traj.num_frames, args.max_steps)
     rssm_state = None
     prev_action = torch.zeros(1, cfg.action_dim, device=device, dtype=torch.float32)
     prev_done = torch.zeros(1, device=device, dtype=torch.float32)
+    if hasattr(model, "reset_target_similarity_memory"):
+        model.reset_target_similarity_memory()
+    logical_uav_state: Optional[Dict[str, Any]] = (
+        _copy_uav_state(initial_uav_state) if args.control_mode == "pose" else None
+    )
+    camera_hold_state: Optional[Dict[str, Any]] = _copy_uav_state(initial_uav_state)
 
     steps: List[Dict[str, Any]] = []
     distances: List[float] = []
@@ -1461,14 +2797,25 @@ def run_online_trajectory(
     action_mse: List[float] = []
     prev_uav_after_pos: Optional[np.ndarray] = None
     prev_uav_after_state: Optional[Dict[str, Any]] = None
+    profile_step_time = bool(getattr(args, "profile_step_time", False))
+    profile_step_time_interval = max(int(getattr(args, "profile_step_time_interval", 20) or 20), 1)
+    step_time_records: List[Dict[str, float]] = []
 
     iterator: Iterable[int] = range(num_steps)
     if tqdm is not None:
         iterator = tqdm(iterator, desc=f"online {traj.scene_id}/{traj.trajectory_name}", unit="step", dynamic_ncols=True)
 
     for t in iterator:
+        step_profile: Optional[Dict[str, float]] = {} if profile_step_time else None
+        step_start_time = time.perf_counter() if profile_step_time else 0.0
+        section_start_time = step_start_time
+        scene_update_start_time = section_start_time
         target_t = traj.target_traj_airsim[t]
         executor.move_target_object(target_t)
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["target_move"] = now - section_start_time
+            section_start_time = now
         jammer_positions_now: Dict[str, np.ndarray] = {}
         if traj.jammer_trajs_airsim:
             for did, series in traj.jammer_trajs_airsim.items():
@@ -1483,29 +2830,63 @@ def run_online_trajectory(
                         jammer_positions_now[str(did)] = pos
                 except Exception:
                     pass
-        executor._step_if_needed(1)
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["jammer_move"] = now - section_start_time
+            section_start_time = now
+        scene_update_frames = max(int(getattr(args, "scene_update_frames", 0) or 0), 0)
+        if scene_update_frames > 0:
+            executor._step_if_needed(scene_update_frames)
+        camera_ready_after = time.perf_counter()
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["frame_step"] = now - section_start_time
+            section_start_time = now
 
         # In pose-control evaluation, target/jammer scene stepping can let the
         # multirotor physics update the UAV before we apply the next action.
         # Keep the UAV exactly at the previous controlled pose so expert replay
         # is a check of action/coordinate consistency, not free-fall dynamics.
-        if (
-            args.control_mode == "pose"
-            and args.hold_uav_pose_during_scene_step
-            and prev_uav_after_state is not None
-        ):
-            prev_pos = np.asarray(prev_uav_after_state["position"], dtype=np.float32)
-            prev_quat = _wxyz_quat_to_airsim_quat(prev_uav_after_state["orientation"])
-            set_vehicle_pose_static(
+        pose_correction_before_camera = None
+        uav_drift_state_before_camera_hold = None
+        uav_held_state_before_camera = None
+        uav_camera_refresh_drift_before_camera = None
+        if args.control_mode == "pose" and args.hold_uav_pose_during_scene_step and camera_hold_state is not None:
+            drift_state = executor.get_uav_state()
+            uav_drift_state_before_camera_hold = drift_state
+            drift_pos = np.asarray(drift_state["position"], dtype=np.float32)
+            hold_pos = np.asarray(camera_hold_state["position"], dtype=np.float32)
+            correction = hold_pos - drift_pos
+            hold_quat = _wxyz_quat_to_airsim_quat(camera_hold_state["orientation"])
+            held_state, refresh_delta = set_vehicle_pose_and_refresh_camera(
                 executor,
-                prev_pos,
-                prev_quat,
+                hold_pos,
+                hold_quat,
+                refresh_frames=effective_camera_pose_refresh_frames,
                 retries=1,
                 tol_xy=0.8,
                 tol_z=0.8,
             )
+            if refresh_delta is not None:
+                uav_camera_refresh_drift_before_camera = refresh_delta.astype(np.float32)
+            camera_ready_after = time.perf_counter()
+            pose_correction_before_camera = correction.astype(np.float32)
+            uav_held_state_before_camera = held_state
+            camera_hold_state = _copy_uav_state(held_state)
+            logical_uav_state = _copy_uav_state(held_state)
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["hold_uav_pose"] = now - section_start_time
+            step_profile["scene_update"] = now - scene_update_start_time
+            section_start_time = now
 
-        uav_state_before = executor.get_uav_state()
+        if args.control_mode == "pose" and logical_uav_state is None:
+            logical_uav_state = _copy_uav_state(executor.get_uav_state())
+        uav_state_before = (
+            _copy_uav_state(logical_uav_state)
+            if args.control_mode == "pose" and logical_uav_state is not None
+            else _copy_uav_state(executor.get_uav_state())
+        )
         uav_before_pos = np.asarray(uav_state_before["position"], dtype=np.float32)
         pose_jump_dataset = None
         pose_jump_norm = None
@@ -1555,12 +2936,139 @@ def run_online_trajectory(
             instruction = traj.saved_instructions[0]
         else:
             instruction = instruction_from_relative(rel_body, next_rel_body)
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["state_and_instruction"] = now - section_start_time
+            section_start_time = now
 
-        rgb_img, _ = executor.get_camera_images()
+        camera_start_time = section_start_time
+        async_camera_meta = None
+        camera_meta: Optional[Dict[str, Any]] = None
+        async_camera_pose_error = None
+        async_camera_pose_fallback = False
+        direct_camera_pose_meta = None
+        direct_camera_pose_sequence = None
+        force_sync_camera = bool(
+            (not direct_set_camera_pose)
+            and getattr(args, "sync_first_camera_frame", True)
+            and t == 0
+        )
+        if direct_set_camera_pose and camera_cache is not None:
+            direct_camera_pose_sequence = camera_cache.update_direct_pose(
+                uav_state_before,
+                camera_offset_body,
+            )
+            try:
+                async_camera_mode = str(getattr(args, "async_camera_mode", "fresh")).lower()
+                min_capture_start = None
+                min_direct_pose_sequence = None
+                require_current_direct_pose = async_camera_mode == "fresh" or t == 0
+                if require_current_direct_pose:
+                    min_capture_start = camera_ready_after
+                    min_direct_pose_sequence = direct_camera_pose_sequence
+                rgb_img, _, async_camera_meta = camera_cache.get_latest(
+                    min_capture_start=min_capture_start,
+                    min_direct_pose_sequence=min_direct_pose_sequence,
+                    timeout=float(getattr(args, "async_camera_wait_timeout", 5.0)),
+                )
+                camera_meta = async_camera_meta
+                async_camera_pose_error = _camera_meta_position_error(
+                    camera_meta,
+                    uav_state_before,
+                    camera_offset_body,
+                )
+                if (
+                    require_current_direct_pose
+                    and async_camera_pose_error is not None
+                    and async_camera_pose_error > 1.0
+                ):
+                    async_camera_pose_fallback = True
+                    direct_camera_pose_meta = set_direct_camera_pose(
+                        executor,
+                        uav_state_before,
+                        camera_offset_body,
+                        external=direct_camera_external,
+                    )
+                    rgb_img, _, camera_meta = capture_camera_images_with_meta(
+                        executor,
+                        direct_camera_pose_meta=direct_camera_pose_meta,
+                        external_camera=direct_camera_external,
+                    )
+            except Exception as exc:
+                print(f"[direct-camera] async fallback to sync simGetImages: {exc}")
+                direct_camera_pose_meta = set_direct_camera_pose(
+                    executor,
+                    uav_state_before,
+                    camera_offset_body,
+                    external=direct_camera_external,
+                )
+                rgb_img, _, camera_meta = capture_camera_images_with_meta(
+                    executor,
+                    direct_camera_pose_meta=direct_camera_pose_meta,
+                    external_camera=direct_camera_external,
+                )
+        elif direct_set_camera_pose:
+            direct_camera_pose_meta = set_direct_camera_pose(
+                executor,
+                uav_state_before,
+                camera_offset_body,
+                external=direct_camera_external,
+            )
+            rgb_img, _, camera_meta = capture_camera_images_with_meta(
+                executor,
+                direct_camera_pose_meta=direct_camera_pose_meta,
+                external_camera=direct_camera_external,
+            )
+        elif force_sync_camera:
+            rgb_img, _, camera_meta = capture_camera_images_with_meta(executor)
+        elif camera_cache is not None:
+            try:
+                min_capture_start = None
+                if str(getattr(args, "async_camera_mode", "fresh")).lower() == "fresh":
+                    min_capture_start = camera_ready_after
+                rgb_img, _, async_camera_meta = camera_cache.get_latest(
+                    min_capture_start=min_capture_start,
+                    timeout=float(getattr(args, "async_camera_wait_timeout", 5.0)),
+                )
+                camera_meta = async_camera_meta
+                async_camera_pose_error = _camera_meta_position_error(
+                    camera_meta,
+                    uav_state_before,
+                    camera_offset_body,
+                )
+                if async_camera_pose_error is not None and async_camera_pose_error > 9999.0:
+                    async_camera_pose_fallback = True
+                    rgb_img, _, camera_meta = capture_camera_images_with_meta(executor)
+            except Exception as exc:
+                print(f"[async-camera] fallback to sync get_camera_images: {exc}")
+                rgb_img, _, camera_meta = capture_camera_images_with_meta(executor)
+        else:
+            rgb_img, _, camera_meta = capture_camera_images_with_meta(executor)
         if rgb_img is None:
             raise RuntimeError(f"failed to capture RGB at step {t}")
-        if args.save_rgb and save_visual_assets:
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["camera_capture"] = now - section_start_time
+            if async_camera_meta is not None:
+                step_profile["async_camera_request"] = float(async_camera_meta.get("request_duration", 0.0))
+            section_start_time = now
+        if save_rgb_assets:
             save_rgb(rgb_out_dir / f"frame_{t:05d}.png", rgb_img)
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["rgb_save"] = now - section_start_time
+            step_profile["camera_and_rgb_save"] = now - camera_start_time
+            section_start_time = now
+
+        if args.control_mode == "pose" and camera_hold_state is not None:
+            set_vehicle_pose_static(
+                executor,
+                np.asarray(camera_hold_state["position"], dtype=np.float32),
+                _wxyz_quat_to_airsim_quat(camera_hold_state["orientation"]),
+                retries=1,
+                tol_xy=0.8,
+                tol_z=0.8,
+            )
 
         dataset_expert_action = traj.expert_action_physical[t] if t < len(traj.expert_action_physical) else None
         target_next_for_expert = traj.target_traj_airsim[t + 1] if t + 1 < len(traj.target_traj_airsim) else target_now
@@ -1582,6 +3090,17 @@ def run_online_trajectory(
         pred = None
         attention_map_relpath = None
         predicted_video_relpaths = None
+        target_similarity_relpaths = None
+        target_crop_relpaths = None
+        object_projection_relpath = None
+        object_projections = None
+        predicted_action_trajectory_relpaths = None
+        action_sequence_norm_record = None
+        action_sequence_physical_record = None
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["expert_action"] = now - section_start_time
+            section_start_time = now
 
         if args.replay_expert_action:
             if expert_action is None:
@@ -1599,6 +3118,11 @@ def run_online_trajectory(
                 text_tokens, attention_mask = tokenize_instruction(tokenizer, instruction, cfg.text_context_length, device)
             target_relative_np = rel_body / max(float(args.target_relative_scale), 1e-6)
             target_relative_t = torch.from_numpy(target_relative_np.astype(np.float32)).view(1, -1).to(device)
+            if step_profile is not None:
+                _sync_cuda_for_profile(device)
+                now = time.perf_counter()
+                step_profile["preprocess"] = now - section_start_time
+                section_start_time = now
 
             pred, rssm_state = model.act(
                 image=image_t,
@@ -1615,6 +3139,11 @@ def run_online_trajectory(
                 save_predicted_video=save_predicted_video_enabled,
                 predicted_video_latent_frames=args.predicted_video_latent_frames,
             )
+            if step_profile is not None:
+                _sync_cuda_for_profile(device)
+                now = time.perf_counter()
+                step_profile["model_act"] = now - section_start_time
+                section_start_time = now
             if save_transformer_attention_maps_enabled and "last_transformer_attention_map" in pred:
                 attention_map_path = attention_map_dir / f"frame_{t:05d}"
                 save_attention_map_overlay(attention_map_path, rgb_img, pred["last_transformer_attention_map"])
@@ -1626,13 +3155,135 @@ def run_online_trajectory(
                 predicted_video_relpaths = [
                     str((pred_frame_dir / name).relative_to(out_dir)) for name in pred_frame_names
                 ]
+            if save_target_similarity_maps_enabled and "target_similarity_heatmap" in pred:
+                target_similarity_fov = float(getattr(cfg, "target_similarity_fov_deg", args.fov_deg))
+                camera_offset_body = tuple(
+                    float(v)
+                    for v in getattr(cfg, "target_similarity_camera_offset_body", (0.46, 0.0, 0.0))
+                )
+                rel_camera_body = compute_camera_relative_body(
+                    executor,
+                    uav_state_before,
+                    target_now,
+                    camera_meta,
+                    camera_offset_body,
+                )
+                gt_center_xy, gt_visible = project_target_center_for_rgb(
+                    rel_camera_body,
+                    rgb_img,
+                    fov_deg=target_similarity_fov,
+                )
+                object_projections = project_objects_for_rgb(
+                    executor,
+                    uav_state_before,
+                    rgb_img,
+                    target_now,
+                    jammer_positions_now,
+                    fov_deg=target_similarity_fov,
+                    camera_meta=camera_meta,
+                    camera_offset_body=camera_offset_body,
+                )
+                object_projection_name = save_object_projection_debug(
+                    object_projection_debug_dir,
+                    rgb_img,
+                    t,
+                    object_projections,
+                )
+                if object_projection_name is not None:
+                    object_projection_relpath = str(
+                        (object_projection_debug_dir / object_projection_name).relative_to(out_dir)
+                    )
+                sim_rel = save_target_similarity_visuals(
+                    target_similarity_dir,
+                    rgb_img,
+                    pred,
+                    t,
+                    gt_center_xy=gt_center_xy,
+                    gt_visible=gt_visible,
+                )
+                target_similarity_relpaths = {
+                    key: (value if key.endswith("_xy") or key == "gt_visible" else str((target_similarity_dir / value).relative_to(out_dir)))
+                    for key, value in sim_rel.items()
+                }
+                crop_rel = save_target_crop(target_crop_dir, rgb_img, gt_center_xy, t)
+                if crop_rel is not None:
+                    target_crop_relpaths = {
+                        key: (value if key in {"center_xy", "box_xyxy"} else str((target_crop_dir / value).relative_to(out_dir)))
+                        for key, value in crop_rel.items()
+                    }
             action_norm = pred["action_norm"].detach().float().view(-1).cpu().numpy().astype(np.float32)
             action_physical = pred["action_physical"].detach().float().view(-1).cpu().numpy().astype(np.float32)
+            action_sequence_norm_value = pred.get("action_sequence_norm")
+            if action_sequence_norm_value is not None:
+                action_sequence_physical = action_sequence_norm_to_physical(
+                    action_sequence_norm_value,
+                    max_vel=cfg.max_vel,
+                    max_yaw_rate=cfg.max_yaw_rate,
+                    max_speed_norm=cfg.max_speed_norm,
+                )
+                action_sequence_norm_arr = (
+                    action_sequence_norm_value.detach().float().cpu().numpy()
+                    if torch.is_tensor(action_sequence_norm_value)
+                    else np.asarray(action_sequence_norm_value, dtype=np.float32)
+                )
+                if action_sequence_norm_arr.ndim == 3 and action_sequence_norm_arr.shape[0] == 1:
+                    action_sequence_norm_arr = action_sequence_norm_arr[0]
+                elif action_sequence_norm_arr.ndim > 2:
+                    action_sequence_norm_arr = action_sequence_norm_arr.reshape(-1, action_sequence_norm_arr.shape[-1])
+                if action_sequence_norm_arr.ndim == 1:
+                    action_sequence_norm_arr = action_sequence_norm_arr.reshape(1, -1)
+                action_sequence_norm_record = np.asarray(action_sequence_norm_arr, dtype=np.float32).astype(float).tolist()
+            else:
+                action_sequence_physical = action_physical.reshape(1, -1).astype(np.float32)
+                action_sequence_norm_record = action_norm.reshape(1, -1).astype(float).tolist()
+            action_sequence_physical_record = action_sequence_physical.astype(float).tolist()
+            if save_predicted_action_trajectories_enabled:
+                trajectory_states = rollout_action_sequence_states(
+                    uav_state_before,
+                    action_sequence_physical,
+                    max_step_norm=args.max_step_norm,
+                )
+                trajectory_fov = float(getattr(cfg, "target_similarity_fov_deg", args.fov_deg))
+                trajectory_camera_offset_body = tuple(
+                    float(v)
+                    for v in getattr(cfg, "target_similarity_camera_offset_body", (0.46, 0.0, 0.0))
+                )
+                traj_rel = save_predicted_action_trajectory_overlay(
+                    predicted_action_trajectory_dir,
+                    rgb_img,
+                    t,
+                    uav_state_before,
+                    trajectory_states,
+                    executor,
+                    camera_meta,
+                    trajectory_camera_offset_body,
+                    trajectory_fov,
+                    action_sequence_physical=action_sequence_physical,
+                )
+                predicted_action_trajectory_relpaths = {
+                    key: (str((predicted_action_trajectory_dir / value).relative_to(out_dir)) if key == "overlay" else value)
+                    for key, value in traj_rel.items()
+                }
+        if step_profile is not None:
+            _sync_cuda_for_profile(device)
+            now = time.perf_counter()
+            step_profile["visualize_and_tensor_copy"] = now - section_start_time
+            section_start_time = now
 
         if args.control_mode == "velocity":
-            uav_state_after = apply_action_by_velocity(executor, action_physical, args.dt)
+            uav_state_after = apply_action_by_velocity(executor, action_physical)
         else:
-            uav_state_after = apply_action_by_pose(executor, action_physical, args.dt, args.max_step_norm)
+            uav_state_after = apply_action_by_pose(
+                executor,
+                action_physical,
+                args.max_step_norm,
+                start_state=uav_state_before,
+            )
+            logical_uav_state = _copy_uav_state(uav_state_after)
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["apply_action"] = now - section_start_time
+            section_start_time = now
 
         post_rel_body = compute_target_relative_body(executor, uav_state_after, target_now)
         distance = float(np.linalg.norm(post_rel_body))
@@ -1649,6 +3300,10 @@ def run_online_trajectory(
             if collision_info_after_action is not None
             else False
         )
+        if step_profile is not None:
+            now = time.perf_counter()
+            step_profile["post_metrics"] = now - section_start_time
+            section_start_time = now
         collision_now = bool(collision_before_action or collision_after_action)
         collision = bool(collision or collision_now)
         close_enough = bool(distance <= float(args.capture_distance))
@@ -1664,13 +3319,71 @@ def run_online_trajectory(
         step_record = {
             "step": t,
             "instruction": instruction,
+            "uav_orientation_before": _quat_wxyz_to_dict(uav_state_before.get("orientation")),
             "uav_position_before": _airsim_xyz_to_dataset(uav_state_before["position"]),
+            "uav_orientation_after": _quat_wxyz_to_dict(uav_state_after.get("orientation")),
             "uav_position_after": _airsim_xyz_to_dataset(uav_state_after["position"]),
             "uav_pose_jump_from_prev_after": _delta_xyz_to_dict(pose_jump_dataset),
             "uav_pose_jump_norm": pose_jump_norm,
             "uav_pose_jump_z_abs": pose_jump_z_abs,
             "large_pose_jump": bool(large_pose_jump),
+            "uav_pose_correction_before_camera": _delta_xyz_to_dict(
+                None if pose_correction_before_camera is None else np.asarray(
+                    [
+                        pose_correction_before_camera[0],
+                        pose_correction_before_camera[1],
+                        -pose_correction_before_camera[2],
+                    ],
+                    dtype=np.float32,
+                )
+            ),
+            "uav_pose_correction_norm_before_camera": (
+                None if pose_correction_before_camera is None else float(np.linalg.norm(pose_correction_before_camera))
+            ),
+            "uav_pose_correction_z_abs_before_camera": (
+                None if pose_correction_before_camera is None else float(abs(pose_correction_before_camera[2]))
+            ),
+            "uav_camera_refresh_drift_before_camera": _delta_xyz_to_dict(
+                None
+                if uav_camera_refresh_drift_before_camera is None
+                else np.asarray(
+                    [
+                        uav_camera_refresh_drift_before_camera[0],
+                        uav_camera_refresh_drift_before_camera[1],
+                        -uav_camera_refresh_drift_before_camera[2],
+                    ],
+                    dtype=np.float32,
+                )
+            ),
+            "uav_camera_refresh_drift_norm_before_camera": (
+                None
+                if uav_camera_refresh_drift_before_camera is None
+                else float(np.linalg.norm(uav_camera_refresh_drift_before_camera))
+            ),
+            "uav_drift_position_before_camera_hold": (
+                None
+                if uav_drift_state_before_camera_hold is None
+                else _airsim_xyz_to_dataset(uav_drift_state_before_camera_hold.get("position"))
+            ),
+            "uav_drift_orientation_before_camera_hold": (
+                None
+                if uav_drift_state_before_camera_hold is None
+                else _quat_wxyz_to_dict(uav_drift_state_before_camera_hold.get("orientation"))
+            ),
+            "uav_held_position_before_camera": (
+                None
+                if uav_held_state_before_camera is None
+                else _airsim_xyz_to_dataset(uav_held_state_before_camera.get("position"))
+            ),
+            "uav_held_orientation_before_camera": (
+                None
+                if uav_held_state_before_camera is None
+                else _quat_wxyz_to_dict(uav_held_state_before_camera.get("orientation"))
+            ),
             "target_position": _airsim_xyz_to_dataset(target_now),
+            "target_object_name": target_object_name,
+            "target_asset_name": target_asset_name,
+            "target_scene_object_exists": _scene_object_exists(executor, target_object_name),
             "relative_target_body": rel_body.astype(float).tolist(),
             "relative_target_body_after": post_rel_body.astype(float).tolist(),
             "distance_after": distance,
@@ -1680,6 +3393,8 @@ def run_online_trajectory(
             "action_source": action_source,
             "action_norm": action_norm.astype(float).tolist(),
             "action_physical": action_physical.astype(float).tolist(),
+            "action_sequence_norm": action_sequence_norm_record,
+            "action_sequence_physical": action_sequence_physical_record,
             "expert_action_physical": None if expert_action is None else expert_action.astype(float).tolist(),
             "expert_action_norm": None if expert_action_norm is None else expert_action_norm.astype(float).tolist(),
             "expert_action_source": expert_action_source,
@@ -1691,11 +3406,68 @@ def run_online_trajectory(
             "jammers": {
                 str(did): _airsim_xyz_to_dataset(pos) for did, pos in jammer_positions_now.items()
             },
+            "jammer_object_names": {str(k): str(v) for k, v in jammer_object_names.items()},
+            "jammer_asset_names": {str(k): str(v) for k, v in jammer_asset_names.items()},
+            "jammer_scene_object_exists": {
+                str(did): _scene_object_exists(executor, obj_name)
+                for did, obj_name in jammer_object_names.items()
+            },
         }
+        if async_camera_meta is not None:
+            step_record["async_camera"] = {
+                "sequence": int(async_camera_meta.get("sequence", 0)),
+                "request_duration": float(async_camera_meta.get("request_duration", 0.0)),
+                "pose_error": async_camera_pose_error,
+                "pose_fallback": bool(async_camera_pose_fallback),
+            }
+        if camera_meta is not None:
+            step_record["camera_response"] = {
+                key: value
+                for key, value in camera_meta.items()
+                if key
+                in {
+                    "capture_start",
+                    "capture_end",
+                    "request_duration",
+                    "width",
+                    "height",
+                    "time_stamp",
+                    "camera_position",
+                    "camera_position_airsim",
+                    "camera_orientation",
+                    "expected_camera_position",
+                    "expected_camera_position_airsim",
+                    "expected_camera_orientation",
+                    "actual_camera_position",
+                    "actual_camera_position_airsim",
+                    "camera_pose_error",
+                    "direct_set_camera_pose_used",
+                    "direct_camera_external",
+                    "direct_camera_pose_input_position",
+                    "direct_camera_pose_input_orientation",
+                    "direct_pose_sequence",
+                    "camera_offset_body",
+                }
+            }
+        if force_sync_camera:
+            step_record["sync_first_camera_frame"] = True
         if attention_map_relpath is not None:
             step_record["last_transformer_attention_map"] = attention_map_relpath
         if predicted_video_relpaths is not None:
             step_record["predicted_video_frames"] = predicted_video_relpaths
+        if target_similarity_relpaths is not None:
+            step_record["target_similarity_visuals"] = target_similarity_relpaths
+        if target_crop_relpaths is not None:
+            step_record["target_crop"] = target_crop_relpaths
+        if object_projection_relpath is not None:
+            step_record["object_projection_debug"] = object_projection_relpath
+        if object_projections is not None:
+            step_record["object_projections"] = object_projections
+        if predicted_action_trajectory_relpaths is not None:
+            step_record["predicted_action_trajectory"] = predicted_action_trajectory_relpaths
+        if step_profile is not None:
+            step_profile["total"] = time.perf_counter() - step_start_time
+            step_record["time_profile"] = {key: float(value) for key, value in step_profile.items()}
         if pred is not None and "candidate_scores" in pred:
             selected_candidate = int(pred["selected_candidate"].detach().view(-1)[0].cpu().item())
             candidate_scores = pred["candidate_scores"].detach().float().view(-1).cpu().numpy()
@@ -1733,17 +3505,35 @@ def run_online_trajectory(
                 if expert_action is not None
                 else "n/a"
             )
+            if step_profile is not None:
+                step_time_records.append(step_profile)
+                if (t + 1) % profile_step_time_interval == 0:
+                    rolling = _mean_step_time_profile(step_time_records[-profile_step_time_interval:])
+                    print(
+                        _format_step_time_profile(
+                            f"[profile-step-time] {traj.scene_id}/{traj.trajectory_name} step={t}",
+                            rolling,
+                        )
+                    )
             iterator.set_postfix(
                 dist=f"{distance:.2f}",
                 action=pred_act,
                 expert=expert_act,
             )
+        elif step_profile is not None:
+            step_time_records.append(step_profile)
+            if (t + 1) % profile_step_time_interval == 0:
+                rolling = _mean_step_time_profile(step_time_records[-profile_step_time_interval:])
+                print(
+                    _format_step_time_profile(
+                        f"[profile-step-time] {traj.scene_id}/{traj.trajectory_name} step={t}",
+                        rolling,
+                    )
+                )
 
         prev_uav_after_pos = np.asarray(uav_state_after["position"], dtype=np.float32).copy()
-        prev_uav_after_state = {
-            "position": np.asarray(uav_state_after["position"], dtype=np.float32).copy(),
-            "orientation": np.asarray(uav_state_after["orientation"], dtype=np.float32).copy(),
-        }
+        prev_uav_after_state = _copy_uav_state(uav_state_after)
+        camera_hold_state = _copy_uav_state(prev_uav_after_state)
 
         if collision_now and args.stop_on_collision:
             break
@@ -1818,13 +3608,35 @@ def run_online_trajectory(
         "mean_action_abs_error_physical": float(np.mean(action_abs_err)) if action_abs_err else None,
         "rmse_action_physical": float(math.sqrt(np.mean(action_mse))) if action_mse else None,
         "target_asset_name": getattr(executor, "target_asset_name", None),
+        "target_object_name": target_object_name,
+        "target_forced_spawn_ok": bool(forced_target_spawn_ok),
+        "target_scene_object_exists_after_forced_spawn": forced_target_scene_exists,
+        "uav_start_quat_source": "dataset" if traj.uav_start_quat_wxyz is not None else "target_facing_fallback",
+        "uav_start_quat_dataset": _quat_wxyz_to_dict(traj.uav_start_quat_wxyz),
         "jammer_asset_names": getattr(executor, "_jammer_asset_names_by_id", {}),
+        "jammer_object_names": getattr(executor, "_jammer_object_names_by_id", {}),
         "control_mode": args.control_mode,
         "replay_expert_action": bool(args.replay_expert_action),
         "hold_uav_pose_during_scene_step": bool(args.hold_uav_pose_during_scene_step),
+        "scene_update_frames": int(getattr(args, "scene_update_frames", 0) or 0),
+        "camera_pose_refresh_frames": int(getattr(args, "camera_pose_refresh_frames", 1) or 0),
+        "effective_camera_pose_refresh_frames": int(effective_camera_pose_refresh_frames),
+        "direct_set_camera_pose": bool(direct_set_camera_pose),
+        "direct_camera_external": bool(direct_camera_external),
+        "disable_camera_physics_refresh": bool(disable_camera_physics_refresh),
+        "camera_offset_body": [float(v) for v in camera_offset_body],
         "capture_distance": args.capture_distance,
         "require_visibility_for_success": args.require_visibility_for_success,
     }
+    if step_time_records:
+        summary["time_profile_mean"] = _mean_step_time_profile(step_time_records)
+        summary["profile_step_time_interval"] = profile_step_time_interval
+        print(
+            _format_step_time_profile(
+                f"[profile-step-time] {traj.scene_id}/{traj.trajectory_name} mean",
+                summary["time_profile_mean"],
+            )
+        )
 
     _dump_json(out_dir / "online_rollout.json", {"summary": summary, "steps": steps})
     _save_trajectory_3d_plot(out_dir, steps)
@@ -1976,9 +3788,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dit-candidate-action-weight", type=float, default=None)
     parser.add_argument("--dit-candidate-temporal-smooth-weight", type=float, default=None)
     parser.add_argument("--use-target-relative-context", type=_str2bool, default=None)
+    parser.add_argument("--target-relative-context-input-mode", type=str, default=None, choices=["xyz", "yz", "no_x", "without_x", "lateral_vertical"])
     parser.add_argument("--target-relative-context-scale", type=float, default=None)
     parser.add_argument("--target-relative-token-scale", type=float, default=None)
     parser.add_argument("--target-relative-context-hidden-dim", type=int, default=None)
+    parser.add_argument("--use-target-similarity-guidance", type=_str2bool, default=None)
+    parser.add_argument("--target-similarity-feature-source", type=str, default=None, choices=["wan_vae_latent", "rgb_cnn"])
+    parser.add_argument("--target-similarity-context-mode", type=str, default=None, choices=["dense", "camera_yz_text"])
+    parser.add_argument("--target-similarity-condition-dim", type=int, default=None)
+    parser.add_argument("--target-similarity-hidden-dim", type=int, default=None)
+    parser.add_argument("--target-similarity-patch-size", type=int, default=None)
+    parser.add_argument("--target-similarity-vae-downsample-factor", type=int, default=None)
+    parser.add_argument("--target-similarity-history-size", type=int, default=None)
+    parser.add_argument("--target-similarity-decay", type=float, default=None)
+    parser.add_argument("--target-similarity-grid-pool-size", type=int, default=None)
+    parser.add_argument("--target-similarity-temperature", type=float, default=None)
+    parser.add_argument("--target-similarity-token-scale", type=float, default=None)
+    parser.add_argument("--target-similarity-condition-mode", type=str, default=None, choices=["image_center", "center", "pixel_center", "normalized_center", "camera_yz", "camera_bearing", "bearing", "ray_yz"])
+    parser.add_argument("--target-similarity-condition-source", type=str, default=None, choices=["predicted", "gt", "ground_truth", "oracle", "mixed", "gt_mix", "mix"])
+    parser.add_argument("--target-similarity-condition-gt-mix-prob", type=float, default=None)
+    parser.add_argument("--target-similarity-fov-deg", type=float, default=None)
+    parser.add_argument("--target-similarity-camera-offset-body", nargs=3, type=float, default=None)
+    parser.add_argument("--target-similarity-heatmap-sigma", type=float, default=None)
+    parser.add_argument("--target-similarity-reacquire-confidence-min", type=float, default=None)
+    parser.add_argument("--target-similarity-reacquire-confidence-ratio", type=float, default=None)
+    parser.add_argument("--target-similarity-reacquire-entropy-max", type=float, default=None)
+    parser.add_argument("--target-similarity-reacquire-margin-min", type=float, default=None)
     parser.add_argument("--max-vel", type=float, default=DEFAULT_MODEL_CFG.max_vel)
     parser.add_argument("--max-yaw-rate", type=float, default=DEFAULT_MODEL_CFG.max_yaw_rate)
     parser.add_argument("--max-speed-norm", type=float, default=DEFAULT_MODEL_CFG.max_speed_norm)
@@ -2032,13 +3867,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--do-not-reuse-saved-assets", action="store_false", dest="reuse_saved_assets")
     parser.add_argument("--random-target-asset", action="store_true", default=False)
     parser.add_argument("--random-jammer-asset", action="store_true", default=False)
+    parser.add_argument("--async-camera-cache", action="store_true", default=False)
+    parser.add_argument(
+        "--async-camera-poll-interval",
+        type=float,
+        default=0.0,
+        help="Seconds to sleep between background camera polls. 0 polls as fast as AirSim returns.",
+    )
+    parser.add_argument(
+        "--async-camera-mode",
+        type=str,
+        default="fresh",
+        choices=["fresh", "latest"],
+        help="fresh waits for a cached frame after scene update; latest returns the newest cached frame immediately.",
+    )
+    parser.add_argument(
+        "--async-camera-wait-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds to wait for a cached frame captured after the current scene update before falling back.",
+    )
+    parser.add_argument("--sync-first-camera-frame", action="store_true", default=True, help="Capture frame 0 synchronously so target identity initialization cannot use a stale async frame.")
+    parser.add_argument("--no-sync-first-camera-frame", action="store_false", dest="sync_first_camera_frame")
 
     # Online rollout config
     parser.add_argument("--control-mode", type=str, default="pose", choices=["pose", "velocity"])
     parser.add_argument("--replay-expert-action", action="store_true", default=False, help="Sanity-check mode: execute dataset expert actions instead of model actions.")
     parser.add_argument("--hold-uav-pose-during-scene-step", action="store_true", default=True, help="In pose control, keep UAV fixed while stepping target/jammer scene updates.")
     parser.add_argument("--no-hold-uav-pose-during-scene-step", action="store_false", dest="hold_uav_pose_during_scene_step")
-    parser.add_argument("--dt", type=float, default=1.0)
+    parser.add_argument("--scene-update-frames", type=int, default=0, help="Extra AirSim frames to advance after moving target/jammers. Keep 0 to avoid UAV free-fall before camera capture.")
+    parser.add_argument("--camera-pose-refresh-frames", type=int, default=1, help="Frames to tick after setting UAV pose so AirSim camera rendering uses the updated pose.")
+    parser.add_argument("--direct-set-camera-pose", action="store_true", default=False, help="Set the render camera pose directly before simGetImages instead of advancing AirSim physics to refresh it.")
+    parser.add_argument("--direct-camera-external", action="store_true", default=True, help="With --direct-set-camera-pose, use an AirSim external camera placed in world coordinates.")
+    parser.add_argument("--vehicle-relative-direct-camera", action="store_false", dest="direct_camera_external", help="Use the vehicle-mounted camera API for direct pose instead of an external world camera.")
+    parser.add_argument("--camera-offset-body", nargs=3, type=float, default=[0.46, 0.0, 0.0], help="Camera offset in UAV body coordinates, z-up convention, used by --direct-set-camera-pose.")
+    parser.add_argument("--disable-camera-physics-refresh", action="store_true", default=False, help="Compatibility flag: with --direct-set-camera-pose, camera_pose_refresh_frames is forced to 0.")
     parser.add_argument("--max-step-norm", type=float, default=1.0, help="Safety clamp for one pose-control step. <=0 disables clamp.")
     parser.add_argument("--force-live-instruction", action="store_true", default=False, help="Generate instruction from current online relative target state instead of replaying saved dataset text.")
     parser.add_argument("--capture-distance", type=float, default=10.0)
@@ -2064,7 +3927,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-save-transformer-attention-maps", action="store_false", dest="save_transformer_attention_maps")
     parser.add_argument("--save-predicted-video", action="store_true", default=False)
     parser.add_argument("--no-save-predicted-video", action="store_false", dest="save_predicted_video")
+    parser.add_argument("--save-predicted-action-trajectories", action="store_true", default=True)
+    parser.add_argument(
+        "--no-save-predicted-action-trajectories",
+        action="store_false",
+        dest="save_predicted_action_trajectories",
+    )
+    parser.add_argument("--save-target-similarity-maps", action="store_true", default=True)
+    parser.add_argument("--no-save-target-similarity-maps", action="store_false", dest="save_target_similarity_maps")
     parser.add_argument("--predicted-video-latent-frames", type=int, default=3)
+    parser.add_argument("--profile-step-time", action="store_true", default=False)
+    parser.add_argument("--profile-step-time-interval", type=int, default=20)
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -2128,7 +4001,18 @@ def main() -> None:
 
     expected_keys = {_trajectory_key(p.parent.name, p.name) for p in traj_dirs}
     partial_path = Path(args.output_dir) / "summary_partial.json"
-    all_summaries: List[Dict[str, Any]] = _load_resumable_partial(partial_path, expected_keys)
+    all_summaries: List[Dict[str, Any]] = _load_resumable_partial(
+        partial_path,
+        expected_keys,
+        current_args=args,
+    )
+    if not all_summaries:
+        summary_path = Path(args.output_dir) / "summary.json"
+        all_summaries = _load_resumable_partial(
+            summary_path,
+            expected_keys,
+            current_args=args,
+        )
     completed_keys = {
         _trajectory_key(str(s.get("scene_id") or ""), str(s.get("trajectory_name") or ""))
         for s in all_summaries
@@ -2137,12 +4021,20 @@ def main() -> None:
         _dump_json(partial_path, {"summaries": all_summaries, "args": vars(args)})
     current_scene = None
     executor = None
+    camera_cache: Optional[AsyncCameraCache] = None
+    if bool(getattr(args, "direct_set_camera_pose", False)) or bool(getattr(args, "disable_camera_physics_refresh", False)):
+        args.camera_pose_refresh_frames = 0
 
     try:
         for idx, dataset_dir in enumerate(traj_dirs, start=1):
             scene_id = dataset_dir.parent.name
             traj_key = _trajectory_key(scene_id, dataset_dir.name)
-            refreshed_summaries = _load_resumable_partial(partial_path, expected_keys, verbose=False)
+            refreshed_summaries = _load_resumable_partial(
+                partial_path,
+                expected_keys,
+                current_args=args,
+                verbose=False,
+            )
             if len(refreshed_summaries) > len(all_summaries):
                 all_summaries = refreshed_summaries
                 completed_keys = {
@@ -2162,15 +4054,31 @@ def main() -> None:
                 completed_keys.discard(traj_key)
             traj = load_online_trajectory(dataset_dir, scene_id)
             if current_scene != scene_id or executor is None:
+                if camera_cache is not None:
+                    camera_cache.stop()
+                    camera_cache = None
                 cleanup_executor(executor)
                 executor = build_executor(executor_module, args, scene_id)
                 current_scene = scene_id
+                if bool(getattr(args, "async_camera_cache", False)):
+                    executor.connect()
+                    camera_cache = start_async_camera_cache_if_needed(executor, args)
 
             print("=" * 100)
             print(f"online eval {scene_id}/{traj.trajectory_name}")
             print(f"dataset trajectory: {dataset_dir}")
             print(f"frames={traj.num_frames}, target_asset={traj.target_asset_name}, jammers={list(traj.jammer_trajs_airsim.keys())}")
-            summary = run_online_trajectory(model, cfg, tokenizer, transform, executor, traj, args, device)
+            summary = run_online_trajectory(
+                model,
+                cfg,
+                tokenizer,
+                transform,
+                executor,
+                traj,
+                args,
+                device,
+                camera_cache=camera_cache,
+            )
             all_summaries.append(summary)
             completed_keys.add(traj_key)
             _dump_json(partial_path, {"summaries": all_summaries, "args": vars(args)})
@@ -2250,6 +4158,8 @@ def main() -> None:
         print("=" * 100)
         print(json.dumps({k: v for k, v in agg.items() if k not in {"args", "summaries"}}, indent=2, ensure_ascii=False))
     finally:
+        if camera_cache is not None:
+            camera_cache.stop()
         cleanup_executor(executor)
         if args.stop_sim_server_on_exit:
             _terminate_process_group(sim_server_proc)

@@ -11,6 +11,7 @@ from .encoders import TargetTokenEncoder, Wan22TextEncoder, Wan22VAEImageEncoder
 from .fusion import CrossAttentionFusion
 from .heads import FastWAMHead, TeacherPredictionHeads
 from .rssm import RSSM, RSSMState
+from .target_similarity import TargetSimilarityGuidance
 
 
 def migrate_legacy_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -40,13 +41,14 @@ class TeacherWorldModelDiT(nn.Module):
         self.image_encoder = Wan22VAEImageEncoder(cfg)
         self.text_encoder = Wan22TextEncoder(cfg)
         self.target_token_encoder = TargetTokenEncoder(cfg)
+        target_context_input_dim = self._target_relative_context_input_dim(cfg)
         target_context_hidden = max(
             int(getattr(cfg, "target_relative_context_hidden_dim", cfg.text_width)),
-            int(cfg.target_relative_dim),
+            int(target_context_input_dim),
             1,
         )
         self.target_relative_context_proj = nn.Sequential(
-            nn.Linear(cfg.target_relative_dim, target_context_hidden),
+            nn.Linear(target_context_input_dim, target_context_hidden),
             nn.GELU(),
             nn.Dropout(float(getattr(cfg, "dropout", 0.0))),
             nn.Linear(target_context_hidden, cfg.text_width),
@@ -54,12 +56,60 @@ class TeacherWorldModelDiT(nn.Module):
         if not bool(getattr(cfg, "use_target_relative_context", False)):
             for p in self.target_relative_context_proj.parameters():
                 p.requires_grad_(False)
+        self.target_similarity_guidance = (
+            TargetSimilarityGuidance(cfg) if bool(getattr(cfg, "use_target_similarity_guidance", False)) else None
+        )
         self.fusion = CrossAttentionFusion(cfg)
         self.rssm = RSSM(cfg) if cfg.use_rssm else None
         self.prediction_heads = TeacherPredictionHeads(cfg)
         self.fastwam = FastWAMHead(cfg) if bool(cfg.use_fastwam_mot) else None
         if self.fastwam is None:
             raise RuntimeError("Legacy MLP/DiT actors were removed; set cfg.use_fastwam_mot=True.")
+        self._target_similarity_memory: Optional[Dict[str, torch.Tensor]] = None
+
+    def reset_target_similarity_memory(self) -> None:
+        self._target_similarity_memory = None
+
+    def initialize_target_similarity_from_heatmap(self, heatmap: torch.Tensor) -> None:
+        self._target_similarity_memory = {"init_heatmap": heatmap.detach()}
+
+    def initialize_target_similarity_from_box(
+        self,
+        box_xyxy: torch.Tensor,
+        image_hw: Tuple[int, int],
+    ) -> None:
+        if box_xyxy.ndim != 2 or box_xyxy.size(-1) != 4:
+            raise ValueError("box_xyxy must have shape [B, 4].")
+        h, w = image_hw
+        device = box_xyxy.device
+        dtype = box_xyxy.dtype if box_xyxy.is_floating_point() else torch.float32
+        patch = max(int(getattr(self.cfg, "target_similarity_patch_size", 16)), 1)
+        source = str(getattr(self.cfg, "target_similarity_feature_source", "wan_vae_latent")).lower()
+        if source in {"wan_vae_latent", "vae_latent", "latent"}:
+            downsample = max(int(getattr(self.cfg, "target_similarity_vae_downsample_factor", 8)), 1)
+            gh = max(int(h) // downsample, 1)
+            gw = max(int(w) // downsample, 1)
+        else:
+            gh = max(int(h) // patch, 1)
+            gw = max(int(w) // patch, 1)
+        xs = torch.linspace(0.0, 1.0, gw, device=device, dtype=dtype)
+        ys = torch.linspace(0.0, 1.0, gh, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        box = box_xyxy.to(device=device, dtype=dtype)
+        if float(box.detach().amax().cpu()) > 2.0:
+            scale = torch.tensor(
+                [max(w - 1, 1), max(h - 1, 1), max(w - 1, 1), max(h - 1, 1)],
+                device=device,
+                dtype=dtype,
+            )
+            box = box / scale
+        x1, y1, x2, y2 = box.unbind(dim=-1)
+        cx = ((x1 + x2) * 0.5).clamp(0.0, 1.0)
+        cy = ((y1 + y2) * 0.5).clamp(0.0, 1.0)
+        sigma = ((x2 - x1).abs() + (y2 - y1).abs()).mul(0.25).clamp_min(0.03)
+        dist2 = (grid_x.unsqueeze(0) - cx[:, None, None]).pow(2) + (grid_y.unsqueeze(0) - cy[:, None, None]).pow(2)
+        heatmap = torch.exp(-0.5 * dist2 / sigma[:, None, None].pow(2).clamp_min(1.0e-6))
+        self.initialize_target_similarity_from_heatmap(heatmap)
 
     def initial_state(self, batch_size: int, device: torch.device) -> RSSMState:
         if self.rssm is None:
@@ -80,6 +130,31 @@ class TeacherWorldModelDiT(nn.Module):
             prev_dones[:, 1:] = done_2d[:, :-1]
         return prev_dones
 
+    @staticmethod
+    def _target_relative_context_input_dim(cfg: ModelConfig) -> int:
+        mode = str(getattr(cfg, "target_relative_context_input_mode", "xyz")).strip().lower()
+        if mode in {"xyz", "full", "all"}:
+            return int(cfg.target_relative_dim)
+        if mode in {"yz", "no_x", "without_x", "lateral_vertical"}:
+            if int(cfg.target_relative_dim) < 3:
+                raise ValueError("target_relative_context_input_mode='yz' requires target_relative_dim >= 3.")
+            return 2
+        raise ValueError(
+            f"Unsupported target_relative_context_input_mode={mode!r}; expected 'xyz' or 'yz'."
+        )
+
+    def _select_target_relative_context_input(self, target_relative: torch.Tensor) -> torch.Tensor:
+        mode = str(getattr(self.cfg, "target_relative_context_input_mode", "xyz")).strip().lower()
+        if mode in {"xyz", "full", "all"}:
+            return target_relative
+        if mode in {"yz", "no_x", "without_x", "lateral_vertical"}:
+            if target_relative.size(-1) < 3:
+                raise ValueError("target_relative_context_input_mode='yz' requires target_relative feature dim >= 3.")
+            return target_relative[..., 1:3]
+        raise ValueError(
+            f"Unsupported target_relative_context_input_mode={mode!r}; expected 'xyz' or 'yz'."
+        )
+
     def _make_target_relative_context_tokens(
         self,
         target_relative: torch.Tensor,
@@ -93,6 +168,7 @@ class TeacherWorldModelDiT(nn.Module):
         if target_relative.size(-1) != int(self.cfg.target_relative_dim):
             raise ValueError("target_relative feature dim must match cfg.target_relative_dim.")
         current_target = target_relative[:, 0].float()
+        current_target = self._select_target_relative_context_input(current_target)
         scale = max(float(getattr(self.cfg, "target_relative_context_scale", 1.0)), 1e-6)
         current_target = current_target / scale
         param = next(self.target_relative_context_proj.parameters())
@@ -112,6 +188,10 @@ class TeacherWorldModelDiT(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         instructions: Optional[list[str]] = None,
         video_latents: Optional[torch.Tensor] = None,
+        target_similarity_memory: Optional[Dict[str, torch.Tensor]] = None,
+        target_similarity_init_heatmap: Optional[torch.Tensor] = None,
+        return_target_similarity_state: bool = False,
+        target_similarity_use_gt_visible_for_condition: bool = True,
     ) -> Dict[str, torch.Tensor]:
         if images.ndim != 5:
             raise ValueError("images must have shape [B, T, C, H, W].")
@@ -194,6 +274,23 @@ class TeacherWorldModelDiT(nn.Module):
             fastwam_context = torch.cat([fastwam_context, target_context], dim=1)
             fastwam_context_mask = torch.cat([fastwam_context_mask, target_context_mask], dim=1)
 
+        target_similarity_out = None
+        if self.target_similarity_guidance is not None:
+            target_similarity_out = self.target_similarity_guidance(
+                images,
+                target_relative,
+                video_latents=video_latents,
+                memory_state=target_similarity_memory,
+                init_heatmap=target_similarity_init_heatmap,
+                return_state=return_target_similarity_state,
+                use_gt_visible_for_condition=target_similarity_use_gt_visible_for_condition,
+            )
+            sim_context = target_similarity_out["context_tokens"].to(device=fastwam_context.device, dtype=fastwam_context.dtype)
+            sim_mask = target_similarity_out["context_mask"].to(device=fastwam_context.device, dtype=torch.bool)
+            if sim_context.size(1) > 0:
+                fastwam_context = torch.cat([fastwam_context, sim_context], dim=1)
+                fastwam_context_mask = torch.cat([fastwam_context_mask, sim_mask], dim=1)
+
         encoded_out = {
             "obs_embed": obs_embed.view(batch_size, latent_seq_len, -1),
             "fused_tokens": fused_tokens.view(batch_size, latent_seq_len, fused_tokens.size(1), fused_tokens.size(2)),
@@ -201,6 +298,8 @@ class TeacherWorldModelDiT(nn.Module):
             "text_context": fastwam_context,
             "text_context_mask": fastwam_context_mask,
         }
+        if target_similarity_out is not None:
+            encoded_out["target_similarity"] = target_similarity_out
         return encoded_out
 
     def forward(
@@ -216,6 +315,9 @@ class TeacherWorldModelDiT(nn.Module):
         done: Optional[torch.Tensor] = None,
         instructions: Optional[list[str]] = None,
         video_latents: Optional[torch.Tensor] = None,
+        target_similarity_memory: Optional[Dict[str, torch.Tensor]] = None,
+        target_similarity_init_heatmap: Optional[torch.Tensor] = None,
+        return_target_similarity_state: bool = False,
     ) -> Dict[str, torch.Tensor]:
         encoded = self.encode_sequence(
             images,
@@ -224,6 +326,9 @@ class TeacherWorldModelDiT(nn.Module):
             attention_mask,
             instructions=instructions,
             video_latents=video_latents,
+            target_similarity_memory=target_similarity_memory,
+            target_similarity_init_heatmap=target_similarity_init_heatmap,
+            return_target_similarity_state=return_target_similarity_state,
         )
         prev_dones = self._make_prev_dones(done)
         if self.rssm is None:
@@ -259,6 +364,9 @@ class TeacherWorldModelDiT(nn.Module):
             prior_preds = {f"prior_{k}": v for k, v in self.prediction_heads(prior_feat).items()}
         out = {
             "obs_embed": encoded["obs_embed"],
+            "fastwam_video_latents": encoded.get("video_latents"),
+            "fastwam_text_context": encoded.get("text_context"),
+            "fastwam_text_context_mask": encoded.get("text_context_mask"),
             "priors": priors,
             "posts": posts,
             "feat": feat,
@@ -266,6 +374,37 @@ class TeacherWorldModelDiT(nn.Module):
             **preds,
             **prior_preds,
         }
+        target_similarity_out = encoded.get("target_similarity")
+        if isinstance(target_similarity_out, dict):
+            out["target_similarity_heatmap"] = target_similarity_out["similarity_heatmap"]
+            out["target_similarity_raw_heatmap"] = target_similarity_out["raw_similarity_heatmap"]
+            out["target_similarity_center"] = target_similarity_out["pred_center"]
+            out["target_similarity_identity"] = target_similarity_out["identity_token"]
+            out["target_similarity_target_features"] = target_similarity_out["target_features"]
+            out["target_similarity_gt_heatmap"] = target_similarity_out["gt_heatmap"]
+            out["target_similarity_gt_center"] = target_similarity_out["gt_center"]
+            out["target_similarity_visible"] = target_similarity_out["visible"]
+            out["target_similarity_condition"] = target_similarity_out["target_condition"]
+            for key in [
+                "memory_last_good_primary",
+                "memory_last_good_velocity",
+                "memory_has_last_good",
+                "memory_lost_count",
+            ]:
+                if key in target_similarity_out:
+                    out[f"target_similarity_{key}"] = target_similarity_out[key]
+            for key in [
+                "memory_sim_prob",
+                "memory_pred_features",
+                "memory_pred_center",
+                "memory_identity_token",
+                "memory_last_good_primary",
+                "memory_last_good_velocity",
+                "memory_has_last_good",
+                "memory_lost_count",
+            ]:
+                if key in target_similarity_out:
+                    out[f"target_similarity_{key}"] = target_similarity_out[key]
         if expert_action is not None:
             if self.fastwam is not None:
                 if encoded.get("video_latents") is None or encoded.get("text_context") is None:
@@ -276,9 +415,11 @@ class TeacherWorldModelDiT(nn.Module):
                     context_mask=encoded["text_context_mask"],
                     expert_action=expert_action.float(),
                     valid_mask=valid_mask,
+                    target_relative=target_relative,
                 )
                 out["video_flow_loss"] = fastwam_out["loss_video"]
                 out["policy_flow_loss"] = fastwam_out["loss_action"]
+                out["fastwam_attention_heatmap_loss"] = fastwam_out["loss_attention_heatmap"]
                 out["policy_action_sequence"] = fastwam_out["pred_action"]
                 out["policy_action"] = fastwam_out["pred_action"][..., 0, :]
             elif self.cfg.use_diffusion_actor:
@@ -466,7 +607,31 @@ class TeacherWorldModelDiT(nn.Module):
             target_relative_seq,
             attention_mask,
             instructions=None if instruction is None else [instruction] * batch_size,
+            target_similarity_memory=self._target_similarity_memory,
+            target_similarity_init_heatmap=(
+                self._target_similarity_memory.get("init_heatmap")
+                if isinstance(self._target_similarity_memory, dict)
+                else None
+            ),
+            return_target_similarity_state=self.target_similarity_guidance is not None,
+            target_similarity_use_gt_visible_for_condition=False,
         )
+        target_similarity_out = encoded.get("target_similarity")
+        if isinstance(target_similarity_out, dict) and "memory_sim_prob" in target_similarity_out:
+            self._target_similarity_memory = {
+                "sim_prob": target_similarity_out["memory_sim_prob"],
+                "pred_features": target_similarity_out["memory_pred_features"],
+                "pred_center": target_similarity_out["memory_pred_center"],
+                "identity_token": target_similarity_out["memory_identity_token"],
+            }
+            for src_key, dst_key in (
+                ("memory_last_good_primary", "last_good_primary"),
+                ("memory_last_good_velocity", "last_good_velocity"),
+                ("memory_has_last_good", "has_last_good"),
+                ("memory_lost_count", "lost_count"),
+            ):
+                if src_key in target_similarity_out:
+                    self._target_similarity_memory[dst_key] = target_similarity_out[src_key]
         if self.rssm is None:
             post = None
             feat = encoded["obs_embed"].squeeze(1)
@@ -534,6 +699,16 @@ class TeacherWorldModelDiT(nn.Module):
         )
         heads = self.prediction_heads(feat)
         out = {"action": action_physical, "action_norm": action_norm, "action_physical": action_physical, **heads}
+        if isinstance(target_similarity_out, dict):
+            out["target_similarity_heatmap"] = target_similarity_out["similarity_heatmap"]
+            out["target_similarity_raw_heatmap"] = target_similarity_out["raw_similarity_heatmap"]
+            out["target_similarity_center"] = target_similarity_out["pred_center"]
+            out["target_similarity_identity"] = target_similarity_out["identity_token"]
+            out["target_similarity_target_features"] = target_similarity_out["target_features"]
+            out["target_similarity_gt_heatmap"] = target_similarity_out["gt_heatmap"]
+            out["target_similarity_gt_center"] = target_similarity_out["gt_center"]
+            out["target_similarity_visible"] = target_similarity_out["visible"]
+            out["target_similarity_condition"] = target_similarity_out["target_condition"]
         if action_sequence_norm is not None:
             out["action_sequence_norm"] = action_sequence_norm
         if self.fastwam is not None and "predicted_video_latents" in locals() and predicted_video_latents is not None:

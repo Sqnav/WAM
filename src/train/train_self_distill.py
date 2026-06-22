@@ -20,7 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 from data.teacher_dataset_builder import build_records
 from model.config import ModelConfig, migrate_legacy_config
 from model.action_loss_utils import weighted_mean_action_squared_error
-from model.losses import summarize_losses, world_model_dit_loss
+from model.losses import masked_mean, summarize_losses, world_model_dit_loss
 from model.model import TeacherWorldModelDiT, migrate_legacy_state_dict_keys
 from train.train_teacher import TrajectoryDataset, _wan_latent_cache_stats, collate_fn, move_batch_to_device
 
@@ -93,6 +93,11 @@ def _reduce_metrics(metrics: Dict[str, float], device: torch.device, use_ddp: bo
 def _init_swanlab(args: argparse.Namespace, cfg: ModelConfig, run_name: str):
     if not bool(getattr(args, "use_swanlab", False)) or not _is_main_process():
         return None
+    mode = str(getattr(args, "swanlab_mode", "offline") or "offline")
+    if mode == "cloud" and not os.environ.get("SWANLAB_API_KEY"):
+        print("[swanlab] SWANLAB_MODE=cloud but SWANLAB_API_KEY is not set; using offline mode.")
+        mode = "offline"
+    os.environ.setdefault("SWANLAB_NO_INTERACTIVE", "1")
     try:
         import swanlab
     except Exception as exc:
@@ -104,7 +109,7 @@ def _init_swanlab(args: argparse.Namespace, cfg: ModelConfig, run_name: str):
             workspace=args.swanlab_workspace or None,
             experiment_name=run_name,
             logdir=args.swanlab_log_dir or None,
-            mode=args.swanlab_mode,
+            mode=mode,
             config={
                 **cfg.__dict__,
                 "epochs": args.epochs,
@@ -114,6 +119,10 @@ def _init_swanlab(args: argparse.Namespace, cfg: ModelConfig, run_name: str):
                 "scene_list": args.scene_list,
                 "trajectory_range": args.trajectory_range,
                 "teacher_ckpt": args.teacher_ckpt,
+                "student_init_ckpt": args.student_init_ckpt,
+                "flow_distill_weight": args.flow_distill_weight,
+                "flow_distill_every": args.flow_distill_every,
+                "flow_distill_sampling_steps": args.flow_distill_sampling_steps,
             },
         )
     except Exception as exc:
@@ -133,9 +142,13 @@ def _swanlab_log(run, metrics: Dict[str, float], step: int, prefix: str) -> None
         "sup_kl",
         "sup_next_target_relative",
         "sup_prior_next_target_relative",
+        "sup_target_similarity_center",
+        "sup_target_similarity_heatmap",
+        "sup_target_similarity_identity",
         "sup_video_x0",
         "sup_x0_action",
         "action_distill",
+        "flow_distill",
     }
     active = {
         k: float(v)
@@ -165,10 +178,14 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
     order = [
         "total",
         "sup_total",
+        "flow_distill",
         "feat_distill",
         "action_distill",
         "sup_action",
         "sup_video",
+        "sup_target_similarity_center",
+        "sup_target_similarity_heatmap",
+        "sup_target_similarity_identity",
         "sup_kl",
         "sup_next_target_relative",
         "sup_prior_next_target_relative",
@@ -178,8 +195,12 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
         "sup_kl",
         "sup_next_target_relative",
         "sup_prior_next_target_relative",
+        "sup_target_similarity_center",
+        "sup_target_similarity_heatmap",
+        "sup_target_similarity_identity",
         "sup_video_x0",
         "sup_x0_action",
+        "flow_distill",
     }
     parts = []
     for key in order:
@@ -328,12 +349,32 @@ def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] 
         cfg_kwargs["fastwam_action_video_freq_ratio"] = max(int(args.action_video_freq_ratio), 1)
     if args.use_target_relative_context is not None:
         cfg_kwargs["use_target_relative_context"] = bool(args.use_target_relative_context)
+    if getattr(args, "target_relative_context_input_mode", None) is not None:
+        cfg_kwargs["target_relative_context_input_mode"] = str(args.target_relative_context_input_mode)
     if args.target_relative_context_scale is not None:
         cfg_kwargs["target_relative_context_scale"] = float(args.target_relative_context_scale)
     if args.target_relative_token_scale is not None:
         cfg_kwargs["target_relative_token_scale"] = float(args.target_relative_token_scale)
     if args.target_relative_context_hidden_dim is not None:
         cfg_kwargs["target_relative_context_hidden_dim"] = int(args.target_relative_context_hidden_dim)
+    if getattr(args, "target_similarity_context_mode", None) is not None:
+        cfg_kwargs["target_similarity_context_mode"] = str(args.target_similarity_context_mode)
+    if getattr(args, "target_similarity_condition_dim", None) is not None:
+        cfg_kwargs["target_similarity_condition_dim"] = int(args.target_similarity_condition_dim)
+    if getattr(args, "target_similarity_condition_mode", None) is not None:
+        cfg_kwargs["target_similarity_condition_mode"] = str(args.target_similarity_condition_mode)
+    if getattr(args, "target_similarity_condition_source", None) is not None:
+        cfg_kwargs["target_similarity_condition_source"] = str(args.target_similarity_condition_source)
+    if getattr(args, "target_similarity_condition_gt_mix_prob", None) is not None:
+        cfg_kwargs["target_similarity_condition_gt_mix_prob"] = float(args.target_similarity_condition_gt_mix_prob)
+    if getattr(args, "target_similarity_reacquire_confidence_min", None) is not None:
+        cfg_kwargs["target_similarity_reacquire_confidence_min"] = float(args.target_similarity_reacquire_confidence_min)
+    if getattr(args, "target_similarity_reacquire_confidence_ratio", None) is not None:
+        cfg_kwargs["target_similarity_reacquire_confidence_ratio"] = float(args.target_similarity_reacquire_confidence_ratio)
+    if getattr(args, "target_similarity_reacquire_entropy_max", None) is not None:
+        cfg_kwargs["target_similarity_reacquire_entropy_max"] = float(args.target_similarity_reacquire_entropy_max)
+    if getattr(args, "target_similarity_reacquire_margin_min", None) is not None:
+        cfg_kwargs["target_similarity_reacquire_margin_min"] = float(args.target_similarity_reacquire_margin_min)
     if args.use_wan22_encoders is not None:
         cfg_kwargs["use_wan22_encoders"] = bool(args.use_wan22_encoders)
     if args.wan22_model_base_path is not None:
@@ -361,6 +402,8 @@ def make_student_cfg(args: argparse.Namespace, teacher_cfg: ModelConfig) -> Mode
     updates: Dict[str, Any] = {}
     if args.student_use_target_relative_context is not None:
         updates["use_target_relative_context"] = bool(args.student_use_target_relative_context)
+    if getattr(args, "student_target_relative_context_input_mode", None) is not None:
+        updates["target_relative_context_input_mode"] = str(args.student_target_relative_context_input_mode)
     return replace(teacher_cfg, **updates)
 
 
@@ -430,6 +473,21 @@ def align_time_mask(valid_mask: Optional[torch.Tensor], length: int, device: tor
             pad = mask[:, -1:].expand(-1, length - mask.size(1))
             mask = torch.cat([mask, pad], dim=1)
     return mask
+
+
+def align_action_token_mask(
+    valid_mask: Optional[torch.Tensor],
+    length: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if valid_mask is None:
+        return None
+    mask = valid_mask.float().to(device)
+    if mask.ndim != 2:
+        raise ValueError("valid_mask must have shape [B, T].")
+    if mask.size(1) >= length + 1:
+        return mask[:, :length] * mask[:, 1 : length + 1]
+    return align_time_mask(mask, length, device)
 
 
 def _make_action_sequence_target(
@@ -515,6 +573,92 @@ def action_distillation_loss(
     return masked_mean(per_t, align_time_mask(valid_mask, student_action.size(1), student_action.device))
 
 
+def flow_distillation_loss(
+    student_model: TeacherWorldModelDiT,
+    teacher_model: TeacherWorldModelDiT,
+    student_out: Dict[str, torch.Tensor],
+    teacher_out: Dict[str, torch.Tensor],
+    valid_mask: Optional[torch.Tensor],
+    cfg: ModelConfig,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    ref = student_out.get("fastwam_video_latents")
+    if ref is None:
+        ref = student_out.get("feat", student_out.get("obs_embed"))
+    if ref is None:
+        raise RuntimeError("Cannot locate a reference tensor for flow distillation.")
+    zero = torch.zeros((), device=ref.device, dtype=ref.dtype if ref.is_floating_point() else torch.float32)
+    if float(getattr(args, "flow_distill_weight", 0.0)) <= 0.0:
+        return zero
+    if student_model.fastwam is None or teacher_model.fastwam is None:
+        raise RuntimeError("Student-sampled flow distillation requires FastWAM heads on both models.")
+
+    student_video = student_out.get("fastwam_video_latents")
+    teacher_video = teacher_out.get("fastwam_video_latents")
+    student_context = student_out.get("fastwam_text_context")
+    student_context_mask = student_out.get("fastwam_text_context_mask")
+    teacher_context = teacher_out.get("fastwam_text_context")
+    teacher_context_mask = teacher_out.get("fastwam_text_context_mask")
+    required = [student_video, teacher_video, student_context, student_context_mask, teacher_context, teacher_context_mask]
+    if any(x is None for x in required):
+        raise RuntimeError("FastWAM encoded latents/context are required for flow distillation.")
+
+    sample_steps = int(getattr(args, "flow_distill_sampling_steps", 0) or 0)
+    if sample_steps <= 0:
+        sample_steps = int(getattr(args, "sampling_steps", cfg.action_sampling_steps))
+    sample_steps = max(sample_steps, 1)
+    action_horizon = max(int(getattr(cfg, "action_sequence_horizon", 1)), 1)
+
+    was_training = student_model.training
+    with torch.no_grad():
+        try:
+            student_model.eval()
+            sampled_action = student_model.fastwam.sample_action(
+                first_frame_latents=student_video[:, :, :1],
+                context=student_context,
+                context_mask=student_context_mask,
+                action_horizon=action_horizon,
+                num_steps=sample_steps,
+            )
+            if isinstance(sampled_action, tuple):
+                sampled_action = sampled_action[0]
+            sampled_action = sampled_action.detach()
+        finally:
+            if was_training:
+                student_model.train()
+
+    b = sampled_action.size(0)
+    timestep = student_model.fastwam.action_scheduler.sample_training_t(
+        b,
+        sampled_action.device,
+        sampled_action.dtype,
+    )
+    noise = torch.randn_like(sampled_action)
+    noisy_action = student_model.fastwam.action_scheduler.add_noise(sampled_action, noise, timestep).detach()
+
+    with torch.no_grad():
+        teacher_velocity = teacher_model.fastwam.predict_action_velocity(
+            first_frame_latents=teacher_video,
+            context=teacher_context,
+            context_mask=teacher_context_mask,
+            noisy_action=noisy_action,
+            timestep=timestep,
+        ).detach()
+
+    student_velocity = student_model.fastwam.predict_action_velocity(
+        first_frame_latents=student_video,
+        context=student_context,
+        context_mask=student_context_mask,
+        noisy_action=noisy_action,
+        timestep=timestep,
+    )
+    per_token = (student_velocity.float() - teacher_velocity.float()).pow(2).mean(dim=-1)
+    token_mask = align_action_token_mask(valid_mask, per_token.size(1), per_token.device)
+    if token_mask is None:
+        return per_token.mean()
+    return (per_token * token_mask).sum() / token_mask.sum().clamp(min=1.0)
+
+
 def self_distill_losses(
     student_out: Dict[str, torch.Tensor],
     teacher_out: Dict[str, torch.Tensor],
@@ -523,26 +667,56 @@ def self_distill_losses(
     batch: Dict[str, Any],
     cfg: ModelConfig,
     args: argparse.Namespace,
+    global_step: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     valid_mask = batch.get("valid_mask")
     sup = world_model_dit_loss(student_out, batch, cfg, valid_mask=valid_mask)
 
     losses: Dict[str, torch.Tensor] = {f"sup_{k}": v for k, v in sup.items()}
 
-    student_belief = belief_feat(student_out)
-    with torch.no_grad():
-        teacher_belief = belief_feat(teacher_out)
+    ref = student_out.get("feat", student_out.get("obs_embed"))
+    if ref is None:
+        ref = batch["expert_action"]
+    zero = torch.zeros((), device=ref.device, dtype=ref.dtype if ref.is_floating_point() else torch.float32)
 
-    feat_loss = masked_mse_lastdim(student_belief, teacher_belief, valid_mask)
-    use_fastwam = bool(getattr(cfg, "use_fastwam_mot", False))
-    action_loss = torch.zeros((), device=feat_loss.device, dtype=feat_loss.dtype)
-    action_loss = action_distillation_loss(student_out, teacher_out, valid_mask, cfg)
+    if float(getattr(args, "feat_distill_weight", 0.0)) > 0.0:
+        student_belief = belief_feat(student_out)
+        with torch.no_grad():
+            teacher_belief = belief_feat(teacher_out)
+        feat_loss = masked_mse_lastdim(student_belief, teacher_belief, valid_mask)
+    else:
+        feat_loss = zero
+
+    if float(getattr(args, "action_distill_weight", 0.0)) > 0.0:
+        action_loss = action_distillation_loss(student_out, teacher_out, valid_mask, cfg)
+    else:
+        action_loss = zero
+
+    flow_every = max(int(getattr(args, "flow_distill_every", 1)), 1)
+    use_flow = float(getattr(args, "flow_distill_weight", 0.0)) > 0.0
+    if global_step is not None and int(global_step) % flow_every != 0:
+        use_flow = False
+    if use_flow:
+        flow_loss = flow_distillation_loss(
+            student_model=student_model,
+            teacher_model=teacher_model,
+            student_out=student_out,
+            teacher_out=teacher_out,
+            valid_mask=valid_mask,
+            cfg=cfg,
+            args=args,
+        )
+    else:
+        flow_loss = zero
+
     total = (
         args.sup_weight * sup["total"]
+        + args.flow_distill_weight * flow_loss
         + args.feat_distill_weight * feat_loss
         + args.action_distill_weight * action_loss
     )
 
+    losses["flow_distill"] = flow_loss
     losses["feat_distill"] = feat_loss
     losses["action_distill"] = action_loss
     losses["total"] = total
@@ -606,6 +780,7 @@ def evaluate_distill(
             batch=batch,
             cfg=student_cfg,
             args=args,
+            global_step=None,
         )
         summary = summarize_losses(losses)
         for k, v in summary.items():
@@ -656,6 +831,7 @@ def build_loaders(
         random_crop=True,
         wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
         action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
+        force_load_rgb=cfg.use_target_similarity_guidance and cfg.target_similarity_feature_source == "rgb_cnn",
     )
 
     train_sampler = (
@@ -697,6 +873,7 @@ def build_loaders(
             random_crop=False,
             wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
             action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
+            force_load_rgb=cfg.use_target_similarity_guidance and cfg.target_similarity_feature_source == "rgb_cnn",
         )
         val_loader = DataLoader(
             val_dataset,
@@ -723,6 +900,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--save-dir", type=str, required=True)
     parser.add_argument("--teacher-ckpt", type=str, required=True)
+    parser.add_argument("--student-init-ckpt", type=str, default="")
     parser.add_argument("--resume", type=str, default=None)
 
     # Model / data config
@@ -746,9 +924,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--use-target-relative-context", type=_str2bool, default=None)
     parser.add_argument("--student-use-target-relative-context", type=_str2bool, default=None)
+    parser.add_argument("--target-relative-context-input-mode", type=str, default=None, choices=["xyz", "yz", "no_x", "without_x", "lateral_vertical"])
+    parser.add_argument("--student-target-relative-context-input-mode", type=str, default=None, choices=["xyz", "yz", "no_x", "without_x", "lateral_vertical"])
     parser.add_argument("--target-relative-context-scale", type=float, default=None)
     parser.add_argument("--target-relative-token-scale", type=float, default=None)
     parser.add_argument("--target-relative-context-hidden-dim", type=int, default=None)
+    parser.add_argument("--target-similarity-context-mode", type=str, default=None, choices=["dense", "camera_yz_text"])
+    parser.add_argument("--target-similarity-condition-dim", type=int, default=None)
+    parser.add_argument("--target-similarity-condition-mode", type=str, default=None, choices=["image_center", "center", "pixel_center", "normalized_center", "camera_yz", "camera_bearing", "bearing", "ray_yz"])
+    parser.add_argument("--target-similarity-condition-source", type=str, default=None, choices=["predicted", "gt", "ground_truth", "oracle", "mixed", "gt_mix", "mix"])
+    parser.add_argument("--target-similarity-condition-gt-mix-prob", type=float, default=None)
+    parser.add_argument("--target-similarity-reacquire-confidence-min", type=float, default=None)
+    parser.add_argument("--target-similarity-reacquire-confidence-ratio", type=float, default=None)
+    parser.add_argument("--target-similarity-reacquire-entropy-max", type=float, default=None)
+    parser.add_argument("--target-similarity-reacquire-margin-min", type=float, default=None)
     parser.add_argument("--use-wan22-encoders", type=_str2bool, default=None)
     parser.add_argument("--wan22-model-base-path", type=str, default=None)
     parser.add_argument("--wan22-fastwam-src-path", type=str, default=None)
@@ -788,7 +977,10 @@ def parse_args() -> argparse.Namespace:
 
     # Distillation weights. Keep the first version clean.
     parser.add_argument("--sup-weight", type=float, default=1.0)
-    parser.add_argument("--feat-distill-weight", type=float, default=0.1)
+    parser.add_argument("--flow-distill-weight", type=float, default=1.0)
+    parser.add_argument("--flow-distill-every", type=int, default=1)
+    parser.add_argument("--flow-distill-sampling-steps", type=int, default=0)
+    parser.add_argument("--feat-distill-weight", type=float, default=0.0)
     parser.add_argument("--action-distill-weight", type=float, default=0.0)
 
     # Student initialization
@@ -887,8 +1079,9 @@ def main() -> None:
             f"train_next_target_relative={student_cfg.train_next_target_relative}, rollout_head=false"
         )
         print(
-            f"[distill] sup={args.sup_weight}, feat={args.feat_distill_weight}, "
-            f"action={args.action_distill_weight}"
+            f"[distill] sup={args.sup_weight}, flow={args.flow_distill_weight}, "
+            f"flow_every={args.flow_distill_every}, flow_sampling_steps={args.flow_distill_sampling_steps or args.sampling_steps}, "
+            f"feat={args.feat_distill_weight}, action={args.action_distill_weight}"
         )
 
     teacher = TeacherWorldModelDiT(teacher_cfg).to(device)
@@ -898,7 +1091,11 @@ def main() -> None:
         print(f"[teacher] loaded frozen teacher: {args.teacher_ckpt}")
 
     student = TeacherWorldModelDiT(student_cfg).to(device)
-    if args.init_student_from_teacher:
+    if str(args.student_init_ckpt or "").strip():
+        load_model_state(student, args.student_init_ckpt, strict=False)
+        if _is_main_process():
+            print(f"[student] initialized from warmup checkpoint: {args.student_init_ckpt}")
+    elif args.init_student_from_teacher:
         load_model_state(student, args.teacher_ckpt, strict=False)
         if _is_main_process():
             print("[student] initialized from teacher checkpoint")
@@ -1068,6 +1265,7 @@ def main() -> None:
                     batch=batch,
                     cfg=student_cfg,
                     args=args,
+                    global_step=global_step,
                 )
                 loss = losses["total"]
 
@@ -1098,8 +1296,10 @@ def main() -> None:
                     "step": global_step,
                     "total": f"{avg.get('total', 0.0):.4f}",
                     "sup": f"{avg.get('sup_total', 0.0):.4f}",
-                    "feat": f"{avg.get('feat_distill', 0.0):.4f}",
+                    "flow": f"{avg.get('flow_distill', 0.0):.4f}",
                 }
+                if abs(avg.get("feat_distill", 0.0)) >= 1e-12:
+                    postfix["feat"] = f"{avg['feat_distill']:.4f}"
                 if abs(avg.get("action_distill", 0.0)) >= 1e-12:
                     postfix["action"] = f"{avg['action_distill']:.4f}"
                 total_pbar.set_postfix(**postfix)

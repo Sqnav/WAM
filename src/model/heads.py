@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from data.visual_guidance import make_attention_heatmap, project_body_to_image
 from .action_loss_utils import weighted_mean_action_squared_error
 from .config import ModelConfig
 from .encoders import MLP, _ensure_fastwam_path, _torch_dtype_from_name
@@ -679,7 +680,6 @@ class FastWAMHead(nn.Module):
         )
         self.video_scheduler = FlowMatchScheduler(cfg.fastwam_video_train_timesteps, cfg.fastwam_video_shift)
         self.action_scheduler = FlowMatchScheduler(cfg.fastwam_action_train_timesteps, cfg.fastwam_action_shift)
-
     def _video_dit_config(self, cfg: ModelConfig) -> Dict[str, Any]:
         return {
             "has_image_input": False,
@@ -798,6 +798,156 @@ class FastWAMHead(nn.Module):
                 action_mask = action_mask * valid_mask[:, 1:]
         return action, action_mask
 
+    def _forward_training_mot_with_attention(
+        self,
+        video_pre: Dict[str, torch.Tensor],
+        action_pre: Dict[str, torch.Tensor],
+        attention_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        xv = video_pre["tokens"]
+        xa = action_pre["tokens"]
+        video_seq_len = int(xv.size(1))
+        action_seq_len = int(xa.size(1))
+        total_seq_len = video_seq_len + action_seq_len
+        action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
+        video_context = {"context": video_pre["context"], "mask": video_pre["context_mask"]}
+        action_context = {"context": action_pre["context"], "mask": action_pre["context_mask"]}
+        last_action_attention = None
+
+        for layer_idx in range(self.mot.num_layers):
+            video_block = self.video_expert.blocks[layer_idx]
+            action_block = self.action_expert.blocks[layer_idx]
+            v_io = self.mot._build_expert_attention_io(
+                expert=self.video_expert,
+                block=video_block,
+                x=xv,
+                freqs=video_pre["freqs"],
+                t_mod=video_pre["t_mod"],
+            )
+            a_io = self.mot._build_expert_attention_io(
+                expert=self.action_expert,
+                block=action_block,
+                x=xa,
+                freqs=action_pre["freqs"],
+                t_mod=action_pre["t_mod"],
+            )
+            q_cat = torch.cat([v_io[0], a_io[0]], dim=1)
+            k_cat = torch.cat([v_io[1], a_io[1]], dim=1)
+            v_cat = torch.cat([v_io[2], a_io[2]], dim=1)
+
+            if layer_idx == self.mot.num_layers - 1:
+                q_action = a_io[0]
+                bsz, query_len, hidden = q_action.shape
+                num_heads = int(self.mot.num_heads)
+                head_dim = hidden // max(num_heads, 1)
+                qh = q_action.reshape(bsz, query_len, num_heads, head_dim).transpose(1, 2).float()
+                kh = k_cat.reshape(bsz, total_seq_len, num_heads, head_dim).transpose(1, 2).float()
+                scores = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(max(head_dim, 1))
+                mask = action_attention_mask.to(device=scores.device, dtype=torch.bool).view(
+                    1, 1, query_len, total_seq_len
+                )
+                scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+                last_action_attention = torch.softmax(scores, dim=-1)[..., :video_seq_len]
+
+            mixed = self.mot._mixed_attention(
+                q_cat=q_cat,
+                k_cat=k_cat,
+                v_cat=v_cat,
+                attention_mask=attention_mask,
+            )
+            mixed_video = mixed[:, :video_seq_len]
+            mixed_action = mixed[:, video_seq_len:]
+            xv = self.mot._apply_post_with_optional_checkpoint(
+                block=video_block,
+                residual_x=v_io[3],
+                gate_msa=v_io[4],
+                shift_mlp=v_io[5],
+                scale_mlp=v_io[6],
+                gate_mlp=v_io[7],
+                use_gradient_checkpointing=v_io[8],
+                mixed_slice=mixed_video,
+                context_payload=video_context,
+            )
+            xa = self.mot._apply_post_with_optional_checkpoint(
+                block=action_block,
+                residual_x=a_io[3],
+                gate_msa=a_io[4],
+                shift_mlp=a_io[5],
+                scale_mlp=a_io[6],
+                gate_mlp=a_io[7],
+                use_gradient_checkpointing=a_io[8],
+                mixed_slice=mixed_action,
+                context_payload=action_context,
+            )
+
+        if last_action_attention is None:
+            raise RuntimeError("Failed to capture training last-layer action attention.")
+        return {"video": xv, "action": xa, "last_action_attention": last_action_attention}
+
+    def _attention_heatmap_loss(
+        self,
+        last_action_attention: torch.Tensor,
+        video_pre: Dict[str, torch.Tensor],
+        target_relative: torch.Tensor,
+        action_valid_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if target_relative is None:
+            raise RuntimeError("FastWAM attention heatmap loss requires target_relative.")
+        if target_relative.ndim != 3 or target_relative.size(-1) < 3:
+            raise ValueError("target_relative must have shape [B, T, D>=3].")
+        if last_action_attention.ndim != 4:
+            raise ValueError("last_action_attention must have shape [B, heads, action_queries, video_tokens].")
+
+        bsz = int(last_action_attention.size(0))
+        _, grid_h, grid_w = (int(v) for v in video_pre["meta"]["grid_size"])
+        tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+        first_frame_tokens = min(tokens_per_frame, int(last_action_attention.size(-1)))
+        if first_frame_tokens != grid_h * grid_w:
+            raise ValueError(
+                "First-frame token count must match video token grid for attention heatmap loss; "
+                f"got first_frame_tokens={first_frame_tokens}, grid={grid_h}x{grid_w}."
+            )
+
+        target_first = target_relative[:, :1, :3].to(device=last_action_attention.device, dtype=torch.float32)
+        _, visible = project_body_to_image(
+            target_first[:, 0],
+            (grid_h, grid_w),
+            fov_deg=float(getattr(self.cfg, "fastwam_attention_heatmap_fov_deg", 90.0)),
+            camera_offset_body=getattr(self.cfg, "fastwam_attention_heatmap_camera_offset_body", None),
+        )
+        gt_heatmap = make_attention_heatmap(
+            target_first,
+            (grid_h, grid_w),
+            fov_deg=float(getattr(self.cfg, "fastwam_attention_heatmap_fov_deg", 90.0)),
+            sigma=float(getattr(self.cfg, "fastwam_attention_heatmap_sigma", 0.08)),
+            camera_offset_body=getattr(self.cfg, "fastwam_attention_heatmap_camera_offset_body", None),
+        )
+        gt_flat = gt_heatmap.reshape(bsz, first_frame_tokens).clamp_min(1.0e-12)
+        visible = visible.to(device=last_action_attention.device, dtype=torch.bool)
+        if action_valid_mask is None:
+            query_valid = torch.ones(
+                (bsz, int(last_action_attention.size(2))),
+                device=last_action_attention.device,
+                dtype=torch.bool,
+            )
+        else:
+            query_valid = action_valid_mask.to(device=last_action_attention.device, dtype=torch.bool)
+            if query_valid.ndim == 3 and query_valid.size(-1) == 1:
+                query_valid = query_valid.squeeze(-1)
+            if query_valid.ndim != 2:
+                raise ValueError("action_valid_mask must have shape [B, action_queries].")
+            query_valid = query_valid[:, : int(last_action_attention.size(2))]
+        valid = visible[:, None] & query_valid
+        if not valid.any():
+            return last_action_attention.sum() * 0.0
+
+        attn = last_action_attention[..., :first_frame_tokens].float().clamp_min(1.0e-8)
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+        gt_dist = gt_flat / gt_flat.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+        kl = (gt_dist[:, None, None, :] * (gt_dist[:, None, None, :].log() - attn.log())).sum(dim=-1)
+        valid = valid[:, None, :].expand_as(kl)
+        return kl[valid].mean()
+
     def training_loss(
         self,
         video_latents: torch.Tensor,
@@ -805,6 +955,7 @@ class FastWAMHead(nn.Module):
         context_mask: torch.Tensor,
         expert_action: torch.Tensor,
         valid_mask: Optional[torch.Tensor],
+        target_relative: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if video_latents.ndim != 5:
             raise ValueError("video_latents must have shape [B, C, T_lat, H_lat, W_lat].")
@@ -853,16 +1004,31 @@ class FastWAMHead(nn.Module):
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_latents.device,
         )
-        out = self.mot(
-            embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
-            attention_mask=mask,
-            freqs_all={"video": video_pre["freqs"], "action": action_pre["freqs"]},
-            context_all={
-                "video": {"context": video_pre["context"], "mask": video_pre["context_mask"]},
-                "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
-            },
-            t_mod_all={"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
-        )
+        if bool(getattr(self.cfg, "use_fastwam_attention_heatmap_loss", False)):
+            out = self._forward_training_mot_with_attention(
+                video_pre=video_pre,
+                action_pre=action_pre,
+                attention_mask=mask,
+            )
+            loss_attention_heatmap = self._attention_heatmap_loss(
+                out["last_action_attention"],
+                video_pre,
+                target_relative,
+                action_valid_mask,
+            )
+        else:
+            mot_kwargs = {
+                "embeds_all": {"video": video_pre["tokens"], "action": action_pre["tokens"]},
+                "attention_mask": mask,
+                "freqs_all": {"video": video_pre["freqs"], "action": action_pre["freqs"]},
+                "context_all": {
+                    "video": {"context": video_pre["context"], "mask": video_pre["context_mask"]},
+                    "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
+                },
+                "t_mod_all": {"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
+            }
+            out = self.mot(**mot_kwargs)
+            loss_attention_heatmap = video_latents.sum() * 0.0
         pred_video = self.video_expert.post_dit(out["video"], video_pre)
         pred_action = self.action_expert.post_dit(out["action"], action_pre)
 
@@ -882,11 +1048,13 @@ class FastWAMHead(nn.Module):
         action_weight = self.action_scheduler.training_weight(t_action).to(action_loss_per_sample.device, action_loss_per_sample.dtype)
         loss_action = (action_loss_per_sample * action_weight).mean()
 
-        return {
+        result = {
             "loss_video": loss_video,
             "loss_action": loss_action,
+            "loss_attention_heatmap": loss_attention_heatmap,
             "pred_action": pred_action.reshape(b, action_token_len, 1, self.cfg.action_dim),
         }
+        return result
 
     @torch.no_grad()
     def _build_mot_attention_mask(
@@ -1099,3 +1267,86 @@ class FastWAMHead(nn.Module):
             grid_size = tuple(int(x) for x in video_pre["meta"]["grid_size"])
             return action, {"last_transformer_attention": last_attention, "video_grid_size": grid_size}
         return action
+
+    def predict_action_velocity(
+        self,
+        first_frame_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        noisy_action: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict FastWAM action flow velocity at a supplied noisy action point.
+
+        This mirrors the online action-denoising path: cache current-frame video
+        tokens once, then run the action expert with video/action MoT attention.
+        """
+        if first_frame_latents.ndim != 5:
+            raise ValueError("first_frame_latents must have shape [B, C, T, H, W].")
+        if noisy_action.ndim != 3:
+            raise ValueError("noisy_action must have shape [B, H, action_dim].")
+        if noisy_action.size(-1) != int(self.cfg.action_dim):
+            raise ValueError(
+                f"noisy_action last dim must be action_dim={int(self.cfg.action_dim)}, "
+                f"got {noisy_action.size(-1)}."
+            )
+
+        first_frame_latents = first_frame_latents[:, :, :1]
+        b = first_frame_latents.size(0)
+        if noisy_action.size(0) != b:
+            raise ValueError("noisy_action batch size must match first_frame_latents.")
+        device = first_frame_latents.device
+        dtype = first_frame_latents.dtype
+
+        context = context.to(device=device, dtype=dtype)
+        context_mask = context_mask.to(device=device, dtype=torch.bool)
+        noisy_action = noisy_action.to(device=device, dtype=dtype)
+        if timestep.ndim == 0:
+            timestep = timestep.view(1).expand(b)
+        elif timestep.ndim > 1:
+            timestep = timestep.reshape(timestep.size(0), -1)[:, 0]
+        if timestep.size(0) == 1 and b > 1:
+            timestep = timestep.expand(b)
+        if timestep.size(0) != b:
+            raise ValueError(f"timestep must have length 1 or batch_size={b}, got {timestep.size(0)}.")
+        timestep = timestep.to(device=device, dtype=dtype)
+
+        t_video = torch.zeros(b, device=device, dtype=dtype)
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=t_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=True,
+        )
+        video_len = video_pre["tokens"].size(1)
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep,
+            context=context,
+            context_mask=context_mask,
+        )
+        mask = self._build_mot_attention_mask(
+            video_seq_len=video_len,
+            action_seq_len=action_pre["tokens"].size(1),
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={"context": video_pre["context"], "mask": video_pre["context_mask"]},
+            video_attention_mask=mask[:video_len, :video_len],
+        )
+        action_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={"context": action_pre["context"], "mask": action_pre["context_mask"]},
+            video_kv_cache=video_kv_cache,
+            attention_mask=mask,
+            video_seq_len=video_len,
+        )
+        return self.action_expert.post_dit(action_tokens, action_pre)

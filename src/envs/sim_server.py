@@ -133,30 +133,11 @@ _global_port = 30000
 _global_gpu_ids = [0]
 
 
-def _parse_gpu_adapter_map(raw: str) -> dict[int, int]:
-    """Parse nvidia-smi GPU id -> UE -GraphicsAdapter id mapping."""
-    result = {}
-    for item in str(raw or "").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        gpu_id, adapter_id = item.split(":", 1)
-        result[int(gpu_id.strip())] = int(adapter_id.strip())
-    return result
-
-
-def _gpu_id_to_graphics_adapter(gpu_id: int) -> int:
-    """Map nvidia-smi GPU id to UE/Vulkan GraphicsAdapter id."""
-    raw_map = os.environ.get("UE_GRAPHICS_ADAPTER_MAP", "0:1,1:3,2:4,3:0,4:5,5:2")
-    try:
-        adapter_map = _parse_gpu_adapter_map(raw_map)
-    except Exception as e:
-        print(f"Warning: failed to parse UE_GRAPHICS_ADAPTER_MAP={raw_map!r}; using gpu_id directly: {e}")
-        return int(gpu_id)
-    return int(adapter_map.get(int(gpu_id), int(gpu_id)))
-
-
 def create_drones(port: int) -> dict:
+    capture_settings = [
+        {"ImageType": 0, "Width": 640, "Height": 640, "FOV_Degrees": 90},
+        {"ImageType": 2, "Width": 640, "Height": 640, "FOV_Degrees": 90},
+    ]
     return {
         "SettingsVersion": 1.2,
         "SimMode": "Multirotor",
@@ -166,10 +147,18 @@ def create_drones(port: int) -> dict:
             "Drone_1": {"VehicleType": "SimpleFlight"}
         },
         "CameraDefaults": {
-            "CaptureSettings": [
-                {"ImageType": 0, "Width": 640, "Height": 640, "FOV_Degrees": 90},
-                {"ImageType": 2, "Width": 640, "Height": 640, "FOV_Degrees": 90},
-            ]
+            "CaptureSettings": capture_settings,
+        },
+        "ExternalCameras": {
+            "0": {
+                "X": 0,
+                "Y": 0,
+                "Z": -10,
+                "Pitch": 0,
+                "Roll": 0,
+                "Yaw": 0,
+                "CaptureSettings": capture_settings,
+            }
         },
         "ApiServerPort": int(port),
     }
@@ -256,7 +245,7 @@ class EventHandler(object):
 
     def _kill_untracked_scene_processes_for_gpus_locked(self, gpu_ids) -> None:
         target_adapters = {
-            str(_gpu_id_to_graphics_adapter(int(gpu_id)))
+            str(int(gpu_id))
             for gpu_id in gpu_ids
         }
         if not target_adapters:
@@ -437,14 +426,14 @@ class EventHandler(object):
                 except Exception as e:
                     raise Exception(f"Scene script not executable: {env_path}; failed to chmod +x: {e}")
 
-            vulkan_gpu_id = _gpu_id_to_graphics_adapter(int(gpu_id))
+            graphics_adapter_id = int(gpu_id)
             settings_path = str(settings_dir / 'settings.json')
             import getpass
             current_user = getpass.getuser()
             if current_user == 'root':
-                subprocess_execute = f'runuser -l ysq -c "export CUDA_VISIBLE_DEVICES={gpu_id} && bash {env_path} -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter={vulkan_gpu_id} -settings=\'{settings_path}\'"'
+                subprocess_execute = f'runuser -l ysq -c "export CUDA_VISIBLE_DEVICES={gpu_id} && bash {env_path} -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter={graphics_adapter_id} -settings=\'{settings_path}\'"'
             else:
-                subprocess_execute = f'CUDA_VISIBLE_DEVICES={gpu_id} bash {env_path} -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter={vulkan_gpu_id} -settings=\'{settings_path}\''
+                subprocess_execute = f'CUDA_VISIBLE_DEVICES={gpu_id} bash {env_path} -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter={graphics_adapter_id} -settings=\'{settings_path}\''
 
             time.sleep(1)
             print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tScene {scen_id} start cmd: {subprocess_execute}")
@@ -475,7 +464,7 @@ class EventHandler(object):
                     self.scene_processes[scen_id] = {'process': p, 'port': ports[index], 'gpu_id': gpu_id}
                     if ports[index] not in self.scene_used_ports:
                         self.scene_used_ports.append(ports[index])
-                print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tScene {scen_id} starting, GPU {gpu_id} -> GraphicsAdapter {vulkan_gpu_id}, log: {log_file_path}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tScene {scen_id} starting, GPU {gpu_id}, GraphicsAdapter {graphics_adapter_id}, log: {log_file_path}")
             except Exception as e:
                 raise Exception(f"Failed to start scene: {e}")
 

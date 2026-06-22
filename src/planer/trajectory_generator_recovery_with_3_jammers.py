@@ -28,7 +28,7 @@ MAP_DIR = os.environ.get("MAP_DIR", "/data1/ysq/OurVLN/Plandataset/map")
 UDF_CACHE_DIR = os.environ.get("UDF_CACHE_DIR", "/data1/ysq/OurVLN/Plandataset/udf_cache")
 OUTPUT_DIR = os.environ.get("RECOVERY_OUTPUT_DIR", "/data1/ysq/Worldmodel/Plandataset")
 
-DEFAULT_CITY_LIST = ",".join(f"city_{i}" for i in range(1, 3))
+DEFAULT_CITY_LIST = ",".join(f"city_{i}" for i in range(1, 31))
 CITY_LIST = [c.strip() for c in os.environ.get("RECOVERY_CITY_LIST", DEFAULT_CITY_LIST).split(",") if c.strip()]
 NUM_TRAJECTORIES = int(os.environ.get("RECOVERY_NUM_TRAJECTORIES", os.environ.get("NUM_TRAJECTORIES", "500")))
 

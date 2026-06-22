@@ -32,15 +32,12 @@ export PYTHONPATH="$root_dir/code/src:${PYTHONPATH:-}"
 GPUS="${GPUS:-1}"
 PORT="${PORT:-30000}"
 ROOT_PATH="${ROOT_PATH:-$root_dir}"
-UE_GRAPHICS_ADAPTER_MAP="${UE_GRAPHICS_ADAPTER_MAP:-0:1,1:3,2:4,3:0,4:5,5:2}"
-export UE_GRAPHICS_ADAPTER_MAP
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SIM_SERVER_PY="${SIM_SERVER_PY:-$root_dir/code/src/envs/sim_server.py}"
 
 echo "[sim_server] env=${CONDA_ENV_NAME} python=$(command -v "$PYTHON_BIN")"
 echo "[sim_server] gpus=${GPUS} port=${PORT} root_path=${ROOT_PATH}"
-echo "[sim_server] UE_GRAPHICS_ADAPTER_MAP=${UE_GRAPHICS_ADAPTER_MAP}"
 echo "[sim_server] script=${SIM_SERVER_PY}"
 
 exec "$PYTHON_BIN" "$SIM_SERVER_PY" \

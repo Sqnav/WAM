@@ -24,5 +24,29 @@
       }
     ]
   },
+  "ExternalCameras": {
+    "0": {
+      "X": 0,
+      "Y": 0,
+      "Z": -10,
+      "Pitch": 0,
+      "Roll": 0,
+      "Yaw": 0,
+      "CaptureSettings": [
+        {
+          "ImageType": 0,
+          "Width": 640,
+          "Height": 640,
+          "FOV_Degrees": 90
+        },
+        {
+          "ImageType": 2,
+          "Width": 640,
+          "Height": 640,
+          "FOV_Degrees": 90
+        }
+      ]
+    }
+  },
   "ApiServerPort": 30001
 }

@@ -17,6 +17,25 @@ def masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
     return (x * mask).sum() / mask.sum().clamp(min=1.0)
 
 
+def align_time_mask(mask: torch.Tensor, length: int, device: torch.device) -> torch.Tensor:
+    if mask.ndim == 3 and mask.size(-1) == 1:
+        mask = mask.squeeze(-1)
+    if mask.ndim != 2:
+        raise ValueError("valid_mask must have shape [B, T] or [B, T, 1].")
+    mask = mask.to(device=device, dtype=torch.bool)
+    if mask.size(1) == int(length):
+        return mask
+    if mask.size(1) <= 0:
+        raise ValueError("valid_mask must have at least one timestep.")
+    idx = torch.linspace(
+        0,
+        mask.size(1) - 1,
+        int(length),
+        device=device,
+    ).round().long()
+    return mask[:, idx]
+
+
 def kl_normal(mean_q: torch.Tensor, std_q: torch.Tensor, mean_p: torch.Tensor, std_p: torch.Tensor) -> torch.Tensor:
     var_q = std_q.pow(2)
     var_p = std_p.pow(2)
@@ -149,6 +168,60 @@ def world_model_dit_loss(
         losses["action"] = torch.zeros((), device=device, dtype=dtype)
         losses["x0_action"] = torch.zeros((), device=device, dtype=dtype)
 
+    sim_enabled = bool(getattr(cfg, "use_target_similarity_guidance", False))
+    losses["target_similarity_center"] = z
+    losses["target_similarity_heatmap"] = z
+    losses["target_similarity_identity"] = z
+    losses["fastwam_attention_heatmap"] = z
+    if sim_enabled:
+        required = [
+            "target_similarity_center",
+            "target_similarity_heatmap",
+            "target_similarity_identity",
+            "target_similarity_target_features",
+            "target_similarity_gt_heatmap",
+            "target_similarity_gt_center",
+            "target_similarity_visible",
+        ]
+        missing = [k for k in required if k not in outputs]
+        if missing:
+            raise RuntimeError(f"Target similarity guidance enabled but missing outputs: {missing}")
+        visible = outputs["target_similarity_visible"].to(device=device, dtype=torch.bool)
+        if valid_mask is not None:
+            visible = visible & align_time_mask(valid_mask, visible.size(1), device=device)
+
+        if visible.any():
+            pred_center = outputs["target_similarity_center"].float()
+            gt_center = outputs["target_similarity_gt_center"].to(device=pred_center.device, dtype=torch.float32)
+            center_err = (pred_center - gt_center).pow(2).sum(dim=-1)
+            losses["target_similarity_center"] = center_err[visible].mean()
+
+            pred_heatmap = outputs["target_similarity_heatmap"].float()
+            gt_heatmap = outputs["target_similarity_gt_heatmap"].to(device=pred_heatmap.device, dtype=torch.float32)
+            pred_dist = pred_heatmap.reshape(pred_heatmap.size(0), pred_heatmap.size(1), -1).clamp_min(1.0e-8)
+            pred_dist = pred_dist / pred_dist.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+            gt_dist = gt_heatmap.reshape(gt_heatmap.size(0), gt_heatmap.size(1), -1).clamp_min(1.0e-8)
+            gt_dist = gt_dist / gt_dist.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+            heatmap_kl = (gt_dist * (gt_dist.log() - pred_dist.log())).sum(dim=-1)
+            losses["target_similarity_heatmap"] = heatmap_kl[visible].mean()
+
+            identity = outputs["target_similarity_identity"].float()
+            target_features = outputs["target_similarity_target_features"].float()
+            identity_n = torch.nn.functional.normalize(identity, dim=-1)
+            target_n = torch.nn.functional.normalize(target_features, dim=-1)
+            identity_loss = 1.0 - (target_n * identity_n.unsqueeze(1)).sum(dim=-1)
+            losses["target_similarity_identity"] = identity_loss[visible].mean()
+        else:
+            zero_ref = outputs["target_similarity_heatmap"].float().sum() * 0.0
+            losses["target_similarity_center"] = zero_ref
+            losses["target_similarity_heatmap"] = zero_ref
+            losses["target_similarity_identity"] = zero_ref
+
+    if bool(getattr(cfg, "use_fastwam_attention_heatmap_loss", False)):
+        if "fastwam_attention_heatmap_loss" not in outputs:
+            raise RuntimeError("FastWAM attention heatmap loss enabled but missing fastwam_attention_heatmap_loss output.")
+        losses["fastwam_attention_heatmap"] = outputs["fastwam_attention_heatmap_loss"]
+
     # DiT actor uses the standard diffusion denoising objective as
     # losses["action"]; an optional x0 reconstruction term keeps the sampled
     # clean trajectory aligned with expert actions.
@@ -161,6 +234,12 @@ def world_model_dit_loss(
     if train_next_target_relative:
         total = total + float(cfg.next_target_relative_loss_weight) * losses["next_target_relative"]
         total = total + float(cfg.prior_target_relative_loss_weight) * losses["prior_next_target_relative"]
+    if sim_enabled:
+        total = total + float(getattr(cfg, "target_similarity_center_loss_weight", 1.0)) * losses["target_similarity_center"]
+        total = total + float(getattr(cfg, "target_similarity_heatmap_loss_weight", 1.0)) * losses["target_similarity_heatmap"]
+        total = total + float(getattr(cfg, "target_similarity_identity_loss_weight", 0.1)) * losses["target_similarity_identity"]
+    if bool(getattr(cfg, "use_fastwam_attention_heatmap_loss", False)):
+        total = total + float(getattr(cfg, "fastwam_attention_heatmap_loss_weight", 0.1)) * losses["fastwam_attention_heatmap"]
     if bool(getattr(cfg, "use_fastwam_mot", False)):
         total = total + float(getattr(cfg, "fastwam_lambda_action", 1.0)) * losses["action"]
         total = total + float(getattr(cfg, "fastwam_lambda_video", 1.0)) * losses["video"]
