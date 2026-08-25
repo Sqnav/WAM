@@ -17,25 +17,6 @@ def masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
     return (x * mask).sum() / mask.sum().clamp(min=1.0)
 
 
-def align_time_mask(mask: torch.Tensor, length: int, device: torch.device) -> torch.Tensor:
-    if mask.ndim == 3 and mask.size(-1) == 1:
-        mask = mask.squeeze(-1)
-    if mask.ndim != 2:
-        raise ValueError("valid_mask must have shape [B, T] or [B, T, 1].")
-    mask = mask.to(device=device, dtype=torch.bool)
-    if mask.size(1) == int(length):
-        return mask
-    if mask.size(1) <= 0:
-        raise ValueError("valid_mask must have at least one timestep.")
-    idx = torch.linspace(
-        0,
-        mask.size(1) - 1,
-        int(length),
-        device=device,
-    ).round().long()
-    return mask[:, idx]
-
-
 def kl_normal(mean_q: torch.Tensor, std_q: torch.Tensor, mean_p: torch.Tensor, std_p: torch.Tensor) -> torch.Tensor:
     var_q = std_q.pow(2)
     var_p = std_p.pow(2)
@@ -54,6 +35,14 @@ def action_sequence_loss(
         raise ValueError("pred_sequence must have shape [B, T, H, A].")
     if expert_action.ndim != 3:
         raise ValueError("expert_action must have shape [B, T, A].")
+    if pred_sequence.size(0) != expert_action.size(0):
+        raise ValueError("pred_sequence and expert_action batch sizes must match.")
+    if pred_sequence.size(1) > expert_action.size(1):
+        raise ValueError("pred_sequence cannot be longer than expert_action.")
+    sequence_length = pred_sequence.size(1)
+    expert_action = expert_action[:, :sequence_length]
+    if valid_mask is not None:
+        valid_mask = valid_mask[:, :sequence_length]
 
     valid = valid_mask.float() if valid_mask is not None else torch.ones_like(expert_action[..., 0])
     horizon = pred_sequence.size(2)
@@ -77,6 +66,8 @@ def world_model_dit_loss(
     batch: Dict[str, torch.Tensor],
     cfg: ModelConfig,
     valid_mask: Optional[torch.Tensor] = None,
+    *,
+    localization_only: bool = False,
 ) -> Dict[str, torch.Tensor]:
     ref = outputs.get("feat", outputs.get("obs_embed"))
     if ref is None:
@@ -138,7 +129,18 @@ def world_model_dit_loss(
 
     if train_direct_action and "policy_flow_loss" in outputs:
         losses["action"] = outputs["policy_flow_loss"]
-        losses["x0_action"] = torch.zeros((), device=device, dtype=dtype)
+        if (
+            float(getattr(cfg, "x0_action_loss_weight", 0.0)) > 0.0
+            and "policy_action_sequence" in outputs
+        ):
+            losses["x0_action"] = action_sequence_loss(
+                outputs["policy_action_sequence"],
+                expert_action.float(),
+                outputs.get("policy_action_valid_mask", valid_mask),
+                cfg,
+            )
+        else:
+            losses["x0_action"] = torch.zeros((), device=device, dtype=dtype)
     elif train_direct_action and "policy_diffusion_loss" in outputs:
         losses["action"] = outputs["policy_diffusion_loss"]
         if float(getattr(cfg, "x0_action_loss_weight", 0.0)) > 0.0 and "policy_action_sequence" in outputs:
@@ -168,59 +170,46 @@ def world_model_dit_loss(
         losses["action"] = torch.zeros((), device=device, dtype=dtype)
         losses["x0_action"] = torch.zeros((), device=device, dtype=dtype)
 
-    sim_enabled = bool(getattr(cfg, "use_target_similarity_guidance", False))
-    losses["target_similarity_center"] = z
-    losses["target_similarity_heatmap"] = z
-    losses["target_similarity_identity"] = z
     losses["fastwam_attention_heatmap"] = z
-    if sim_enabled:
-        required = [
-            "target_similarity_center",
-            "target_similarity_heatmap",
-            "target_similarity_identity",
-            "target_similarity_target_features",
-            "target_similarity_gt_heatmap",
-            "target_similarity_gt_center",
-            "target_similarity_visible",
-        ]
-        missing = [k for k in required if k not in outputs]
-        if missing:
-            raise RuntimeError(f"Target similarity guidance enabled but missing outputs: {missing}")
-        visible = outputs["target_similarity_visible"].to(device=device, dtype=torch.bool)
-        if valid_mask is not None:
-            visible = visible & align_time_mask(valid_mask, visible.size(1), device=device)
-
-        if visible.any():
-            pred_center = outputs["target_similarity_center"].float()
-            gt_center = outputs["target_similarity_gt_center"].to(device=pred_center.device, dtype=torch.float32)
-            center_err = (pred_center - gt_center).pow(2).sum(dim=-1)
-            losses["target_similarity_center"] = center_err[visible].mean()
-
-            pred_heatmap = outputs["target_similarity_heatmap"].float()
-            gt_heatmap = outputs["target_similarity_gt_heatmap"].to(device=pred_heatmap.device, dtype=torch.float32)
-            pred_dist = pred_heatmap.reshape(pred_heatmap.size(0), pred_heatmap.size(1), -1).clamp_min(1.0e-8)
-            pred_dist = pred_dist / pred_dist.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
-            gt_dist = gt_heatmap.reshape(gt_heatmap.size(0), gt_heatmap.size(1), -1).clamp_min(1.0e-8)
-            gt_dist = gt_dist / gt_dist.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
-            heatmap_kl = (gt_dist * (gt_dist.log() - pred_dist.log())).sum(dim=-1)
-            losses["target_similarity_heatmap"] = heatmap_kl[visible].mean()
-
-            identity = outputs["target_similarity_identity"].float()
-            target_features = outputs["target_similarity_target_features"].float()
-            identity_n = torch.nn.functional.normalize(identity, dim=-1)
-            target_n = torch.nn.functional.normalize(target_features, dim=-1)
-            identity_loss = 1.0 - (target_n * identity_n.unsqueeze(1)).sum(dim=-1)
-            losses["target_similarity_identity"] = identity_loss[visible].mean()
-        else:
-            zero_ref = outputs["target_similarity_heatmap"].float().sum() * 0.0
-            losses["target_similarity_center"] = zero_ref
-            losses["target_similarity_heatmap"] = zero_ref
-            losses["target_similarity_identity"] = zero_ref
-
+    losses["fastwam_ortrack_consistency"] = z
+    losses["center_flow"] = outputs.get("center_flow_loss", z)
+    losses["current_center"] = outputs.get("current_center_loss", z)
+    losses["future_center"] = outputs.get("future_center_loss", z)
+    losses["center_transition"] = outputs.get("center_transition_loss", z)
+    losses["box_l1"] = outputs.get("box_l1_loss", z)
+    losses["box_giou"] = outputs.get("box_giou_loss", z)
+    losses["state_flow"] = outputs.get("state_flow_loss", z)
+    losses["current_box"] = outputs.get("current_box_loss", z)
+    losses["current_center_spatial"] = outputs.get("current_center_spatial_loss", z)
+    losses["current_box_giou"] = outputs.get("current_box_giou_loss", z)
+    losses["current_attention"] = outputs.get("current_attention_loss", z)
+    losses["capture_value"] = outputs.get("capture_value_loss", z)
+    for key in (
+        "state_valid_ratio",
+        "current_box_valid_ratio",
+        "state_to_action_gate_mean",
+        "current_box_action_gate_mean",
+        "predicted_s0_box_error",
+        "predicted_s0_center_error_pixels",
+        "predicted_future_state_error",
+        "capture_value_capture_loss",
+        "capture_value_distance_loss",
+        "capture_value_visibility_loss",
+        "capture_value_ranking_loss",
+        "capture_value_ranking_accuracy",
+        "capture_value_target_capture",
+    ):
+        losses[key] = outputs.get(key, z)
     if bool(getattr(cfg, "use_fastwam_attention_heatmap_loss", False)):
         if "fastwam_attention_heatmap_loss" not in outputs:
-            raise RuntimeError("FastWAM attention heatmap loss enabled but missing fastwam_attention_heatmap_loss output.")
+            raise RuntimeError("FastWAM attention heatmap loss is enabled but missing from model outputs.")
         losses["fastwam_attention_heatmap"] = outputs["fastwam_attention_heatmap_loss"]
+    if bool(getattr(cfg, "use_fastwam_tracker_heatmap_loss", False)):
+        if "fastwam_ortrack_consistency_loss" not in outputs:
+            raise RuntimeError("ORTrack consistency loss is enabled but missing from model outputs.")
+        losses["fastwam_ortrack_consistency"] = outputs["fastwam_ortrack_consistency_loss"]
+    if bool(getattr(cfg, "tracker_center_flow_supervision", False)) and "center_flow_loss" not in outputs:
+        raise RuntimeError("Center-flow supervision is enabled but the model did not return center_flow_loss.")
 
     # DiT actor uses the standard diffusion denoising objective as
     # losses["action"]; an optional x0 reconstruction term keeps the sampled
@@ -229,27 +218,105 @@ def world_model_dit_loss(
     kl_w = float(cfg.kl_weight)
 
     total = torch.zeros((), device=device, dtype=dtype)
-    if train_kl:
+    if bool(getattr(cfg, "use_future_state_dit", False)):
+        required_v4_losses = {
+            "state_flow_loss",
+            "current_box_loss",
+            "current_center_spatial_loss",
+            "current_box_giou_loss",
+            "current_attention_loss",
+        }
+        missing_v4_losses = sorted(required_v4_losses.difference(outputs))
+        if missing_v4_losses:
+            raise RuntimeError(
+                f"V4 Future State DiT losses are missing: {missing_v4_losses}."
+            )
+        localization_total = (
+            float(getattr(cfg, "current_box_weight", 5.0)) * losses["current_box"]
+            + float(getattr(cfg, "current_center_weight", 5.0))
+            * losses["current_center_spatial"]
+            + float(getattr(cfg, "current_box_giou_weight", 2.0))
+            * losses["current_box_giou"]
+            + float(getattr(cfg, "current_attention_weight", 1.0))
+            * losses["current_attention"]
+        )
+        joint_total = (
+            float(getattr(cfg, "fastwam_lambda_action", 1.0)) * losses["action"]
+            + float(getattr(cfg, "fastwam_lambda_video", 1.0)) * losses["video"]
+            + float(getattr(cfg, "x0_action_loss_weight", 0.0))
+            * losses["x0_action"]
+            + float(getattr(cfg, "future_state_flow_weight", 1.0)) * losses["state_flow"]
+            + localization_total
+        )
+        # Keep all expert loss graphs connected under DDP/DeepSpeed during the
+        # localization warmup, while applying gradients only to s0 localization.
+        total = (
+            localization_total
+            + 0.0
+            * (
+                losses["action"]
+                + losses["video"]
+                + losses["x0_action"]
+                + losses["state_flow"]
+            )
+            if localization_only
+            else joint_total
+        )
+        losses["localization_total"] = localization_total
+        losses["joint_total"] = joint_total
+        losses["localization_warmup_active"] = torch.as_tensor(
+            float(localization_only), device=device, dtype=dtype
+        )
+    elif train_kl:
         total = total + kl_w * losses["kl"]
-    if train_next_target_relative:
+    uses_structured_future = bool(getattr(cfg, "use_future_state_dit", False))
+    if not uses_structured_future and train_next_target_relative:
         total = total + float(cfg.next_target_relative_loss_weight) * losses["next_target_relative"]
         total = total + float(cfg.prior_target_relative_loss_weight) * losses["prior_next_target_relative"]
-    if sim_enabled:
-        total = total + float(getattr(cfg, "target_similarity_center_loss_weight", 1.0)) * losses["target_similarity_center"]
-        total = total + float(getattr(cfg, "target_similarity_heatmap_loss_weight", 1.0)) * losses["target_similarity_heatmap"]
-        total = total + float(getattr(cfg, "target_similarity_identity_loss_weight", 0.1)) * losses["target_similarity_identity"]
-    if bool(getattr(cfg, "use_fastwam_attention_heatmap_loss", False)):
-        total = total + float(getattr(cfg, "fastwam_attention_heatmap_loss_weight", 0.1)) * losses["fastwam_attention_heatmap"]
-    if bool(getattr(cfg, "use_fastwam_mot", False)):
-        total = total + float(getattr(cfg, "fastwam_lambda_action", 1.0)) * losses["action"]
-        total = total + float(getattr(cfg, "fastwam_lambda_video", 1.0)) * losses["video"]
-    elif train_direct_action and "policy_action" in outputs:
+    if not uses_structured_future and bool(getattr(cfg, "use_fastwam_attention_heatmap_loss", False)):
+        total = total + float(cfg.fastwam_attention_heatmap_loss_weight) * losses["fastwam_attention_heatmap"]
+    if not uses_structured_future and bool(getattr(cfg, "use_fastwam_tracker_heatmap_loss", False)):
+        total = total + float(cfg.fastwam_ortrack_consistency_loss_weight) * losses["fastwam_ortrack_consistency"]
+    if not uses_structured_future and bool(getattr(cfg, "use_fastwam_mot", False)):
+        capture_value_only = bool(
+            getattr(cfg, "use_capture_value_reranking", False)
+            and getattr(cfg, "capture_value_adapter_only", False)
+        )
+        if capture_value_only:
+            # Keep the frozen parent metrics visible without letting their
+            # stochastic denoising losses determine the best Value checkpoint.
+            total = total + 0.0 * (
+                losses["action"] + losses["video"] + losses["x0_action"]
+            )
+        else:
+            total = total + float(getattr(cfg, "fastwam_lambda_action", 1.0)) * losses["action"]
+            total = total + float(getattr(cfg, "fastwam_lambda_video", 1.0)) * losses["video"]
+            total = total + float(getattr(cfg, "x0_action_loss_weight", 0.0)) * losses["x0_action"]
+            if bool(getattr(cfg, "tracker_center_flow_supervision", False)):
+                total = total + float(getattr(cfg, "tracker_center_flow_loss_weight", 0.1)) * losses["center_flow"]
+        if bool(getattr(cfg, "use_capture_value_reranking", False)):
+            if "capture_value_loss" not in outputs:
+                raise RuntimeError(
+                    "Capture-value reranking is enabled but its loss is missing."
+                )
+            total = total + float(
+                getattr(cfg, "capture_value_loss_weight", 0.2)
+            ) * losses["capture_value"]
+    elif not uses_structured_future and train_direct_action and "policy_action" in outputs:
         total = total + float(cfg.direct_action_loss_weight) * losses["action"]
         total = total + float(getattr(cfg, "x0_action_loss_weight", 0.0)) * losses["x0_action"]
     if total.ndim > 0:
         total = total.mean()
 
     losses["total"] = total
+    if bool(getattr(cfg, "use_future_state_dit", False)):
+        # Keep the established short metric names while exposing the explicit
+        # V4 loss names requested by the experiment specification.
+        losses["total_loss"] = total
+        losses["action_flow_loss"] = losses["action"]
+        losses["video_flow_loss"] = losses["video"]
+        losses["state_flow_loss"] = losses["state_flow"]
+        losses["current_box_loss"] = losses["current_box"]
     return losses
 
 

@@ -5,12 +5,16 @@ import random
 import traceback
 import multiprocessing as mp
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import trimesh
 
-os.environ.setdefault("MPLCONFIGDIR", "/data1/ysq/Worldmodel/.matplotlib_cache")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+OURVLN_ROOT = PROJECT_ROOT.parent / "OurVLN"
+
+os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / ".matplotlib_cache"))
 os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
 import matplotlib
@@ -24,9 +28,9 @@ except Exception:
 
 
 # ===================== config =====================
-MAP_DIR = os.environ.get("MAP_DIR", "/data1/ysq/OurVLN/Plandataset/map")
-UDF_CACHE_DIR = os.environ.get("UDF_CACHE_DIR", "/data1/ysq/OurVLN/Plandataset/udf_cache")
-OUTPUT_DIR = os.environ.get("RECOVERY_OUTPUT_DIR", "/data1/ysq/Worldmodel/Plandataset")
+MAP_DIR = os.environ.get("MAP_DIR", str(OURVLN_ROOT / "Plandataset/map"))
+UDF_CACHE_DIR = os.environ.get("UDF_CACHE_DIR", str(OURVLN_ROOT / "Plandataset/udf_cache"))
+OUTPUT_DIR = os.environ.get("RECOVERY_OUTPUT_DIR", str(PROJECT_ROOT / "Plandataset"))
 
 DEFAULT_CITY_LIST = ",".join(f"city_{i}" for i in range(1, 31))
 CITY_LIST = [c.strip() for c in os.environ.get("RECOVERY_CITY_LIST", DEFAULT_CITY_LIST).split(",") if c.strip()]

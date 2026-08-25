@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 import json
 import math
@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
@@ -19,7 +20,6 @@ from torch.utils.data.distributed import DistributedSampler
 
 from data.teacher_dataset_builder import build_records
 from model.config import ModelConfig, migrate_legacy_config
-from model.action_loss_utils import weighted_mean_action_squared_error
 from model.losses import masked_mean, summarize_losses, world_model_dit_loss
 from model.model import TeacherWorldModelDiT, migrate_legacy_state_dict_keys
 from train.train_teacher import TrajectoryDataset, _wan_latent_cache_stats, collate_fn, move_batch_to_device
@@ -93,11 +93,6 @@ def _reduce_metrics(metrics: Dict[str, float], device: torch.device, use_ddp: bo
 def _init_swanlab(args: argparse.Namespace, cfg: ModelConfig, run_name: str):
     if not bool(getattr(args, "use_swanlab", False)) or not _is_main_process():
         return None
-    mode = str(getattr(args, "swanlab_mode", "offline") or "offline")
-    if mode == "cloud" and not os.environ.get("SWANLAB_API_KEY"):
-        print("[swanlab] SWANLAB_MODE=cloud but SWANLAB_API_KEY is not set; using offline mode.")
-        mode = "offline"
-    os.environ.setdefault("SWANLAB_NO_INTERACTIVE", "1")
     try:
         import swanlab
     except Exception as exc:
@@ -109,7 +104,7 @@ def _init_swanlab(args: argparse.Namespace, cfg: ModelConfig, run_name: str):
             workspace=args.swanlab_workspace or None,
             experiment_name=run_name,
             logdir=args.swanlab_log_dir or None,
-            mode=mode,
+            mode=args.swanlab_mode,
             config={
                 **cfg.__dict__,
                 "epochs": args.epochs,
@@ -118,11 +113,9 @@ def _init_swanlab(args: argparse.Namespace, cfg: ModelConfig, run_name: str):
                 "weight_decay": args.weight_decay,
                 "scene_list": args.scene_list,
                 "trajectory_range": args.trajectory_range,
+                "val_scene_list": args.val_scene_list,
+                "val_trajectory_range": args.val_trajectory_range,
                 "teacher_ckpt": args.teacher_ckpt,
-                "student_init_ckpt": args.student_init_ckpt,
-                "flow_distill_weight": args.flow_distill_weight,
-                "flow_distill_every": args.flow_distill_every,
-                "flow_distill_sampling_steps": args.flow_distill_sampling_steps,
             },
         )
     except Exception as exc:
@@ -142,13 +135,9 @@ def _swanlab_log(run, metrics: Dict[str, float], step: int, prefix: str) -> None
         "sup_kl",
         "sup_next_target_relative",
         "sup_prior_next_target_relative",
-        "sup_target_similarity_center",
-        "sup_target_similarity_heatmap",
-        "sup_target_similarity_identity",
         "sup_video_x0",
         "sup_x0_action",
         "action_distill",
-        "flow_distill",
     }
     active = {
         k: float(v)
@@ -178,14 +167,10 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
     order = [
         "total",
         "sup_total",
-        "flow_distill",
         "feat_distill",
         "action_distill",
         "sup_action",
         "sup_video",
-        "sup_target_similarity_center",
-        "sup_target_similarity_heatmap",
-        "sup_target_similarity_identity",
         "sup_kl",
         "sup_next_target_relative",
         "sup_prior_next_target_relative",
@@ -195,12 +180,8 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
         "sup_kl",
         "sup_next_target_relative",
         "sup_prior_next_target_relative",
-        "sup_target_similarity_center",
-        "sup_target_similarity_heatmap",
-        "sup_target_similarity_identity",
         "sup_video_x0",
         "sup_x0_action",
-        "flow_distill",
     }
     parts = []
     for key in order:
@@ -349,32 +330,20 @@ def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] 
         cfg_kwargs["fastwam_action_video_freq_ratio"] = max(int(args.action_video_freq_ratio), 1)
     if args.use_target_relative_context is not None:
         cfg_kwargs["use_target_relative_context"] = bool(args.use_target_relative_context)
-    if getattr(args, "target_relative_context_input_mode", None) is not None:
-        cfg_kwargs["target_relative_context_input_mode"] = str(args.target_relative_context_input_mode)
     if args.target_relative_context_scale is not None:
         cfg_kwargs["target_relative_context_scale"] = float(args.target_relative_context_scale)
     if args.target_relative_token_scale is not None:
         cfg_kwargs["target_relative_token_scale"] = float(args.target_relative_token_scale)
     if args.target_relative_context_hidden_dim is not None:
         cfg_kwargs["target_relative_context_hidden_dim"] = int(args.target_relative_context_hidden_dim)
-    if getattr(args, "target_similarity_context_mode", None) is not None:
-        cfg_kwargs["target_similarity_context_mode"] = str(args.target_similarity_context_mode)
-    if getattr(args, "target_similarity_condition_dim", None) is not None:
-        cfg_kwargs["target_similarity_condition_dim"] = int(args.target_similarity_condition_dim)
-    if getattr(args, "target_similarity_condition_mode", None) is not None:
-        cfg_kwargs["target_similarity_condition_mode"] = str(args.target_similarity_condition_mode)
-    if getattr(args, "target_similarity_condition_source", None) is not None:
-        cfg_kwargs["target_similarity_condition_source"] = str(args.target_similarity_condition_source)
-    if getattr(args, "target_similarity_condition_gt_mix_prob", None) is not None:
-        cfg_kwargs["target_similarity_condition_gt_mix_prob"] = float(args.target_similarity_condition_gt_mix_prob)
-    if getattr(args, "target_similarity_reacquire_confidence_min", None) is not None:
-        cfg_kwargs["target_similarity_reacquire_confidence_min"] = float(args.target_similarity_reacquire_confidence_min)
-    if getattr(args, "target_similarity_reacquire_confidence_ratio", None) is not None:
-        cfg_kwargs["target_similarity_reacquire_confidence_ratio"] = float(args.target_similarity_reacquire_confidence_ratio)
-    if getattr(args, "target_similarity_reacquire_entropy_max", None) is not None:
-        cfg_kwargs["target_similarity_reacquire_entropy_max"] = float(args.target_similarity_reacquire_entropy_max)
-    if getattr(args, "target_similarity_reacquire_margin_min", None) is not None:
-        cfg_kwargs["target_similarity_reacquire_margin_min"] = float(args.target_similarity_reacquire_margin_min)
+    if args.use_tracker_center_context is not None:
+        cfg_kwargs["use_tracker_center_context"] = bool(args.use_tracker_center_context)
+    if args.tracker_center_context_hidden_dim is not None:
+        cfg_kwargs["tracker_center_context_hidden_dim"] = int(args.tracker_center_context_hidden_dim)
+    if args.tracker_center_token_scale is not None:
+        cfg_kwargs["tracker_center_token_scale"] = float(args.tracker_center_token_scale)
+    if args.tracker_heatmap_target_mode is not None:
+        cfg_kwargs["tracker_heatmap_target_mode"] = str(args.tracker_heatmap_target_mode)
     if args.use_wan22_encoders is not None:
         cfg_kwargs["use_wan22_encoders"] = bool(args.use_wan22_encoders)
     if args.wan22_model_base_path is not None:
@@ -395,16 +364,209 @@ def make_cfg(args: argparse.Namespace, checkpoint_cfg: Optional[Dict[str, Any]] 
         cfg_kwargs["fastwam_action_dit_pretrained_path"] = str(args.fastwam_action_dit_pretrained_path)
     if args.fastwam_mot_checkpoint_mixed_attn is not None:
         cfg_kwargs["fastwam_mot_checkpoint_mixed_attn"] = bool(args.fastwam_mot_checkpoint_mixed_attn)
+    if args.use_fastwam_heatmap_guidance is not None:
+        cfg_kwargs["use_fastwam_heatmap_guidance"] = bool(args.use_fastwam_heatmap_guidance)
+    if args.fastwam_heatmap_guidance_scale is not None:
+        cfg_kwargs["fastwam_heatmap_guidance_scale"] = float(args.fastwam_heatmap_guidance_scale)
+    if args.fastwam_heatmap_guidance_sigma is not None:
+        cfg_kwargs["fastwam_heatmap_guidance_sigma"] = float(args.fastwam_heatmap_guidance_sigma)
+    if args.fastwam_heatmap_guidance_fov_deg is not None:
+        cfg_kwargs["fastwam_heatmap_guidance_fov_deg"] = float(args.fastwam_heatmap_guidance_fov_deg)
+    if args.fastwam_ortrack_consistency_loss_weight is not None:
+        cfg_kwargs["fastwam_ortrack_consistency_loss_weight"] = float(args.fastwam_ortrack_consistency_loss_weight)
+    if args.teacher_use_tracker_bias:
+        cfg_kwargs.update(
+            use_fastwam_attention_bias=True,
+            fastwam_heatmap_source="tracker",
+            use_fastwam_heatmap_guidance=True,
+        )
     return ModelConfig(**cfg_kwargs)
 
 
 def make_student_cfg(args: argparse.Namespace, teacher_cfg: ModelConfig) -> ModelConfig:
-    updates: Dict[str, Any] = {}
+    updates: Dict[str, Any] = {
+        "use_fastwam_attention_bias": False,
+        "use_gt_center_attention_bias": False,
+        "use_fastwam_heatmap_guidance": False,
+    }
+    if not args.student_keep_tracker_supervision:
+        updates.update(
+            use_fastwam_attention_heatmap_loss=False,
+            use_fastwam_tracker_heatmap_loss=False,
+            fastwam_heatmap_source="none",
+        )
     if args.student_use_target_relative_context is not None:
         updates["use_target_relative_context"] = bool(args.student_use_target_relative_context)
-    if getattr(args, "student_target_relative_context_input_mode", None) is not None:
-        updates["target_relative_context_input_mode"] = str(args.student_target_relative_context_input_mode)
+    if args.student_use_tracker_center_context is not None:
+        updates["use_tracker_center_context"] = bool(args.student_use_tracker_center_context)
     return replace(teacher_cfg, **updates)
+
+
+def student_tracker_inputs(
+    batch: Dict[str, Any],
+    cfg: ModelConfig,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    use_center = bool(getattr(cfg, "use_tracker_center_context", False))
+    use_heatmap = bool(getattr(cfg, "use_fastwam_tracker_heatmap_loss", False)) or bool(
+        getattr(cfg, "use_fastwam_attention_bias", False)
+    )
+    return (
+        batch.get("guidance_heatmap") if use_heatmap else None,
+        batch.get("guidance_confidence") if (use_center or use_heatmap) else None,
+        batch.get("tracker_center") if use_center else None,
+    )
+
+
+@torch.no_grad()
+def sample_student_policy_actions(
+    student: TeacherWorldModelDiT,
+    batch: Dict[str, Any],
+    cfg: ModelConfig,
+    args: argparse.Namespace,
+    sampling_offset: int = 0,
+) -> torch.Tensor:
+    batch_size = int(batch["target_relative"].size(0))
+    horizon = max(int(cfg.action_sequence_horizon), 1)
+    device = batch["target_relative"].device
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(args.student_sampling_seed) + int(sampling_offset))
+    initial_noise = torch.randn(
+        batch_size,
+        horizon,
+        int(cfg.action_dim),
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+    targets = student.sample_distillation_targets(
+        images=batch["images"],
+        text_tokens=batch["text_tokens"],
+        target_relative=batch["target_relative"],
+        attention_mask=batch["attention_mask"],
+        instructions=batch.get("instructions"),
+        video_latents=batch.get("video_latents"),
+        guidance_heatmap=None,
+        guidance_confidence=None,
+        tracker_center=None,
+        num_steps=int(args.student_sampling_steps),
+        initial_action_noise=initial_noise,
+        return_attention_maps=False,
+    )
+    return targets["teacher_action_sequence"].detach()
+
+
+def shared_flow_state(
+    model: TeacherWorldModelDiT,
+    sampled_action: torch.Tensor,
+    batch: Dict[str, Any],
+) -> Dict[str, Optional[torch.Tensor]]:
+    fastwam = model.fastwam
+    if fastwam is None:
+        raise RuntimeError("FastWAM is required for velocity distillation.")
+    action_noise = torch.randn_like(sampled_action)
+    action_timestep = fastwam.action_scheduler.sample_training_t(
+        sampled_action.size(0), sampled_action.device, sampled_action.dtype
+    )
+
+    video_latents = batch.get("video_latents")
+    if video_latents is None:
+        raise RuntimeError(
+            "Shared video-velocity distillation requires cached video_latents."
+        )
+    video_noise = torch.randn_like(video_latents)
+    video_timestep = fastwam.video_scheduler.sample_training_t(
+        video_latents.size(0), video_latents.device, video_latents.dtype
+    )
+    return {
+        "noise_action": action_noise,
+        "t_action": action_timestep,
+        "noise_video": video_noise,
+        "t_video": video_timestep,
+    }
+
+
+@contextmanager
+def deterministic_student_kd_forward(model: torch.nn.Module):
+    dropout_types = (
+        torch.nn.Dropout,
+        torch.nn.Dropout1d,
+        torch.nn.Dropout2d,
+        torch.nn.Dropout3d,
+        torch.nn.AlphaDropout,
+        torch.nn.FeatureAlphaDropout,
+    )
+    modules = [module for module in _unwrap_model(model).modules() if isinstance(module, dropout_types)]
+    states = [module.training for module in modules]
+    try:
+        for module in modules:
+            module.train(False)
+        yield
+    finally:
+        for module, training in zip(modules, states):
+            module.train(training)
+
+
+def forward_student_policy_target(
+    student: torch.nn.Module,
+    batch: Dict[str, Any],
+    cfg: ModelConfig,
+    action_target: torch.Tensor,
+    capture_attention: bool,
+    capture_flow_predictions: bool = False,
+    flow_state: Optional[Dict[str, Optional[torch.Tensor]]] = None,
+) -> Dict[str, torch.Tensor]:
+    student_heatmap, student_confidence, student_center = student_tracker_inputs(batch, cfg)
+    return student(
+        images=batch["images"],
+        text_tokens=batch["text_tokens"],
+        target_relative=batch["target_relative"],
+        prev_actions=batch["prev_actions"],
+        attention_mask=batch["attention_mask"],
+        expert_action=action_target,
+        valid_mask=batch["valid_mask"],
+        done=batch.get("done"),
+        instructions=batch.get("instructions"),
+        video_latents=batch.get("video_latents"),
+        guidance_heatmap=student_heatmap,
+        guidance_confidence=student_confidence,
+        tracker_center=student_center,
+        capture_fastwam_attention=capture_attention,
+        capture_fastwam_flow_predictions=capture_flow_predictions,
+        fastwam_noise_video_override=None if flow_state is None else flow_state.get("noise_video"),
+        fastwam_t_video_override=None if flow_state is None else flow_state.get("t_video"),
+        fastwam_noise_action_override=None if flow_state is None else flow_state.get("noise_action"),
+        fastwam_t_action_override=None if flow_state is None else flow_state.get("t_action"),
+    )
+
+
+def forward_teacher_velocity(
+    teacher: torch.nn.Module,
+    batch: Dict[str, Any],
+    action_target: torch.Tensor,
+    flow_state: Dict[str, Optional[torch.Tensor]],
+    capture_attention: bool = False,
+) -> Dict[str, torch.Tensor]:
+    return teacher(
+        images=batch["images"],
+        text_tokens=batch["text_tokens"],
+        target_relative=batch["target_relative"],
+        prev_actions=batch["prev_actions"],
+        attention_mask=batch["attention_mask"],
+        expert_action=action_target,
+        valid_mask=batch["valid_mask"],
+        done=batch.get("done"),
+        instructions=batch.get("instructions"),
+        video_latents=batch.get("video_latents"),
+        guidance_heatmap=batch.get("guidance_heatmap"),
+        guidance_confidence=batch.get("guidance_confidence"),
+        tracker_center=batch.get("tracker_center"),
+        capture_fastwam_attention=capture_attention,
+        capture_fastwam_flow_predictions=True,
+        fastwam_noise_video_override=flow_state.get("noise_video"),
+        fastwam_t_video_override=flow_state.get("t_video"),
+        fastwam_noise_action_override=flow_state.get("noise_action"),
+        fastwam_t_action_override=flow_state.get("t_action"),
+    )
 
 
 def load_model_state(model: torch.nn.Module, ckpt_path: str, strict: bool = True) -> Dict[str, Any]:
@@ -462,263 +624,211 @@ def masked_mse_lastdim(x: torch.Tensor, y: torch.Tensor, valid_mask: Optional[to
     return (per_item * mask).sum() / mask.sum().clamp(min=1.0)
 
 
-def align_time_mask(valid_mask: Optional[torch.Tensor], length: int, device: torch.device) -> Optional[torch.Tensor]:
-    if valid_mask is None:
-        return None
-    mask = valid_mask.float().to(device)
-    if mask.ndim >= 2 and mask.size(1) != length:
-        if mask.size(1) > length:
-            mask = mask[:, :length]
-        else:
-            pad = mask[:, -1:].expand(-1, length - mask.size(1))
-            mask = torch.cat([mask, pad], dim=1)
-    return mask
+def sampled_action_as_sequence_target(
+    sampled_action: torch.Tensor,
+    expert_action: torch.Tensor,
+) -> torch.Tensor:
+    """Append one shape-only padding step to a sampled FastWAM action trajectory."""
+    if sampled_action.ndim != 3 or expert_action.ndim != 3:
+        raise ValueError("Sampled and expert actions must have shape [B,T,A].")
+    if sampled_action.size(0) != expert_action.size(0) or sampled_action.size(2) != expert_action.size(2):
+        raise ValueError(
+            "Sampled action batch/dim must match expert_action; "
+            f"got {tuple(sampled_action.shape)} and {tuple(expert_action.shape)}."
+        )
+    transitions = max(int(expert_action.size(1)) - 1, 1)
+    if sampled_action.size(1) < transitions:
+        pad = sampled_action[:, -1:].expand(-1, transitions - sampled_action.size(1), -1)
+        sampled_action = torch.cat([sampled_action, pad], dim=1)
+    sampled_action = sampled_action[:, :transitions].detach()
+    # FastWAM creates action queries from action_target[:, :-1]. Keep the final
+    # slot as an explicit non-label padding sentinel instead of duplicating the
+    # last real action and suggesting a false equality constraint.
+    padding = torch.zeros_like(sampled_action[:, -1:])
+    return torch.cat([sampled_action, padding], dim=1)
 
 
-def align_action_token_mask(
+def action_query_valid_mask(
     valid_mask: Optional[torch.Tensor],
-    length: int,
+    query_count: int,
+    *,
     device: torch.device,
 ) -> Optional[torch.Tensor]:
     if valid_mask is None:
         return None
-    mask = valid_mask.float().to(device)
-    if mask.ndim != 2:
-        raise ValueError("valid_mask must have shape [B, T].")
-    if mask.size(1) >= length + 1:
-        return mask[:, :length] * mask[:, 1 : length + 1]
-    return align_time_mask(mask, length, device)
+    valid = valid_mask.to(device=device, dtype=torch.bool)
+    if valid.ndim == 3 and valid.size(-1) == 1:
+        valid = valid.squeeze(-1)
+    if valid.ndim != 2:
+        raise ValueError("valid_mask must have shape [B,T] or [B,action_queries].")
+    if valid.size(1) == query_count + 1:
+        valid = valid[:, :-1] & valid[:, 1:]
+    elif valid.size(1) != query_count:
+        raise ValueError(
+            f"valid_mask length {valid.size(1)} does not match {query_count} action queries."
+        )
+    return valid
 
 
-def _make_action_sequence_target(
-    expert_action: torch.Tensor,
-    horizon: int,
-    action_dim: int,
-) -> torch.Tensor:
-    if expert_action.ndim != 3:
-        raise ValueError("expert_action must have shape [B, T, A].")
-    batch, seq_len, action_dim = expert_action.shape
-    if horizon > 1:
-        seq_targets = []
-        for k in range(horizon):
-            seq_targets.append(
-                torch.cat(
-                    [expert_action[:, k:], expert_action[:, -1:].expand(-1, k, -1)],
-                    dim=1,
-                )
-            )
-        expert_action = torch.stack(seq_targets, dim=2).reshape(batch, seq_len, horizon * action_dim)
-    return expert_action
-
-
-def _weighted_flat_action_sequence_mse(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    cfg: ModelConfig,
-) -> torch.Tensor:
-    action_dim = int(getattr(cfg, "action_dim", pred.shape[-1]))
-    if pred.shape[-1] % action_dim != 0:
-        return (pred.float() - target.float()).pow(2).mean(dim=-1)
-    horizon = pred.shape[-1] // action_dim
-    pred_seq = pred.reshape(pred.shape[0], horizon, action_dim)
-    tgt_seq = target.reshape(target.shape[0], horizon, action_dim)
-    return weighted_mean_action_squared_error(pred_seq, tgt_seq, cfg).mean(dim=-1)
-
-
-def action_distillation_loss(
-    student_out: Dict[str, torch.Tensor],
-    teacher_out: Dict[str, torch.Tensor],
+def action_velocity_distillation_loss(
+    student_velocity_out: Optional[Dict[str, torch.Tensor]],
+    teacher_velocity_out: Optional[Dict[str, torch.Tensor]],
     valid_mask: Optional[torch.Tensor],
-    cfg: ModelConfig,
+    reference: torch.Tensor,
 ) -> torch.Tensor:
-    ref = student_out.get("feat", student_out.get("obs_embed"))
-    device = ref.device
-    dtype = ref.dtype
-    student_action = student_out.get("policy_action_sequence")
-    teacher_action = teacher_out.get("policy_action_sequence")
-    if student_action is not None and teacher_action is not None:
-        with torch.no_grad():
-            target = teacher_action.detach()
-        if student_action.ndim == 4 and teacher_action.ndim == 4:
-            horizon = min(student_action.size(2), teacher_action.size(2))
-            mask = align_time_mask(valid_mask, student_action.size(1), student_action.device)
-            terms = []
-            for k in range(horizon):
-                per_t = weighted_mean_action_squared_error(student_action[:, :, k], target[:, :, k], cfg).unsqueeze(-1)
-                terms.append(masked_mean(per_t, mask))
-            return torch.stack(terms).mean()
-        if student_action.ndim == 4 and teacher_action.ndim == 3:
-            target = teacher_action.unsqueeze(2)
-        if student_action.ndim == 3 and teacher_action.ndim == 4:
-            target = teacher_action[:, :, 0]
-        if student_action.ndim == 3 and target.ndim == 3:
-            per_t = weighted_mean_action_squared_error(student_action, target, cfg).unsqueeze(-1)
-            return masked_mean(per_t, align_time_mask(valid_mask, student_action.size(1), student_action.device))
-        terms = []
-        mask = align_time_mask(valid_mask, student_action.size(1), student_action.device)
-        horizon = min(student_action.size(2), target.size(2))
-        for k in range(horizon):
-            per_t = weighted_mean_action_squared_error(student_action[:, :, k], target[:, :, k], cfg).unsqueeze(-1)
-            terms.append(masked_mean(per_t, mask))
-        return torch.stack(terms).mean()
-
-    student_action = student_out.get("policy_action")
-    teacher_action = teacher_out.get("policy_action")
-    if student_action is None or teacher_action is None:
-        return torch.zeros((), device=device, dtype=dtype)
-
-    with torch.no_grad():
-        target = teacher_action.detach()
-    per_t = weighted_mean_action_squared_error(student_action, target, cfg).unsqueeze(-1)
-    return masked_mean(per_t, align_time_mask(valid_mask, student_action.size(1), student_action.device))
+    if student_velocity_out is None or teacher_velocity_out is None:
+        return reference.sum() * 0.0
+    student_velocity = student_velocity_out["policy_action_sequence"].float()
+    teacher_velocity = teacher_velocity_out["policy_action_sequence"].detach().float()
+    if student_velocity.shape != teacher_velocity.shape:
+        raise ValueError(
+            "Teacher/Student action velocity shapes differ: "
+            f"{tuple(teacher_velocity.shape)} vs {tuple(student_velocity.shape)}."
+        )
+    per_token = (student_velocity - teacher_velocity).pow(2).mean(dim=(-1, -2))
+    valid = action_query_valid_mask(
+        valid_mask, int(per_token.size(1)), device=per_token.device
+    )
+    if valid is not None:
+        weight = valid.to(dtype=per_token.dtype)
+        return (per_token * weight).sum() / weight.sum().clamp_min(1.0)
+    return per_token.mean()
 
 
-def flow_distillation_loss(
-    student_model: TeacherWorldModelDiT,
-    teacher_model: TeacherWorldModelDiT,
-    student_out: Dict[str, torch.Tensor],
-    teacher_out: Dict[str, torch.Tensor],
+def video_velocity_distillation_loss(
+    student_velocity_out: Optional[Dict[str, torch.Tensor]],
+    teacher_velocity_out: Optional[Dict[str, torch.Tensor]],
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    if student_velocity_out is None or teacher_velocity_out is None:
+        return reference.sum() * 0.0
+    student_velocity = student_velocity_out["video_velocity"].float()
+    teacher_velocity = teacher_velocity_out["video_velocity"].detach().float()
+    if student_velocity.shape != teacher_velocity.shape:
+        raise ValueError(
+            "Teacher/Student video velocity shapes differ: "
+            f"{tuple(teacher_velocity.shape)} vs {tuple(student_velocity.shape)}."
+        )
+    return F.mse_loss(student_velocity, teacher_velocity)
+
+
+def all_query_attention_distillation_loss(
+    student_velocity_out: Optional[Dict[str, torch.Tensor]],
+    teacher_velocity_out: Optional[Dict[str, torch.Tensor]],
     valid_mask: Optional[torch.Tensor],
-    cfg: ModelConfig,
-    args: argparse.Namespace,
+    reference: torch.Tensor,
 ) -> torch.Tensor:
-    ref = student_out.get("fastwam_video_latents")
-    if ref is None:
-        ref = student_out.get("feat", student_out.get("obs_embed"))
-    if ref is None:
-        raise RuntimeError("Cannot locate a reference tensor for flow distillation.")
-    zero = torch.zeros((), device=ref.device, dtype=ref.dtype if ref.is_floating_point() else torch.float32)
-    if float(getattr(args, "flow_distill_weight", 0.0)) <= 0.0:
-        return zero
-    if student_model.fastwam is None or teacher_model.fastwam is None:
-        raise RuntimeError("Student-sampled flow distillation requires FastWAM heads on both models.")
+    """Distill per-query spatial attention over the first 7x7 visual tokens."""
+    if student_velocity_out is None or teacher_velocity_out is None:
+        return reference.sum() * 0.0
+    student_attention = student_velocity_out.get("last_guided_action_attention")
+    if student_attention is None:
+        student_attention = student_velocity_out.get("last_action_attention")
+    # A privileged center-bias teacher must distill the post-bias attention,
+    # otherwise its GT spatial prior is absent from the KD target.
+    teacher_attention = teacher_velocity_out.get("last_guided_action_attention")
+    if teacher_attention is None:
+        teacher_attention = teacher_velocity_out.get("last_action_attention")
+    if student_attention is None or teacher_attention is None:
+        raise RuntimeError("Attention distillation requested without captured last-layer attention.")
+    if student_attention.ndim != 4 or teacher_attention.ndim != 4:
+        raise ValueError("Last-layer attention must have shape [B, heads, queries, video_tokens].")
+    if student_attention.shape[:3] != teacher_attention.shape[:3]:
+        raise ValueError(
+            "Teacher/Student attention batch/head/query shapes differ: "
+            f"{tuple(teacher_attention.shape)} vs {tuple(student_attention.shape)}."
+        )
 
-    student_video = student_out.get("fastwam_video_latents")
-    teacher_video = teacher_out.get("fastwam_video_latents")
-    student_context = student_out.get("fastwam_text_context")
-    student_context_mask = student_out.get("fastwam_text_context_mask")
-    teacher_context = teacher_out.get("fastwam_text_context")
-    teacher_context_mask = teacher_out.get("fastwam_text_context_mask")
-    required = [student_video, teacher_video, student_context, student_context_mask, teacher_context, teacher_context_mask]
-    if any(x is None for x in required):
-        raise RuntimeError("FastWAM encoded latents/context are required for flow distillation.")
+    image_tokens = 7 * 7
+    if student_attention.size(3) < image_tokens or teacher_attention.size(3) < image_tokens:
+        raise ValueError(
+            "Attention distillation requires at least 49 first-frame visual tokens in both models; "
+            f"got teacher={tuple(teacher_attention.shape)}, student={tuple(student_attention.shape)}."
+        )
+    student = student_attention[..., :image_tokens].float().mean(dim=1).clamp_min(1.0e-8)
+    teacher = teacher_attention[..., :image_tokens].detach().float().mean(dim=1).clamp_min(1.0e-8)
+    student = student / student.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    per_query = (teacher * (teacher.log() - student.log())).sum(dim=-1)
 
-    sample_steps = int(getattr(args, "flow_distill_sampling_steps", 0) or 0)
-    if sample_steps <= 0:
-        sample_steps = int(getattr(args, "sampling_steps", cfg.action_sampling_steps))
-    sample_steps = max(sample_steps, 1)
-    action_horizon = max(int(getattr(cfg, "action_sequence_horizon", 1)), 1)
-
-    was_training = student_model.training
-    with torch.no_grad():
-        try:
-            student_model.eval()
-            sampled_action = student_model.fastwam.sample_action(
-                first_frame_latents=student_video[:, :, :1],
-                context=student_context,
-                context_mask=student_context_mask,
-                action_horizon=action_horizon,
-                num_steps=sample_steps,
-            )
-            if isinstance(sampled_action, tuple):
-                sampled_action = sampled_action[0]
-            sampled_action = sampled_action.detach()
-        finally:
-            if was_training:
-                student_model.train()
-
-    b = sampled_action.size(0)
-    timestep = student_model.fastwam.action_scheduler.sample_training_t(
-        b,
-        sampled_action.device,
-        sampled_action.dtype,
+    valid = action_query_valid_mask(
+        valid_mask, int(per_query.size(1)), device=per_query.device
     )
-    noise = torch.randn_like(sampled_action)
-    noisy_action = student_model.fastwam.action_scheduler.add_noise(sampled_action, noise, timestep).detach()
-
-    with torch.no_grad():
-        teacher_velocity = teacher_model.fastwam.predict_action_velocity(
-            first_frame_latents=teacher_video,
-            context=teacher_context,
-            context_mask=teacher_context_mask,
-            noisy_action=noisy_action,
-            timestep=timestep,
-        ).detach()
-
-    student_velocity = student_model.fastwam.predict_action_velocity(
-        first_frame_latents=student_video,
-        context=student_context,
-        context_mask=student_context_mask,
-        noisy_action=noisy_action,
-        timestep=timestep,
-    )
-    per_token = (student_velocity.float() - teacher_velocity.float()).pow(2).mean(dim=-1)
-    token_mask = align_action_token_mask(valid_mask, per_token.size(1), per_token.device)
-    if token_mask is None:
-        return per_token.mean()
-    return (per_token * token_mask).sum() / token_mask.sum().clamp(min=1.0)
+    if valid is not None:
+        if not valid.any():
+            return student_attention.sum() * 0.0
+        return per_query[valid].mean()
+    return per_query.mean()
 
 
 def self_distill_losses(
     student_out: Dict[str, torch.Tensor],
-    teacher_out: Dict[str, torch.Tensor],
+    teacher_out: Optional[Dict[str, torch.Tensor]],
+    offline_student_velocity_out: Optional[Dict[str, torch.Tensor]],
+    offline_teacher_velocity_out: Optional[Dict[str, torch.Tensor]],
+    sampled_student_velocity_out: Optional[Dict[str, torch.Tensor]],
+    sampled_teacher_velocity_out: Optional[Dict[str, torch.Tensor]],
     student_model: TeacherWorldModelDiT,
     teacher_model: TeacherWorldModelDiT,
     batch: Dict[str, Any],
     cfg: ModelConfig,
     args: argparse.Namespace,
-    global_step: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     valid_mask = batch.get("valid_mask")
     sup = world_model_dit_loss(student_out, batch, cfg, valid_mask=valid_mask)
 
     losses: Dict[str, torch.Tensor] = {f"sup_{k}": v for k, v in sup.items()}
 
-    ref = student_out.get("feat", student_out.get("obs_embed"))
-    if ref is None:
-        ref = batch["expert_action"]
-    zero = torch.zeros((), device=ref.device, dtype=ref.dtype if ref.is_floating_point() else torch.float32)
-
-    if float(getattr(args, "feat_distill_weight", 0.0)) > 0.0:
-        student_belief = belief_feat(student_out)
+    del student_model, teacher_model
+    student_belief = belief_feat(student_out)
+    feat_loss = student_belief.sum() * 0.0
+    if args.feat_distill_weight > 0.0:
+        if teacher_out is None:
+            raise RuntimeError("Feature distillation requested without a teacher training forward.")
         with torch.no_grad():
             teacher_belief = belief_feat(teacher_out)
         feat_loss = masked_mse_lastdim(student_belief, teacher_belief, valid_mask)
-    else:
-        feat_loss = zero
-
-    if float(getattr(args, "action_distill_weight", 0.0)) > 0.0:
-        action_loss = action_distillation_loss(student_out, teacher_out, valid_mask, cfg)
-    else:
-        action_loss = zero
-
-    flow_every = max(int(getattr(args, "flow_distill_every", 1)), 1)
-    use_flow = float(getattr(args, "flow_distill_weight", 0.0)) > 0.0
-    if global_step is not None and int(global_step) % flow_every != 0:
-        use_flow = False
-    if use_flow:
-        flow_loss = flow_distillation_loss(
-            student_model=student_model,
-            teacher_model=teacher_model,
-            student_out=student_out,
-            teacher_out=teacher_out,
-            valid_mask=valid_mask,
-            cfg=cfg,
-            args=args,
-        )
-    else:
-        flow_loss = zero
-
+    offline_action_loss = action_velocity_distillation_loss(
+        offline_student_velocity_out,
+        offline_teacher_velocity_out,
+        valid_mask,
+        student_belief,
+    )
+    offline_video_velocity_loss = video_velocity_distillation_loss(
+        offline_student_velocity_out,
+        offline_teacher_velocity_out,
+        student_belief,
+    )
+    sampled_action_loss = action_velocity_distillation_loss(
+        sampled_student_velocity_out,
+        sampled_teacher_velocity_out,
+        valid_mask,
+        student_belief,
+    )
+    sampled_video_velocity_loss = student_belief.sum() * 0.0
+    attention_loss = all_query_attention_distillation_loss(
+        offline_student_velocity_out,
+        offline_teacher_velocity_out,
+        valid_mask,
+        student_belief,
+    ) if args.attention_distill_weight > 0.0 else student_belief.sum() * 0.0
+    flow_distill_loss = offline_action_loss + offline_video_velocity_loss + sampled_action_loss
     total = (
         args.sup_weight * sup["total"]
-        + args.flow_distill_weight * flow_loss
         + args.feat_distill_weight * feat_loss
-        + args.action_distill_weight * action_loss
+        + args.action_distill_weight * flow_distill_loss
+        + args.attention_distill_weight * attention_loss
     )
 
-    losses["flow_distill"] = flow_loss
     losses["feat_distill"] = feat_loss
-    losses["action_distill"] = action_loss
+    losses["offline_action_velocity_distill"] = offline_action_loss
+    losses["offline_video_velocity_distill"] = offline_video_velocity_loss
+    losses["sampled_action_velocity_distill"] = sampled_action_loss
+    losses["sampled_video_velocity_distill"] = sampled_video_velocity_loss
+    losses["action_distill"] = offline_action_loss + sampled_action_loss
+    losses["video_velocity_distill"] = offline_video_velocity_loss
+    losses["flow_distill"] = flow_distill_loss
+    losses["attention_distill"] = attention_loss
     losses["total"] = total
     return losses
 
@@ -742,45 +852,89 @@ def evaluate_distill(
     if tqdm is not None:
         val_iter = tqdm(loader, desc="val", leave=False, dynamic_ncols=True)
 
-    for batch in val_iter:
+    for batch_index, batch in enumerate(val_iter):
         batch = move_batch_to_device(batch, device)
+        teacher_out = None
+        if args.feat_distill_weight > 0.0:
+            teacher_out = teacher(
+                images=batch["images"],
+                text_tokens=batch["text_tokens"],
+                target_relative=batch["target_relative"],
+                prev_actions=batch["prev_actions"],
+                attention_mask=batch["attention_mask"],
+                expert_action=None,
+                valid_mask=None,
+                done=batch.get("done"),
+                instructions=batch.get("instructions"),
+                video_latents=batch.get("video_latents"),
+                guidance_confidence=batch.get("guidance_confidence"),
+                tracker_center=batch.get("tracker_center"),
+            )
 
-        teacher_policy_target = batch["expert_action"] if args.action_distill_weight > 0.0 else None
-        teacher_out = teacher(
-            images=batch["images"],
-            text_tokens=batch["text_tokens"],
-            target_relative=batch["target_relative"],
-            prev_actions=batch["prev_actions"],
-            attention_mask=batch["attention_mask"],
-            expert_action=teacher_policy_target,
-            valid_mask=batch["valid_mask"] if teacher_policy_target is not None else None,
-            done=batch.get("done"),
-            instructions=batch.get("instructions"),
-            video_latents=batch.get("video_latents"),
+        student_out = forward_student_policy_target(
+            student,
+            batch,
+            student_cfg,
+            batch["expert_action"],
+            capture_attention=False,
         )
-
-        student_out = student(
-            images=batch["images"],
-            text_tokens=batch["text_tokens"],
-            target_relative=batch["target_relative"],
-            prev_actions=batch["prev_actions"],
-            attention_mask=batch["attention_mask"],
-            expert_action=batch["expert_action"],
-            valid_mask=batch["valid_mask"],
-            done=batch.get("done"),
-            instructions=batch.get("instructions"),
-            video_latents=batch.get("video_latents"),
-        )
+        offline_student_velocity_out = None
+        offline_teacher_velocity_out = None
+        sampled_student_velocity_out = None
+        sampled_teacher_velocity_out = None
+        if args.action_distill_weight > 0.0 or args.attention_distill_weight > 0.0:
+            expert_action = batch["expert_action"]
+            offline_flow_state = shared_flow_state(student, expert_action[:, :-1], batch)
+            offline_teacher_velocity_out = forward_teacher_velocity(
+                teacher, batch, expert_action, offline_flow_state,
+                capture_attention=args.attention_distill_weight > 0.0,
+            )
+            with deterministic_student_kd_forward(student):
+                offline_student_velocity_out = forward_student_policy_target(
+                    student,
+                    batch,
+                    student_cfg,
+                    expert_action,
+                    capture_attention=args.attention_distill_weight > 0.0,
+                    capture_flow_predictions=True,
+                    flow_state=offline_flow_state,
+                )
+        if args.action_distill_weight > 0.0:
+            sampled_action = sample_student_policy_actions(
+                student, batch, student_cfg, args, sampling_offset=batch_index
+            )
+            sampled_action_target = sampled_action_as_sequence_target(
+                sampled_action,
+                batch["expert_action"],
+            )
+            flow_state = shared_flow_state(student, sampled_action, batch)
+            sampled_teacher_velocity_out = forward_teacher_velocity(
+                teacher, batch, sampled_action_target, flow_state,
+                capture_attention=False,
+            )
+            with deterministic_student_kd_forward(student):
+                sampled_student_velocity_out = forward_student_policy_target(
+                    student,
+                    batch,
+                    student_cfg,
+                    sampled_action_target,
+                    capture_attention=False,
+                    capture_flow_predictions=True,
+                    flow_state=flow_state,
+                )
 
         losses = self_distill_losses(
             student_out=student_out,
             teacher_out=teacher_out,
+            offline_student_velocity_out=offline_student_velocity_out,
+            offline_teacher_velocity_out=offline_teacher_velocity_out,
+            sampled_student_velocity_out=sampled_student_velocity_out,
+            sampled_teacher_velocity_out=sampled_teacher_velocity_out,
             student_model=student,
             teacher_model=teacher,
             batch=batch,
             cfg=student_cfg,
             args=args,
-            global_step=None,
         )
         summary = summarize_losses(losses)
         for k, v in summary.items():
@@ -794,12 +948,13 @@ def build_loaders(
     args: argparse.Namespace,
     cfg: ModelConfig,
     use_ddp: bool,
+    teacher_requires_gt_center: bool = False,
 ) -> tuple[DataLoader, Optional[DataLoader], int, int, int]:
     scene_list = [s.strip() for s in args.scene_list.split(",") if s.strip()]
     if not scene_list:
         raise ValueError("--scene-list is empty.")
 
-    records = build_records(
+    train_records = build_records(
         Path(args.dataset_root),
         scene_list,
         args.trajectory_range.strip(),
@@ -807,17 +962,40 @@ def build_loaders(
         max_yaw_rate=cfg.max_yaw_rate,
         max_speed_norm=cfg.max_speed_norm,
     )
-    if not records:
+    if not train_records:
         raise RuntimeError("No trajectory selected. Check --scene-list / --trajectory-range.")
-
-    rng = random.Random(args.split_seed)
-    rng.shuffle(records)
-    val_n = int(len(records) * args.val_ratio)
-    if args.val_ratio > 0.0 and len(records) > 1:
-        val_n = max(1, val_n)
-    val_n = min(val_n, max(len(records) - 1, 0))
-    val_records = records[:val_n]
-    train_records = records[val_n:] if val_n > 0 else records
+    explicit_val = bool(args.val_scene_list.strip() or args.val_trajectory_range.strip())
+    if explicit_val and not (args.val_scene_list.strip() and args.val_trajectory_range.strip()):
+        raise ValueError("--val-scene-list and --val-trajectory-range must be provided together.")
+    if explicit_val:
+        val_scenes = [s.strip() for s in args.val_scene_list.split(",") if s.strip()]
+        val_records = build_records(
+            Path(args.dataset_root),
+            val_scenes,
+            args.val_trajectory_range.strip(),
+            max_vel=cfg.max_vel,
+            max_yaw_rate=cfg.max_yaw_rate,
+            max_speed_norm=cfg.max_speed_norm,
+        )
+        if not val_records:
+            raise RuntimeError(
+                "No validation trajectory selected. Check --val-scene-list / --val-trajectory-range."
+            )
+        train_keys = {(record["scene_id"], record["trajectory_name"]) for record in train_records}
+        val_keys = {(record["scene_id"], record["trajectory_name"]) for record in val_records}
+        overlap = sorted(train_keys.intersection(val_keys))
+        if overlap:
+            raise ValueError(f"Training and validation trajectories overlap: {overlap[:8]}")
+    else:
+        rng = random.Random(args.split_seed)
+        rng.shuffle(train_records)
+        val_n = int(len(train_records) * args.val_ratio)
+        if args.val_ratio > 0.0 and len(train_records) > 1:
+            val_n = max(1, val_n)
+        val_n = min(val_n, max(len(train_records) - 1, 0))
+        val_records = train_records[:val_n]
+        train_records = train_records[val_n:] if val_n > 0 else train_records
+    random.Random(args.split_seed).shuffle(train_records)
 
     train_dataset = TrajectoryDataset(
         records=train_records,
@@ -831,7 +1009,16 @@ def build_loaders(
         random_crop=True,
         wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
         action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
-        force_load_rgb=cfg.use_target_similarity_guidance and cfg.target_similarity_feature_source == "rgb_cnn",
+        ortrack_cache_root=args.ortrack_cache_root,
+        require_ortrack_cache=(
+            args.teacher_use_tracker_bias
+            or bool(args.use_tracker_center_context)
+            or cfg.use_tracker_center_context
+            or cfg.use_fastwam_tracker_heatmap_loss
+        ),
+        canonical_heatmap_sigma=cfg.fastwam_attention_heatmap_sigma,
+        tracker_heatmap_target_mode=cfg.tracker_heatmap_target_mode,
+        guidance_heatmap_source=("gt" if teacher_requires_gt_center else None),
     )
 
     train_sampler = (
@@ -873,7 +1060,16 @@ def build_loaders(
             random_crop=False,
             wan_latent_cache_root=args.wan_latent_cache_root if args.wan_latent_cache_root else None,
             action_video_freq_ratio=cfg.fastwam_action_video_freq_ratio,
-            force_load_rgb=cfg.use_target_similarity_guidance and cfg.target_similarity_feature_source == "rgb_cnn",
+            ortrack_cache_root=args.ortrack_cache_root,
+            require_ortrack_cache=(
+                args.teacher_use_tracker_bias
+                or bool(args.use_tracker_center_context)
+                or cfg.use_tracker_center_context
+                or cfg.use_fastwam_tracker_heatmap_loss
+            ),
+            canonical_heatmap_sigma=cfg.fastwam_attention_heatmap_sigma,
+            tracker_heatmap_target_mode=cfg.tracker_heatmap_target_mode,
+            guidance_heatmap_source=("gt" if teacher_requires_gt_center else None),
         )
         val_loader = DataLoader(
             val_dataset,
@@ -886,7 +1082,7 @@ def build_loaders(
             collate_fn=collate_fn,
         )
 
-    return train_loader, val_loader, len(records), len(train_records), len(val_records)
+    return train_loader, val_loader, len(train_records) + len(val_records), len(train_records), len(val_records)
 
 
 def parse_args() -> argparse.Namespace:
@@ -896,11 +1092,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=str, required=True)
     parser.add_argument("--scene-list", type=str, required=True)
     parser.add_argument("--trajectory-range", type=str, default="")
+    parser.add_argument("--val-scene-list", type=str, default="")
+    parser.add_argument("--val-trajectory-range", type=str, default="")
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--save-dir", type=str, required=True)
     parser.add_argument("--teacher-ckpt", type=str, required=True)
-    parser.add_argument("--student-init-ckpt", type=str, default="")
     parser.add_argument("--resume", type=str, default=None)
 
     # Model / data config
@@ -924,20 +1121,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--use-target-relative-context", type=_str2bool, default=None)
     parser.add_argument("--student-use-target-relative-context", type=_str2bool, default=None)
-    parser.add_argument("--target-relative-context-input-mode", type=str, default=None, choices=["xyz", "yz", "no_x", "without_x", "lateral_vertical"])
-    parser.add_argument("--student-target-relative-context-input-mode", type=str, default=None, choices=["xyz", "yz", "no_x", "without_x", "lateral_vertical"])
     parser.add_argument("--target-relative-context-scale", type=float, default=None)
     parser.add_argument("--target-relative-token-scale", type=float, default=None)
     parser.add_argument("--target-relative-context-hidden-dim", type=int, default=None)
-    parser.add_argument("--target-similarity-context-mode", type=str, default=None, choices=["dense", "camera_yz_text"])
-    parser.add_argument("--target-similarity-condition-dim", type=int, default=None)
-    parser.add_argument("--target-similarity-condition-mode", type=str, default=None, choices=["image_center", "center", "pixel_center", "normalized_center", "camera_yz", "camera_bearing", "bearing", "ray_yz"])
-    parser.add_argument("--target-similarity-condition-source", type=str, default=None, choices=["predicted", "gt", "ground_truth", "oracle", "mixed", "gt_mix", "mix"])
-    parser.add_argument("--target-similarity-condition-gt-mix-prob", type=float, default=None)
-    parser.add_argument("--target-similarity-reacquire-confidence-min", type=float, default=None)
-    parser.add_argument("--target-similarity-reacquire-confidence-ratio", type=float, default=None)
-    parser.add_argument("--target-similarity-reacquire-entropy-max", type=float, default=None)
-    parser.add_argument("--target-similarity-reacquire-margin-min", type=float, default=None)
+    parser.add_argument("--use-tracker-center-context", type=_str2bool, default=None)
+    parser.add_argument("--student-use-tracker-center-context", type=_str2bool, default=None)
+    parser.add_argument("--tracker-center-context-hidden-dim", type=int, default=None)
+    parser.add_argument("--tracker-center-token-scale", type=float, default=None)
+    parser.add_argument(
+        "--tracker-heatmap-target-mode",
+        choices=["canonical", "raw", "raw_area"],
+        default=None,
+    )
     parser.add_argument("--use-wan22-encoders", type=_str2bool, default=None)
     parser.add_argument("--wan22-model-base-path", type=str, default=None)
     parser.add_argument("--wan22-fastwam-src-path", type=str, default=None)
@@ -947,6 +1142,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fastwam-skip-dit-load-from-pretrain", type=_str2bool, default=None)
     parser.add_argument("--fastwam-action-dit-pretrained-path", type=str, default=None)
     parser.add_argument("--fastwam-mot-checkpoint-mixed-attn", type=_str2bool, default=None)
+    parser.add_argument("--use-fastwam-heatmap-guidance", type=_str2bool, default=None)
+    parser.add_argument("--fastwam-heatmap-guidance-scale", type=float, default=None)
+    parser.add_argument("--fastwam-heatmap-guidance-sigma", type=float, default=None)
+    parser.add_argument("--fastwam-heatmap-guidance-fov-deg", type=float, default=None)
+    parser.add_argument("--fastwam-ortrack-consistency-loss-weight", type=float, default=None)
+    parser.add_argument("--teacher-use-tracker-bias", type=_str2bool, default=False)
+    parser.add_argument("--student-keep-tracker-supervision", type=_str2bool, default=False)
+    parser.add_argument(
+        "--distillation-target-mode",
+        choices=["expert_offline_plus_student_sampled_action_velocity"],
+        default="expert_offline_plus_student_sampled_action_velocity",
+    )
+    parser.add_argument(
+        "--student-sampling-steps",
+        type=int,
+        default=8,
+        help="FastWAM denoising steps used to generate final teacher action targets.",
+    )
+    parser.add_argument(
+        "--student-sampling-seed",
+        type=int,
+        default=12345,
+        help="Fixed initial action-noise seed for deterministic teacher targets.",
+    )
 
     # Training config
     parser.add_argument("--batch-size", type=int, default=1)
@@ -956,6 +1175,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--wan-latent-cache-root", type=str, default="")
+    parser.add_argument("--ortrack-cache-root", type=str, default="")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
@@ -975,13 +1195,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--swanlab-log-dir", type=str, default=None)
     parser.add_argument("--swanlab-mode", type=str, default="cloud", choices=["cloud", "local", "offline", "disabled"])
 
-    # Distillation weights. Keep the first version clean.
+    # Tracker-free policy distillation weights.
     parser.add_argument("--sup-weight", type=float, default=1.0)
-    parser.add_argument("--flow-distill-weight", type=float, default=1.0)
-    parser.add_argument("--flow-distill-every", type=int, default=1)
-    parser.add_argument("--flow-distill-sampling-steps", type=int, default=0)
     parser.add_argument("--feat-distill-weight", type=float, default=0.0)
-    parser.add_argument("--action-distill-weight", type=float, default=0.0)
+    parser.add_argument("--action-distill-weight", type=float, default=0.2)
+    parser.add_argument("--attention-distill-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--attention-distill-mode",
+        choices=["all_queries_spatial_kl"],
+        default="all_queries_spatial_kl",
+    )
 
     # Student initialization
     parser.add_argument(
@@ -1002,6 +1225,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if int(args.student_sampling_steps) <= 0:
+        raise ValueError("--student-sampling-steps must be positive.")
 
     seed_everything(args.seed + _get_rank())
 
@@ -1042,14 +1267,26 @@ def main() -> None:
             f"got sampled_video_len={sampled_video_len}."
         )
 
-    train_loader, val_loader, total_n, train_n, val_n = build_loaders(args, student_cfg, use_ddp=use_distributed)
+    train_loader, val_loader, total_n, train_n, val_n = build_loaders(
+        args,
+        student_cfg,
+        use_ddp=use_distributed,
+        teacher_requires_gt_center=bool(teacher_cfg.use_gt_center_attention_bias),
+    )
     train_sampler = getattr(train_loader, "sampler_for_epoch", None)
 
     if _is_main_process():
         if val_n > 0:
-            print(f"[dataset] total={total_n}, train={train_n}, val={val_n}")
+            print(
+                f"[dataset] total={total_n}, train={train_n} "
+                f"({args.scene_list} {args.trajectory_range}), val={val_n} "
+                f"({args.val_scene_list or 'ratio split'} {args.val_trajectory_range or args.val_ratio})"
+            )
         else:
-            print(f"[dataset] total={total_n}, train={train_n}")
+            print(
+                f"[dataset] total={total_n}, train={train_n} "
+                f"({args.scene_list} {args.trajectory_range})"
+            )
         records_for_cache = build_records(
             Path(args.dataset_root),
             [s.strip() for s in args.scene_list.split(",") if s.strip()],
@@ -1071,17 +1308,25 @@ def main() -> None:
                 print("[wan-latents] WARNING: no matching cached latents; training will encode RGB videos online.")
         print(
             f"[teacher cfg] target_relative_context={teacher_cfg.use_target_relative_context}, "
+            f"tracker_center_context={teacher_cfg.use_tracker_center_context}, "
+            f"tracker_heatmap_target={teacher_cfg.tracker_heatmap_target_mode}, "
+            f"tracker_loss={teacher_cfg.use_fastwam_tracker_heatmap_loss}, "
             f"use_fastwam_mot={teacher_cfg.use_fastwam_mot}, use_wan22_encoders={teacher_cfg.use_wan22_encoders}"
         )
         print(
             f"[student cfg] target_relative_context={student_cfg.use_target_relative_context}, "
+            f"tracker_center_context={student_cfg.use_tracker_center_context}, "
+            f"tracker_heatmap_target={student_cfg.tracker_heatmap_target_mode}, "
+            f"tracker_loss={student_cfg.use_fastwam_tracker_heatmap_loss}, "
             f"low_dim_target_input=off, fusion={student_cfg.target_token_fusion_mode}, "
             f"train_next_target_relative={student_cfg.train_next_target_relative}, rollout_head=false"
         )
         print(
-            f"[distill] sup={args.sup_weight}, flow={args.flow_distill_weight}, "
-            f"flow_every={args.flow_distill_every}, flow_sampling_steps={args.flow_distill_sampling_steps or args.sampling_steps}, "
-            f"feat={args.feat_distill_weight}, action={args.action_distill_weight}"
+            f"[distill] sup={args.sup_weight}, feat={args.feat_distill_weight}, "
+            f"offline_action_video_and_sampled_action_velocity={args.action_distill_weight}, "
+            f"attention={args.attention_distill_weight}, "
+            f"student_sampling_steps={args.student_sampling_steps}, "
+            f"student_sampling_seed={args.student_sampling_seed}"
         )
 
     teacher = TeacherWorldModelDiT(teacher_cfg).to(device)
@@ -1091,11 +1336,7 @@ def main() -> None:
         print(f"[teacher] loaded frozen teacher: {args.teacher_ckpt}")
 
     student = TeacherWorldModelDiT(student_cfg).to(device)
-    if str(args.student_init_ckpt or "").strip():
-        load_model_state(student, args.student_init_ckpt, strict=False)
-        if _is_main_process():
-            print(f"[student] initialized from warmup checkpoint: {args.student_init_ckpt}")
-    elif args.init_student_from_teacher:
+    if args.init_student_from_teacher:
         load_model_state(student, args.teacher_ckpt, strict=False)
         if _is_main_process():
             print("[student] initialized from teacher checkpoint")
@@ -1127,6 +1368,7 @@ def main() -> None:
     start_epoch = 0
     global_step = 0
     best_val = math.inf
+    best_epoch = -1
     history: List[Dict[str, Any]] = []
 
     if args.resume:
@@ -1141,6 +1383,7 @@ def main() -> None:
         start_epoch = int(ckpt["epoch"]) + 1
         global_step = int(ckpt.get("global_step", 0))
         best_val = float(ckpt.get("best_val", best_val))
+        best_epoch = int(ckpt.get("best_epoch", best_epoch))
         history = list(ckpt.get("history", []))
         if _is_main_process():
             print(f"[resume] {args.resume}, start_epoch={start_epoch}, best_val={best_val:.6f}")
@@ -1227,57 +1470,198 @@ def main() -> None:
             else:
                 optimizer.zero_grad(set_to_none=True)
 
-            amp_ctx = nullcontext() if use_deepspeed else _autocast_context(device, student_cfg)
-            with amp_ctx:
-                with torch.no_grad():
-                    teacher_policy_target = batch["expert_action"] if args.action_distill_weight > 0.0 else None
-                    teacher_out = teacher(
-                        images=batch["images"],
-                        text_tokens=batch["text_tokens"],
-                        target_relative=batch["target_relative"],
-                        prev_actions=batch["prev_actions"],
-                        attention_mask=batch["attention_mask"],
-                        expert_action=teacher_policy_target,
-                        valid_mask=batch["valid_mask"] if teacher_policy_target is not None else None,
-                        done=batch.get("done"),
-                        instructions=batch.get("instructions"),
-                        video_latents=batch.get("video_latents"),
+            losses: Dict[str, torch.Tensor] = {}
+
+            def backward_branch(branch_loss: torch.Tensor, branch_name: str) -> None:
+                if not torch.isfinite(branch_loss.detach()).all():
+                    raise RuntimeError(
+                        f"Non-finite {branch_name} loss at epoch={epoch}, step={step}: "
+                        f"{float(branch_loss.detach().float().cpu())}"
                     )
+                if use_deepspeed:
+                    student.backward(branch_loss)
+                else:
+                    scaler.scale(branch_loss).backward()
 
-                student_out = student(
-                    images=batch["images"],
-                    text_tokens=batch["text_tokens"],
-                    target_relative=batch["target_relative"],
-                    prev_actions=batch["prev_actions"],
-                    attention_mask=batch["attention_mask"],
-                    expert_action=batch["expert_action"],
-                    valid_mask=batch["valid_mask"],
-                    done=batch.get("done"),
-                    instructions=batch.get("instructions"),
-                    video_latents=batch.get("video_latents"),
+            # Branch 1: ordinary expert-action / expert-video supervision.
+            with (nullcontext() if use_deepspeed else _autocast_context(device, student_cfg)):
+                teacher_out = None
+                if args.feat_distill_weight > 0.0:
+                    with torch.no_grad():
+                        teacher_out = teacher(
+                            images=batch["images"],
+                            text_tokens=batch["text_tokens"],
+                            target_relative=batch["target_relative"],
+                            prev_actions=batch["prev_actions"],
+                            attention_mask=batch["attention_mask"],
+                            expert_action=None,
+                            valid_mask=None,
+                            done=batch.get("done"),
+                            instructions=batch.get("instructions"),
+                            video_latents=batch.get("video_latents"),
+                            guidance_confidence=batch.get("guidance_confidence"),
+                            tracker_center=batch.get("tracker_center"),
+                        )
+
+                student_out = forward_student_policy_target(
+                    student,
+                    batch,
+                    student_cfg,
+                    batch["expert_action"],
+                    capture_attention=False,
+                )
+                sup = world_model_dit_loss(
+                    student_out, batch, student_cfg, valid_mask=batch.get("valid_mask")
+                )
+                student_belief = belief_feat(student_out)
+                feat_loss = student_belief.sum() * 0.0
+                if args.feat_distill_weight > 0.0:
+                    if teacher_out is None:
+                        raise RuntimeError("Feature distillation requested without a teacher forward.")
+                    feat_loss = masked_mse_lastdim(
+                        student_belief, belief_feat(teacher_out).detach(), batch.get("valid_mask")
+                    )
+                supervised_branch_loss = (
+                    args.sup_weight * sup["total"]
+                    + args.feat_distill_weight * feat_loss
+                )
+            backward_branch(supervised_branch_loss, "supervised")
+            losses.update({f"sup_{key}": value.detach() for key, value in sup.items()})
+            losses["feat_distill"] = feat_loss.detach()
+            del student_out, teacher_out, student_belief, sup, feat_loss
+
+            zero = supervised_branch_loss.detach() * 0.0
+            offline_action_loss = zero
+            offline_video_velocity_loss = zero
+            attention_loss = zero
+
+            # Branch 2: expert-action / expert-video offline velocity and attention KD.
+            if args.action_distill_weight > 0.0 or args.attention_distill_weight > 0.0:
+                with (nullcontext() if use_deepspeed else _autocast_context(device, student_cfg)):
+                    expert_action = batch["expert_action"]
+                    offline_flow_state = shared_flow_state(
+                        _unwrap_model(student), expert_action[:, :-1], batch
+                    )
+                    with torch.no_grad():
+                        offline_teacher_velocity_out = forward_teacher_velocity(
+                            teacher, batch, expert_action, offline_flow_state,
+                            capture_attention=args.attention_distill_weight > 0.0,
+                        )
+                    with deterministic_student_kd_forward(student):
+                        offline_student_velocity_out = forward_student_policy_target(
+                            student,
+                            batch,
+                            student_cfg,
+                            expert_action,
+                            capture_attention=args.attention_distill_weight > 0.0,
+                            capture_flow_predictions=True,
+                            flow_state=offline_flow_state,
+                        )
+                    offline_action_loss = action_velocity_distillation_loss(
+                        offline_student_velocity_out,
+                        offline_teacher_velocity_out,
+                        batch.get("valid_mask"),
+                        supervised_branch_loss,
+                    )
+                    offline_video_velocity_loss = video_velocity_distillation_loss(
+                        offline_student_velocity_out,
+                        offline_teacher_velocity_out,
+                        supervised_branch_loss,
+                    )
+                    attention_loss = (
+                        all_query_attention_distillation_loss(
+                            offline_student_velocity_out,
+                            offline_teacher_velocity_out,
+                            batch.get("valid_mask"),
+                            supervised_branch_loss,
+                        )
+                        if args.attention_distill_weight > 0.0
+                        else zero
+                    )
+                    offline_branch_loss = (
+                        args.action_distill_weight
+                        * (offline_action_loss + offline_video_velocity_loss)
+                        + args.attention_distill_weight * attention_loss
+                    )
+                backward_branch(offline_branch_loss, "offline-distill")
+                del offline_student_velocity_out, offline_teacher_velocity_out, offline_flow_state
+
+            sampled_action_loss = zero
+            sampled_video_velocity_loss = zero
+
+            # Branch 3: Student-sampled actions receive action-velocity KD only.
+            if args.action_distill_weight > 0.0:
+                with (nullcontext() if use_deepspeed else _autocast_context(device, student_cfg)):
+                    with torch.no_grad(), deterministic_student_kd_forward(student):
+                        sampled_action = sample_student_policy_actions(
+                            _unwrap_model(student),
+                            batch,
+                            student_cfg,
+                            args,
+                            sampling_offset=global_step,
+                        )
+                    sampled_action_target = sampled_action_as_sequence_target(
+                        sampled_action,
+                        batch["expert_action"],
+                    )
+                    flow_state = shared_flow_state(
+                        _unwrap_model(student), sampled_action, batch
+                    )
+                    with torch.no_grad():
+                        sampled_teacher_velocity_out = forward_teacher_velocity(
+                            teacher, batch, sampled_action_target, flow_state,
+                            capture_attention=False,
+                        )
+                    with deterministic_student_kd_forward(student):
+                        sampled_student_velocity_out = forward_student_policy_target(
+                            student,
+                            batch,
+                            student_cfg,
+                            sampled_action_target,
+                            capture_attention=False,
+                            capture_flow_predictions=True,
+                            flow_state=flow_state,
+                        )
+                    sampled_action_loss = action_velocity_distillation_loss(
+                        sampled_student_velocity_out,
+                        sampled_teacher_velocity_out,
+                        batch.get("valid_mask"),
+                        supervised_branch_loss,
+                    )
+                    sampled_branch_loss = args.action_distill_weight * sampled_action_loss
+                backward_branch(sampled_branch_loss, "sampled-action-distill")
+                del (
+                    sampled_student_velocity_out,
+                    sampled_teacher_velocity_out,
+                    sampled_action,
+                    sampled_action_target,
+                    flow_state,
                 )
 
-                losses = self_distill_losses(
-                    student_out=student_out,
-                    teacher_out=teacher_out,
-                    student_model=_unwrap_model(student),
-                    teacher_model=teacher,
-                    batch=batch,
-                    cfg=student_cfg,
-                    args=args,
-                    global_step=global_step,
-                )
-                loss = losses["total"]
-
-            if torch.is_tensor(loss) and not torch.isfinite(loss.detach()).all():
-                debug = _finite_debug_summary(losses, student_out)
-                raise RuntimeError(f"Non-finite self-distill loss at epoch={epoch}, step={step}: {debug}")
+            flow_distill_loss = (
+                offline_action_loss.detach()
+                + offline_video_velocity_loss.detach()
+                + sampled_action_loss.detach()
+            )
+            losses["offline_action_velocity_distill"] = offline_action_loss.detach()
+            losses["offline_video_velocity_distill"] = offline_video_velocity_loss.detach()
+            losses["sampled_action_velocity_distill"] = sampled_action_loss.detach()
+            losses["sampled_video_velocity_distill"] = sampled_video_velocity_loss
+            losses["action_distill"] = (
+                offline_action_loss.detach() + sampled_action_loss.detach()
+            )
+            losses["video_velocity_distill"] = offline_video_velocity_loss.detach()
+            losses["flow_distill"] = flow_distill_loss
+            losses["attention_distill"] = attention_loss.detach()
+            losses["total"] = (
+                supervised_branch_loss.detach()
+                + args.action_distill_weight * flow_distill_loss
+                + args.attention_distill_weight * attention_loss.detach()
+            )
 
             if use_deepspeed:
-                student.backward(loss)
                 student.step()
             else:
-                scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 clip_grad_norm_(student.parameters(), args.grad_clip)
                 scaler.step(optimizer)
@@ -1296,12 +1680,12 @@ def main() -> None:
                     "step": global_step,
                     "total": f"{avg.get('total', 0.0):.4f}",
                     "sup": f"{avg.get('sup_total', 0.0):.4f}",
-                    "flow": f"{avg.get('flow_distill', 0.0):.4f}",
+                    "feat": f"{avg.get('feat_distill', 0.0):.4f}",
                 }
-                if abs(avg.get("feat_distill", 0.0)) >= 1e-12:
-                    postfix["feat"] = f"{avg['feat_distill']:.4f}"
                 if abs(avg.get("action_distill", 0.0)) >= 1e-12:
                     postfix["action"] = f"{avg['action_distill']:.4f}"
+                if abs(avg.get("attention_distill", 0.0)) >= 1e-12:
+                    postfix["attention"] = f"{avg['attention_distill']:.4f}"
                 total_pbar.set_postfix(**postfix)
                 total_pbar.update(1)
             elif _is_main_process() and (step + 1) % 20 == 0:
@@ -1334,17 +1718,19 @@ def main() -> None:
                 tqdm.write(msg) if tqdm is not None else print(msg)
                 _swanlab_log(swanlab_run, val_avg, step=epoch, prefix="val")
 
-        metric = train_avg["total"] if val_avg is None else val_avg["total"]
+        metric_source = train_avg if val_avg is None else val_avg
+        metric = metric_source["total"]
         if _is_main_process():
             history.append({
                 "epoch": epoch,
                 "train": train_avg,
                 "val": val_avg,
                 "metric": metric,
+                "metric_name": "total",
                 "global_step": int(global_step),
             })
 
-            should_save = (
+            should_save_last = (
                 (
                     int(args.max_train_steps) <= 0
                     and int(args.save_every_epochs) > 0
@@ -1355,10 +1741,11 @@ def main() -> None:
                     and global_step >= int(args.max_train_steps)
                 )
             )
-            if should_save:
-                is_best = metric < best_val
-                if is_best:
-                    best_val = metric
+            is_best = metric < best_val
+            if is_best:
+                best_val = metric
+                best_epoch = epoch
+            if should_save_last or (bool(args.save_best_checkpoint) and is_best):
                 ckpt = {
                     "epoch": epoch,
                     "global_step": int(global_step),
@@ -1371,13 +1758,15 @@ def main() -> None:
                     "teacher_cfg": teacher_cfg.__dict__,
                     "args": vars(args),
                     "best_val": best_val,
+                    "best_epoch": int(best_epoch),
                     "history": history,
                 }
+            if should_save_last:
                 torch.save(ckpt, save_dir / "last.pt")
 
-                if bool(args.save_best_checkpoint) and is_best:
-                    torch.save(ckpt, save_dir / "best.pt")
-                    print(f"[save] best.pt updated: metric={metric:.6f}")
+            if bool(args.save_best_checkpoint) and is_best:
+                torch.save(ckpt, save_dir / "best.pt")
+                print(f"[save] best.pt updated: epoch={epoch}, metric={metric:.6f}")
 
             with open(save_dir / "history.json", "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2, ensure_ascii=False)
@@ -1394,6 +1783,7 @@ def main() -> None:
             "global_step": int(global_step),
             "max_train_steps": int(args.max_train_steps),
             "best_val": float(best_val),
+            "best_epoch": int(best_epoch),
         }
         with open(save_dir / "done.marker", "w", encoding="utf-8") as f:
             json.dump(done_marker, f, indent=2, ensure_ascii=False)

@@ -14,6 +14,9 @@ from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 import threading
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_DATASET_BASE_DIR = str(PROJECT_ROOT / "Dataset")
+
 try:
     from tornado.iostream import StreamClosedError
     TORNADO_AVAILABLE = True
@@ -35,6 +38,62 @@ DEFAULT_SYSTEM_PROMPT = (
     "they appear closer or cross the view. Keep the target centered, pursue "
     "smoothly, and avoid obstacles or collisions."
 )
+DEPTH_SCALE_M = 100.0
+DEPTH_MAX_M = 655.35
+DEPTH_IMAGE_TYPE_NAME = "DepthPerspective"
+DEPTH_IMAGE_TYPE_FALLBACK = 2
+TARGET_SEGMENTATION_ID = 43
+TARGET_SEGMENTATION_COLOR_RGB = (207, 229, 90)
+
+
+class TargetSegmentationError(RuntimeError):
+    """Target segmentation setup failed without invalidating the AirSim scene."""
+
+
+def _get_airsim_image_type(name, fallback):
+    try:
+        return getattr(airsim.ImageType, name)
+    except AttributeError:
+        return fallback
+
+
+def _depth_format_matches(depth_dir):
+    meta_path = Path(depth_dir) / "depth_format.json"
+    if not meta_path.exists():
+        return False
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return (
+            float(meta.get("scale_m_to_uint16", -1.0)) == float(DEPTH_SCALE_M)
+            and abs(float(meta.get("max_depth_m", -1.0)) - float(DEPTH_MAX_M)) < 1e-6
+        )
+    except Exception:
+        return False
+
+
+def _target_boxes_complete(dataset_path, expected_steps, expected_capture_mode=None):
+    boxes_path = Path(dataset_path) / "target_boxes.json"
+    if not boxes_path.exists():
+        return False
+    try:
+        with open(boxes_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        color = tuple(int(value) for value in payload.get("segmentation_color_rgb", []))
+        capture_mode = payload.get("capture_mode")
+        boxes = payload.get("boxes_xywh")
+        frames = payload.get("frames")
+        return (
+            color == TARGET_SEGMENTATION_COLOR_RGB
+            and (expected_capture_mode is None or capture_mode == expected_capture_mode)
+            and isinstance(boxes, list)
+            and len(boxes) >= int(expected_steps)
+            and isinstance(frames, list)
+            and len(frames) >= int(expected_steps)
+        )
+    except Exception:
+        return False
+
 
 def safe_log(msg, scene_id=None):
     if scene_id:
@@ -71,7 +130,7 @@ try:
         root_logger.removeHandler(handler)
     root_logger.setLevel(logging.WARNING)
     root_logger.propagate = False
-    
+
     from .logger import logger
     if hasattr(logger, 'logger'):
         for handler in logger.logger.handlers[:]:
@@ -422,6 +481,7 @@ class TrajectoryExecutor:
         self.pre_existing_sim_client_tool = pre_existing_sim_client_tool
         self.deterministic_step_mode = bool(deterministic_step_mode)
         self._sim_paused_by_executor = False
+        self.disable_physics_pose_refresh = False
 
         
         self.client = None
@@ -431,6 +491,35 @@ class TrajectoryExecutor:
         self._prev_frame_data = None
         
         self._abnormal_jumps = []
+        self.save_depth = True
+        self.require_depth = True
+        self.validate_camera_freshness = False
+        self.camera_max_vehicle_distance = 5.0
+        self.camera_pose_tolerance_m = 0.05
+        self.camera_orientation_tolerance_deg = 1.0
+        self._last_camera_timestamp = None
+        self.camera_stale_rejections = 0
+        self.camera_distance_rejections = 0
+        self.camera_pose_rejections = 0
+        self.use_external_camera = False
+        self.camera_only_capture = False
+        self._camera_only_orientation = None
+        self._last_camera_response_position = None
+        self._last_camera_response_orientation = None
+        self._expected_external_camera_position = None
+        self._expected_external_camera_orientation = None
+        self.save_target_segmentation = False
+        self.save_target_masks = False
+        self.save_target_bbox_overlays = False
+        self.target_segmentation_id = TARGET_SEGMENTATION_ID
+        self._target_segmentation_color = None
+        self._last_target_segmentation = None
+        self._target_boxes = []
+        self._target_box_frames = []
+        # Object poses are verified on the first steady-state move and then
+        # periodically. Failed sets always fall back to strict RPC validation.
+        self.object_pose_verify_interval = 30
+        self._object_pose_move_counts = {}
     
 
     def _safe_sim_pause(self, pause: bool):
@@ -457,6 +546,23 @@ class TrajectoryExecutor:
                 time.sleep(0.02 * frames)
             finally:
                 self._safe_sim_pause(True)
+
+    def configure_camera_rendering(self, max_fps: float = 0.0):
+        """Limit offscreen rendering so Vulkan readbacks do not queue indefinitely."""
+        max_fps = float(max_fps)
+        if max_fps <= 0.0:
+            return
+        command = f"t.MaxFPS {max_fps:g}"
+        if not self.client.simRunConsoleCommand(command):
+            raise RuntimeError(f"Unreal rejected console command: {command}")
+
+    def get_fresh_camera_images(self):
+        """Capture the first rendered frame after unpausing, then pause immediately."""
+        self._safe_sim_pause(False)
+        try:
+            return self.get_camera_images()
+        finally:
+            self._safe_sim_pause(True)
 
     def _get_vehicle_pos(self):
         pose = self.client.simGetVehiclePose(vehicle_name=self.uav_vehicle_name)
@@ -498,10 +604,22 @@ class TrajectoryExecutor:
             if not rpc_ok and last_rpc_err is not None:
                 raise last_rpc_err
 
-            try:
-                self.client.simContinueForFrames(2)
-            except Exception:
-                pass
+            if getattr(self, "disable_physics_pose_refresh", False):
+                try:
+                    self.client.simContinueForFrames(1)
+                    self._safe_sim_pause(True)
+                    self.client.simSetVehiclePose(
+                        pose,
+                        ignore_collision=True,
+                        vehicle_name=self.uav_vehicle_name,
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.client.simContinueForFrames(2)
+                except Exception:
+                    pass
 
             px, py, pz = self._get_vehicle_pos()
             last = np.array([px, py, pz], dtype=np.float32)
@@ -515,6 +633,113 @@ class TrajectoryExecutor:
         err_xy = float(np.hypot(last[0] - x, last[1] - y)) if last is not None else float("inf")
         err_z = float(abs(last[2] - z)) if last is not None else float("inf")
         return False, last, err, err_xy, err_z
+
+    def render_frames_holding_vehicle_pose(self, frames: int = 1):
+        """Render a deterministic frame batch, then restore the multirotor pose."""
+        import airsim
+
+        frames = max(int(frames), 0)
+        if frames == 0:
+            return
+        state = self.get_uav_state()
+        position = np.asarray(state["position"], dtype=np.float32)
+        orientation = np.asarray(state["orientation"], dtype=np.float64)
+        pose = airsim.Pose(
+            airsim.Vector3r(float(position[0]), float(position[1]), float(position[2])),
+            airsim.Quaternionr(
+                w_val=float(orientation[0]),
+                x_val=float(orientation[1]),
+                y_val=float(orientation[2]),
+                z_val=float(orientation[3]),
+            ),
+        )
+        self._safe_sim_pause(True)
+        self.client.simSetVehiclePose(
+            pose,
+            ignore_collision=True,
+            vehicle_name=self.uav_vehicle_name,
+        )
+        self.client.simContinueForFrames(frames)
+        self._safe_sim_pause(True)
+        self.client.simSetVehiclePose(
+            pose,
+            ignore_collision=True,
+            vehicle_name=self.uav_vehicle_name,
+        )
+
+    def set_external_camera_pose_from_state(self, state):
+        """Move the external camera to a stable UAV pose before rendering."""
+        import airsim
+
+        position = np.asarray(state["position"], dtype=np.float32)
+        orientation = np.asarray(state["orientation"], dtype=np.float64)
+        pose = airsim.Pose(
+            airsim.Vector3r(float(position[0]), float(position[1]), float(position[2])),
+            airsim.Quaternionr(
+                w_val=float(orientation[0]),
+                x_val=float(orientation[1]),
+                y_val=float(orientation[2]),
+                z_val=float(orientation[3]),
+            ),
+        )
+        self.client.simSetCameraPose(
+            self.camera_name,
+            pose,
+            vehicle_name="",
+            external=True,
+        )
+        self._expected_external_camera_position = position.copy()
+        norm = float(np.linalg.norm(orientation))
+        self._expected_external_camera_orientation = (
+            orientation / norm if norm > 1.0e-12 else orientation.copy()
+        )
+
+    def _park_physical_vehicle_for_camera_capture(self, reference_position):
+        """Keep the multirotor mesh far below the external camera capture volume."""
+        import airsim
+
+        reference = np.asarray(reference_position, dtype=np.float32)
+        pose = airsim.Pose(
+            airsim.Vector3r(
+                float(reference[0]),
+                float(reference[1]),
+                float(reference[2] + 1000.0),
+            ),
+            airsim.to_quaternion(0.0, 0.0, 0.0),
+        )
+        self._safe_sim_pause(True)
+        self.client.simSetVehiclePose(
+            pose,
+            ignore_collision=True,
+            vehicle_name=self.uav_vehicle_name,
+        )
+
+    def _camera_only_state(self, u_target, t_target, planned_yaw, yaw_rate, step_idx):
+        import airsim
+
+        if planned_yaw is not None:
+            quat = airsim.to_quaternion(0.0, 0.0, float(planned_yaw))
+        elif self._camera_only_orientation is None:
+            delta = np.asarray(t_target, dtype=np.float64) - np.asarray(u_target, dtype=np.float64)
+            yaw = float(np.arctan2(delta[1], delta[0])) if np.linalg.norm(delta[:2]) > 1e-6 else 0.0
+            quat = airsim.to_quaternion(0.0, 0.0, yaw)
+        else:
+            quat = self._quat_from_yaw_rate(
+                current_orientation=self._camera_only_orientation,
+                yaw_rate=yaw_rate,
+                step_idx=step_idx,
+            )
+        orientation = np.asarray(
+            [float(quat.w_val), float(quat.x_val), float(quat.y_val), float(quat.z_val)],
+            dtype=np.float64,
+        )
+        self._camera_only_orientation = orientation
+        return {
+            "position": np.asarray(u_target, dtype=np.float32).copy(),
+            "orientation": orientation.copy(),
+            "has_collided": False,
+            "collision_time_stamp": None,
+        }
 
     def _set_object_pose_paused(self, object_name, x, y, z, quat=None, retries=3, tol=1.0):
         import numpy as np
@@ -544,6 +769,80 @@ class TrajectoryExecutor:
 
         err = float(np.linalg.norm(last - np.array([x, y, z], dtype=np.float32))) if last is not None and not np.any(np.isnan(last)) else float("inf")
         return False, last, err
+
+    def _set_object_pose_steady(self, object_name, x, y, z, quat=None, tol=1.0):
+        """Set a known object cheaply, with first/periodic pose verification."""
+        import airsim
+
+        x, y, z = float(x), float(y), float(z)
+        if quat is None:
+            quat = airsim.to_quaternion(0, 0, 0)
+
+        self._safe_sim_pause(True)
+        try:
+            result = self.client.simSetObjectPose(
+                object_name,
+                airsim.Pose(airsim.Vector3r(x, y, z), quat),
+            )
+        except Exception as exc:
+            return False, None, float("inf"), f"simSetObjectPose raised: {exc}"
+
+        if result is False:
+            return False, None, float("inf"), "simSetObjectPose returned False"
+
+        count = int(self._object_pose_move_counts.get(object_name, 0)) + 1
+        self._object_pose_move_counts[object_name] = count
+        interval = max(1, int(getattr(self, "object_pose_verify_interval", 30)))
+        if count != 1 and count % interval != 0:
+            return True, None, 0.0, None
+
+        try:
+            pose = self.client.simGetObjectPose(object_name)
+        except Exception as exc:
+            return False, None, float("inf"), f"periodic simGetObjectPose raised: {exc}"
+        if pose is None:
+            return False, None, float("inf"), "periodic simGetObjectPose returned None"
+
+        p = pose.position
+        last = np.asarray(
+            [float(p.x_val), float(p.y_val), float(p.z_val)], dtype=np.float32
+        )
+        if np.any(np.isnan(last)):
+            return False, last, float("inf"), "periodic pose contains NaN"
+
+        target = np.asarray([x, y, z], dtype=np.float32)
+        err = float(np.linalg.norm(last - target))
+        if err > float(tol):
+            return False, last, err, f"periodic pose error {err:.2f}m"
+        return True, last, err, None
+
+    def _recover_object_pose(self, object_name, x, y, z, quat, spawn_object, tol=1.0):
+        """Recover a failed steady-state move and strictly verify the result."""
+        exists = _scene_object_exists_exact(self.client, object_name)
+
+        # A transient set/get failure should not force an unnecessary respawn.
+        if exists is not False:
+            ok, last, err = self._set_object_pose_paused(
+                object_name, x, y, z, quat=quat, retries=2, tol=tol
+            )
+            if ok:
+                self._object_pose_move_counts[object_name] = 1
+                return True, last, err, "strict retry"
+
+        try:
+            spawned = bool(spawn_object(float(x), float(y), float(z)))
+        except Exception as exc:
+            return False, None, float("inf"), f"respawn raised: {exc}"
+        if not spawned:
+            return False, None, float("inf"), "respawn returned False"
+
+        ok, last, err = self._set_object_pose_paused(
+            object_name, x, y, z, quat=quat, retries=3, tol=tol
+        )
+        if ok:
+            self._object_pose_move_counts[object_name] = 1
+            return True, last, err, "respawn"
+        return False, last, err, "strict verification failed after respawn"
 
     def _step_if_needed(self, frames: int = 1):
         if not getattr(self, "deterministic_step_mode", False):
@@ -833,7 +1132,8 @@ class TrajectoryExecutor:
         try:
             collision_info = self._safe_call_airsim(self.client.simGetCollisionInfo, vehicle_name=self.uav_vehicle_name)
             collision_info = self._safe_call_airsim(self.client.simGetCollisionInfo, vehicle_name=self.uav_vehicle_name)
-            self._safe_call_airsim(self.client.simContinueForFrames, 1)
+            if not getattr(self, "disable_physics_pose_refresh", False):
+                self._safe_call_airsim(self.client.simContinueForFrames, 1)
         except Exception as e:
             pass
     
@@ -910,10 +1210,14 @@ class TrajectoryExecutor:
                         raise
 
                 if getattr(self, "deterministic_step_mode", False):
-                    self._step_if_needed(1)
+                    if not getattr(self, "disable_physics_pose_refresh", False):
+                        self._step_if_needed(1)
+                    else:
+                        self._safe_sim_pause(True)
                 else:
                     self._safe_sim_pause(False)
                     time.sleep(0.02)
+                    self._safe_sim_pause(True)
 
                 self.reset_collision_info()
 
@@ -1149,17 +1453,123 @@ class TrajectoryExecutor:
             'collision_time_stamp': collision_time_stamp
         }
     
+    @staticmethod
+    def _position_xyz(position):
+        return np.asarray(
+            [float(position.x_val), float(position.y_val), float(position.z_val)],
+            dtype=np.float32,
+        )
+
     def get_camera_images(self):
         max_retries = 5
-        retry_delay = 2.0
+        retry_delay = 0.02
+        self._last_camera_profile_ms = {}
+        self._last_target_segmentation = None
         
         for attempt in range(max_retries):
             try:
-                responses_rgb = self.client.simGetImages([
-                    airsim.ImageRequest(self.camera_name, airsim.ImageType.Scene, False, False)
-                ], vehicle_name=self.uav_vehicle_name)
+                requests = [airsim.ImageRequest(self.camera_name, airsim.ImageType.Scene, False, False)]
+                depth_response_index = None
+                if bool(getattr(self, "save_depth", True)):
+                    depth_image_type = _get_airsim_image_type(DEPTH_IMAGE_TYPE_NAME, DEPTH_IMAGE_TYPE_FALLBACK)
+                    depth_response_index = len(requests)
+                    requests.append(airsim.ImageRequest(self.camera_name, depth_image_type, True, False))
+                segmentation_response_index = None
+                if bool(getattr(self, "save_target_segmentation", False)):
+                    segmentation_response_index = len(requests)
+                    requests.append(
+                        airsim.ImageRequest(
+                            self.camera_name,
+                            airsim.ImageType.Segmentation,
+                            False,
+                            False,
+                        )
+                    )
+                use_external_camera = bool(getattr(self, "use_external_camera", False))
+                rpc_started = time.perf_counter()
+                responses = self.client.simGetImages(
+                    requests,
+                    vehicle_name="" if use_external_camera else self.uav_vehicle_name,
+                    external=use_external_camera,
+                )
+                rpc_done = time.perf_counter()
+                if not responses:
+                    raise RuntimeError("AirSim returned no camera responses")
                 
-                rgb_response = responses_rgb[0]
+                rgb_response = responses[0]
+                self._last_camera_response_position = self._position_xyz(
+                    rgb_response.camera_position
+                )
+                response_orientation = rgb_response.camera_orientation
+                self._last_camera_response_orientation = np.asarray(
+                    [
+                        float(response_orientation.w_val),
+                        float(response_orientation.x_val),
+                        float(response_orientation.y_val),
+                        float(response_orientation.z_val),
+                    ],
+                    dtype=np.float64,
+                )
+                if self.validate_camera_freshness:
+                    timestamp = int(getattr(rgb_response, "time_stamp", 0) or 0)
+                    if self._last_camera_timestamp is not None and timestamp <= self._last_camera_timestamp:
+                        self.camera_stale_rejections += 1
+                        raise RuntimeError(
+                            f"stale camera frame: timestamp={timestamp}, "
+                            f"last={self._last_camera_timestamp}"
+                        )
+                    response_camera_position = self._position_xyz(rgb_response.camera_position)
+                    if use_external_camera and self._expected_external_camera_position is not None:
+                        position_error = float(
+                            np.linalg.norm(
+                                response_camera_position - self._expected_external_camera_position
+                            )
+                        )
+                        expected_orientation = self._expected_external_camera_orientation
+                        response_orientation = self._last_camera_response_orientation
+                        response_norm = float(np.linalg.norm(response_orientation))
+                        orientation_error_deg = float("inf")
+                        if expected_orientation is not None and response_norm > 1.0e-12:
+                            response_orientation = response_orientation / response_norm
+                            quat_dot = float(
+                                np.clip(
+                                    abs(np.dot(response_orientation, expected_orientation)),
+                                    0.0,
+                                    1.0,
+                                )
+                            )
+                            orientation_error_deg = float(
+                                np.degrees(2.0 * np.arccos(quat_dot))
+                            )
+                        if (
+                            not np.isfinite(position_error)
+                            or position_error > float(self.camera_pose_tolerance_m)
+                            or not np.isfinite(orientation_error_deg)
+                            or orientation_error_deg > float(self.camera_orientation_tolerance_deg)
+                        ):
+                            self.camera_pose_rejections += 1
+                            raise RuntimeError(
+                                "external camera pose mismatch: "
+                                f"position_error={position_error:.4f}m, "
+                                f"orientation_error={orientation_error_deg:.3f}deg, "
+                                f"limits={self.camera_pose_tolerance_m:.4f}m/"
+                                f"{self.camera_orientation_tolerance_deg:.3f}deg"
+                            )
+                    else:
+                        vehicle_position = np.asarray(self._get_vehicle_pos(), dtype=np.float32)
+                        camera_vehicle_distance = float(
+                            np.linalg.norm(response_camera_position - vehicle_position)
+                        )
+                        if (
+                            not np.isfinite(camera_vehicle_distance)
+                            or camera_vehicle_distance > float(self.camera_max_vehicle_distance)
+                        ):
+                            self.camera_distance_rejections += 1
+                            raise RuntimeError(
+                                "camera too far from vehicle: "
+                                f"distance={camera_vehicle_distance:.3f}m, "
+                                f"limit={self.camera_max_vehicle_distance:.3f}m"
+                            )
                 rgb_img = None
                 if rgb_response.image_data_uint8:
                     rgb_img = np.frombuffer(rgb_response.image_data_uint8, dtype=np.uint8)
@@ -1167,11 +1577,49 @@ class TrajectoryExecutor:
                     rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
                 
                 depth_img = None
+                if depth_response_index is not None and len(responses) > depth_response_index:
+                    depth_response = responses[depth_response_index]
+                    if depth_response.image_data_float:
+                        depth_img = np.asarray(depth_response.image_data_float, dtype=np.float32)
+                        depth_img = depth_img.reshape(depth_response.height, depth_response.width)
+                if segmentation_response_index is not None:
+                    if len(responses) <= segmentation_response_index:
+                        raise RuntimeError("AirSim returned no Segmentation response")
+                    segmentation_response = responses[segmentation_response_index]
+                    if not segmentation_response.image_data_uint8:
+                        raise RuntimeError("AirSim returned an empty Segmentation image")
+                    segmentation = np.frombuffer(
+                        segmentation_response.image_data_uint8, dtype=np.uint8
+                    ).reshape(
+                        segmentation_response.height,
+                        segmentation_response.width,
+                        3,
+                    )
+                    self._last_target_segmentation = cv2.cvtColor(
+                        segmentation, cv2.COLOR_BGR2RGB
+                    )
+                    if self._last_target_segmentation.shape[:2] != rgb_img.shape[:2]:
+                        raise RuntimeError(
+                            "Segmentation/RGB resolution mismatch: "
+                            f"segmentation={self._last_target_segmentation.shape[1]}x"
+                            f"{self._last_target_segmentation.shape[0]}, "
+                            f"rgb={rgb_img.shape[1]}x{rgb_img.shape[0]}. "
+                            "Configure AirSim ImageType 5 with the same capture resolution as ImageType 0."
+                        )
+                if self.validate_camera_freshness:
+                    self._last_camera_timestamp = int(getattr(rgb_response, "time_stamp", 0) or 0)
+                decode_done = time.perf_counter()
+                self._last_camera_profile_ms = {
+                    "camera_rpc_ms": (rpc_done - rpc_started) * 1000.0,
+                    "camera_decode_ms": (decode_done - rpc_done) * 1000.0,
+                }
                 return rgb_img, depth_img
             except (TimeoutError, Exception) as e:
                 error_msg = str(e)
                 if attempt < max_retries - 1:
                     safe_log(f"⚠ Image request failed ({attempt + 1}/{max_retries}): {error_msg}", scene_id=self.scene_id)
+                    if self.validate_camera_freshness:
+                        self._safe_continue_for_frames(1)
                     time.sleep(retry_delay)
                     continue
                 else:
@@ -1181,69 +1629,138 @@ class TrajectoryExecutor:
                     return None, None
         
         return None, None
-    
+
+    def _capture_segmentation_image(self):
+        response = self.client.simGetImages(
+            [
+                airsim.ImageRequest(
+                    self.camera_name,
+                    airsim.ImageType.Segmentation,
+                    False,
+                    False,
+                )
+            ],
+            vehicle_name="" if bool(getattr(self, "use_external_camera", False)) else self.uav_vehicle_name,
+            external=bool(getattr(self, "use_external_camera", False)),
+        )[0]
+        if not response.image_data_uint8:
+            raise RuntimeError("AirSim returned an empty Segmentation calibration image")
+        image = np.frombuffer(response.image_data_uint8, dtype=np.uint8).reshape(
+            response.height, response.width, 3
+        )
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    def _set_target_segmentation_id(self, object_id):
+        object_name = str(self.target_object_name)
+        ok = bool(self.client.simSetSegmentationObjectID(object_name, int(object_id), False))
+        if not ok:
+            ok = bool(
+                self.client.simSetSegmentationObjectID(
+                    f".*{re.escape(object_name)}.*", int(object_id), True
+                )
+            )
+        if not ok:
+            raise TargetSegmentationError(
+                f"AirSim could not assign Segmentation ID {object_id} to {object_name}"
+            )
+
+    def _configure_target_segmentation(self):
+        self._target_segmentation_color = None
+        self._target_boxes = []
+        self._target_box_frames = []
+        if not bool(getattr(self, "save_target_segmentation", False)):
+            return
+
+        target_id = int(getattr(self, "target_segmentation_id", TARGET_SEGMENTATION_ID))
+        if target_id != TARGET_SEGMENTATION_ID:
+            raise TargetSegmentationError(
+                f"Unsupported target Segmentation ID {target_id}; expected {TARGET_SEGMENTATION_ID}"
+            )
+
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                cleared = bool(self.client.simSetSegmentationObjectID(".*", -1, True))
+                if not cleared:
+                    raise TargetSegmentationError(
+                        "AirSim could not clear scene Segmentation IDs before target setup"
+                    )
+                self._set_target_segmentation_id(target_id)
+                self._safe_continue_for_frames(1)
+                self.target_segmentation_id = target_id
+                self._target_segmentation_color = np.asarray(
+                    TARGET_SEGMENTATION_COLOR_RGB, dtype=np.uint8
+                )
+                safe_log(
+                    f"Target Segmentation configured: object={self.target_object_name}, "
+                    f"id={target_id}, color={list(TARGET_SEGMENTATION_COLOR_RGB)}",
+                    scene_id=self.scene_id,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    safe_log(
+                        f"Target Segmentation setup retry {attempt}/3: {exc}",
+                        scene_id=self.scene_id,
+                    )
+                    self._safe_continue_for_frames(1)
+                    time.sleep(0.05)
+
+        raise TargetSegmentationError(
+            f"Target Segmentation setup failed after 3 attempts: {last_error}"
+        ) from last_error
+
 
     def move_target_object(self, target_pos):
         import airsim
-        import numpy as np
-
-        try:
-            exists = _scene_object_exists_exact(self.client, self.target_object_name)
-            test_pose = self.client.simGetObjectPose(self.target_object_name)
-            if exists is False or test_pose is None:
-                if self.target_asset_name is None:
-                    self.target_asset_name = self.target_object_name
-                if not self.spawn_target_object(float(target_pos[0]), float(target_pos[1]), float(target_pos[2])):
-                    safe_log(
-                        f"⚠ Target object {self.target_object_name} is missing; respawning",
-                        scene_id=self.scene_id
-                    )
-            else:
-                test_pos = np.array([test_pose.position.x_val, test_pose.position.y_val, test_pose.position.z_val])
-                if np.any(np.isnan(test_pos)):
-                    if self.target_asset_name is None:
-                        self.target_asset_name = self.target_object_name
-                    if not self.spawn_target_object(float(target_pos[0]), float(target_pos[1]), float(target_pos[2])):
-                        safe_log(
-                            f"⚠ Target object {self.target_object_name} pose is NaN; respawning",
-                            scene_id=self.scene_id
-                        )
-        except Exception as e:
-            if self.target_asset_name is None:
-                self.target_asset_name = self.target_object_name
-            try:
-                self.spawn_target_object(float(target_pos[0]), float(target_pos[1]), float(target_pos[2]))
-            except Exception as spawn_error:
-                safe_log(
-                    f"⚠ Failed to refresh target object {self.target_object_name}: {e}; respawn error: {spawn_error}",
-                    scene_id=self.scene_id
-                )
 
         pose_quat = airsim.to_quaternion(0, 0, 0)
-        ok, last, err = self._set_object_pose_paused(
+        ok, last, err, reason = self._set_object_pose_steady(
             self.target_object_name,
             float(target_pos[0]), float(target_pos[1]), float(target_pos[2]),
             quat=pose_quat,
-            retries=2,
             tol=1.0
         )
+        if ok:
+            return True
+
+        if self.target_asset_name is None:
+            self.target_asset_name = self.target_object_name
+        ok, last, err, recovery = self._recover_object_pose(
+            self.target_object_name,
+            float(target_pos[0]), float(target_pos[1]), float(target_pos[2]),
+            pose_quat,
+            self.spawn_target_object,
+            tol=1.0,
+        )
+        if ok:
+            safe_log(
+                f"⚠ Recovered target object {self.target_object_name} via {recovery} after {reason}",
+                scene_id=self.scene_id,
+            )
+            return True
+
         if not ok:
             if last is not None:
                 safe_log(
                     f"⚠ Target move mismatch: target=({float(target_pos[0]):.2f},{float(target_pos[1]):.2f},{float(target_pos[2]):.2f}) "
-                    f"actual=({last[0]:.2f},{last[1]:.2f},{last[2]:.2f}) err={err:.2f}m",
+                    f"actual=({last[0]:.2f},{last[1]:.2f},{last[2]:.2f}) err={err:.2f}m; "
+                    f"initial={reason}; recovery={recovery}",
                     scene_id=self.scene_id
                 )
             else:
                 safe_log(
                     f"⚠ Target move mismatch: target=({float(target_pos[0]):.2f},{float(target_pos[1]):.2f},{float(target_pos[2]):.2f}) "
-                    f"actual pose unavailable",
+                    f"actual pose unavailable; initial={reason}; recovery={recovery}",
                     scene_id=self.scene_id
                 )
+        return False
 
     def cleanup_old_frames(self, dataset_dir):
         dataset_path = Path(dataset_dir)
         rgb_dir = dataset_path / "rgb"
+        depth_dir = dataset_path / "depth"
         
         if rgb_dir.exists():
             for old_file in rgb_dir.glob("frame_*.png"):
@@ -1251,16 +1768,146 @@ class TrajectoryExecutor:
                     old_file.unlink()
                 except Exception:
                     pass
+        if depth_dir.exists():
+            for old_file in depth_dir.glob("frame_*.png"):
+                try:
+                    old_file.unlink()
+                except Exception:
+                    pass
+            meta_file = depth_dir / "depth_format.json"
+            if meta_file.exists():
+                try:
+                    meta_file.unlink()
+                except Exception:
+                    pass
+        for dirname in ("target_masks", "target_bbox_overlays"):
+            output_dir = dataset_path / dirname
+            if output_dir.exists():
+                for old_file in output_dir.glob("frame_*.png"):
+                    try:
+                        old_file.unlink()
+                    except Exception:
+                        pass
+        target_boxes_path = dataset_path / "target_boxes.json"
+        if target_boxes_path.exists():
+            try:
+                target_boxes_path.unlink()
+            except Exception:
+                pass
     
     def save_frame_data(self, frame_idx, rgb_img, depth_img, dataset_dir):
         dataset_path = Path(dataset_dir)
         
         rgb_dir = dataset_path / "rgb"
         rgb_dir.mkdir(parents=True, exist_ok=True)
+        depth_dir = dataset_path / "depth"
         
         if rgb_img is not None:
             rgb_path = rgb_dir / f"frame_{frame_idx:05d}.png"
             cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR))
+        if bool(getattr(self, "save_depth", True)) and depth_img is not None:
+            depth_dir.mkdir(parents=True, exist_ok=True)
+            depth = np.asarray(depth_img, dtype=np.float32)
+            depth = np.nan_to_num(depth, nan=0.0, posinf=DEPTH_MAX_M, neginf=0.0)
+            depth = np.clip(depth, 0.0, DEPTH_MAX_M)
+            depth_mm = np.rint(depth * DEPTH_SCALE_M).astype(np.uint16)
+            depth_path = depth_dir / f"frame_{frame_idx:05d}.png"
+            cv2.imwrite(str(depth_path), depth_mm)
+            meta_path = depth_dir / "depth_format.json"
+            if not meta_path.exists():
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "format": "uint16_png",
+                            "source": f"airsim.ImageType.{DEPTH_IMAGE_TYPE_NAME}",
+                            "image_type": DEPTH_IMAGE_TYPE_FALLBACK,
+                            "unit": "centimeter",
+                            "scale_m_to_uint16": DEPTH_SCALE_M,
+                            "max_depth_m": DEPTH_MAX_M,
+                            "decode": "depth_m = uint16 / 100.0",
+                        },
+                        f,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+        if bool(getattr(self, "save_target_segmentation", False)):
+            segmentation = getattr(self, "_last_target_segmentation", None)
+            color = getattr(self, "_target_segmentation_color", None)
+            if segmentation is None or color is None:
+                raise RuntimeError("Target Segmentation is enabled but no calibrated mask is available")
+            mask = np.all(
+                np.asarray(segmentation, dtype=np.uint8) == np.asarray(color, dtype=np.uint8)[None, None, :],
+                axis=2,
+            )
+            ys, xs = np.nonzero(mask)
+            bbox = None
+            if xs.size >= 8:
+                x1, y1 = int(xs.min()), int(ys.min())
+                x2, y2 = int(xs.max()) + 1, int(ys.max()) + 1
+                bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
+
+            while len(self._target_boxes) <= int(frame_idx):
+                self._target_boxes.append(None)
+                self._target_box_frames.append(None)
+            self._target_boxes[int(frame_idx)] = bbox
+            self._target_box_frames[int(frame_idx)] = {
+                "frame_idx": int(frame_idx),
+                "bbox_xywh": bbox,
+                "visible_pixels": int(xs.size),
+            }
+
+            if bool(getattr(self, "save_target_masks", False)):
+                mask_dir = dataset_path / "target_masks"
+                mask_dir.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(
+                    str(mask_dir / f"frame_{frame_idx:05d}.png"),
+                    np.uint8(mask) * 255,
+                )
+            if bool(getattr(self, "save_target_bbox_overlays", False)) and rgb_img is not None:
+                overlay_dir = dataset_path / "target_bbox_overlays"
+                overlay_dir.mkdir(parents=True, exist_ok=True)
+                overlay = cv2.cvtColor(np.asarray(rgb_img, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+                tint = overlay.copy()
+                tint[mask] = (0, 255, 255)
+                overlay = cv2.addWeighted(overlay, 0.72, tint, 0.28, 0.0)
+                if bbox is not None:
+                    bx, by, bw, bh = (int(round(value)) for value in bbox)
+                    cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+                    cv2.putText(
+                        overlay,
+                        f"target mask pixels={int(xs.size)}",
+                        (bx, max(by - 6, 18)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 255, 0),
+                        2,
+                    )
+                cv2.imwrite(
+                    str(overlay_dir / f"frame_{frame_idx:05d}.png"), overlay
+                )
+
+            payload = {
+                "format_version": 1,
+                "source": "airsim_instance_segmentation",
+                "capture_mode": (
+                    "external_camera_one_frame"
+                    if bool(getattr(self, "camera_only_capture", False))
+                    else "physical_uav"
+                ),
+                "target_object_name": str(self.target_object_name),
+                "target_asset_name": str(self.target_asset_name),
+                "segmentation_object_id": int(self.target_segmentation_id),
+                "segmentation_color_rgb": [int(value) for value in np.asarray(color).tolist()],
+                "boxes_xywh": self._target_boxes,
+                "frames": self._target_box_frames,
+            }
+            target_boxes_path = dataset_path / "target_boxes.json"
+            temporary = target_boxes_path.with_suffix(".json.tmp")
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(target_boxes_path)
     
     def _prepare_target_object(self):
         if self._target_asset_name_explicitly_set:
@@ -1554,10 +2201,11 @@ class TrajectoryExecutor:
                         target_x=t0[0], target_y=t0[1], target_z=t0[2],
                         quaternion=planned_start_quat
                     )
-                    try:
-                        self.client.simContinueForFrames(5)
-                    except:
-                        pass
+                    if not getattr(self, "disable_physics_pose_refresh", False):
+                        try:
+                            self.client.simContinueForFrames(5)
+                        except:
+                            pass
                     time.sleep(0.1)
             
             if pos_error > 1.0 and cur_pos is not None:
@@ -1585,10 +2233,11 @@ class TrajectoryExecutor:
                 vehicle_name=self.uav_vehicle_name
             )
             
-            try:
-                self.client.simContinueForFrames(1)
-            except:
-                pass
+            if not getattr(self, "disable_physics_pose_refresh", False):
+                try:
+                    self.client.simContinueForFrames(1)
+                except:
+                    pass
         except Exception as e:
             print(f"⚠ Initialization warning: {e}")
             import traceback
@@ -2196,7 +2845,7 @@ class TrajectoryExecutor:
                 except:
                     pass
     
-    def execute_trajectory(self, trajectory_file, dataset_base_dir="/mnt/Data20T/ysq/OurVLN/Dataset", save_dataset=True, skip_hover=False, trajectory_index=None, total_trajectories=None, max_retries=5, jump_threshold=1.5):
+    def execute_trajectory(self, trajectory_file, dataset_base_dir=DEFAULT_DATASET_BASE_DIR, save_dataset=True, skip_hover=False, trajectory_index=None, total_trajectories=None, max_retries=5, jump_threshold=1.5):
         if not os.path.exists(trajectory_file):
             print(f"Starting trajectory execution: {trajectory_file}")
             return
@@ -2212,6 +2861,7 @@ class TrajectoryExecutor:
             
             dataset_path = Path(dataset_base_dir) / self.scene_id / trajectory_name
             rgb_dir = dataset_path / "rgb"
+            depth_dir = dataset_path / "depth"
             uav_json_file = dataset_path / "uav_trajectory.json"
             
             num_steps = min(len(uav_traj), len(target_traj))
@@ -2227,9 +2877,57 @@ class TrajectoryExecutor:
                 if len(existing_frames) >= num_steps:
                     expected_frames = set(range(num_steps))
                     saved_frames = set(existing_frames)
+                    depth_complete = True
+                    if bool(getattr(self, "require_depth", True)):
+                        existing_depth_frames = []
+                        if depth_dir.exists():
+                            for frame_file in depth_dir.glob("frame_*.png"):
+                                try:
+                                    frame_num = int(frame_file.stem.split('_')[1])
+                                    existing_depth_frames.append(frame_num)
+                                except:
+                                    continue
+                        depth_complete = (
+                            expected_frames.issubset(set(existing_depth_frames))
+                            and _depth_format_matches(depth_dir)
+                        )
+                    target_boxes_complete = (
+                        not bool(getattr(self, "save_target_segmentation", False))
+                        or _target_boxes_complete(
+                            dataset_path,
+                            num_steps,
+                            expected_capture_mode=(
+                                "external_camera_one_frame"
+                                if bool(getattr(self, "camera_only_capture", False))
+                                else "physical_uav"
+                            ),
+                        )
+                    )
                     if expected_frames.issubset(saved_frames):
-                        safe_log(f"⏭ [{self.scene_id}] Skipping trajectory {trajectory_name}; dataset already complete", scene_id=self.scene_id)
-                        return
+                        if depth_complete and target_boxes_complete:
+                            safe_log(f"⏭ [{self.scene_id}] Skipping trajectory {trajectory_name}; dataset already complete", scene_id=self.scene_id)
+                            return
+                        incomplete = []
+                        if not depth_complete:
+                            incomplete.append("depth")
+                        if not target_boxes_complete:
+                            incomplete.append("target_boxes")
+                        safe_log(
+                            f"🔄 [{self.scene_id}] Recollecting trajectory {trajectory_name}; "
+                            f"missing/invalid: {','.join(incomplete)}",
+                            scene_id=self.scene_id,
+                        )
+                        try:
+                            self.cleanup_old_frames(str(dataset_path))
+                            for json_file in ['uav_trajectory.json', 'target_trajectory.json', 'jammer_trajectories.json', 'instruction.json']:
+                                json_path = dataset_path / json_file
+                                if json_path.exists():
+                                    try:
+                                        json_path.unlink()
+                                    except:
+                                        pass
+                        except Exception as e:
+                            safe_log(f"⚠ [{self.scene_id}] Dataset cleanup warning: {e}", scene_id=self.scene_id)
                     else:
                         safe_log(f"🔄 [{self.scene_id}] Resuming trajectory {trajectory_name} from existing frames ({len(existing_frames)}/{num_steps})", scene_id=self.scene_id)
                         try:
@@ -2371,6 +3069,7 @@ class TrajectoryExecutor:
         
         
         self._initialize_simulation(uav_traj, target_traj)
+        self._configure_target_segmentation()
         
         self._reset_collision_state()
         
@@ -3036,45 +3735,50 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
         return self.get_named_object_position(self.jammer_object_name)
 
     def move_named_object(self, object_name, asset_name, object_scale, target_pos):
-        try:
-            exists = _scene_object_exists_exact(self.client, object_name)
-            test_pose = self.client.simGetObjectPose(object_name)
-            if exists is False or test_pose is None:
-                if not self._spawn_named_object(object_name, asset_name, object_scale,
-                                                float(target_pos[0]), float(target_pos[1]), float(target_pos[2])):
-                    safe_log(f"⚠ failed to respawn {object_name}", scene_id=self.scene_id)
-            else:
-                test_pos = np.array([test_pose.position.x_val, test_pose.position.y_val, test_pose.position.z_val])
-                if np.any(np.isnan(test_pos)):
-                    if not self._spawn_named_object(object_name, asset_name, object_scale,
-                                                    float(target_pos[0]), float(target_pos[1]), float(target_pos[2])):
-                        safe_log(f"⚠ failed to respawn {object_name} from NaN pose", scene_id=self.scene_id)
-        except Exception as e:
-            try:
-                self._spawn_named_object(object_name, asset_name, object_scale,
-                                         float(target_pos[0]), float(target_pos[1]), float(target_pos[2]))
-            except Exception as spawn_error:
-                safe_log(f"⚠ failed to recover {object_name}: {e}; respawn error: {spawn_error}", scene_id=self.scene_id)
-
-        ok, last, err = self._set_named_object_pose_paused(
+        quat = airsim.to_quaternion(0, 0, 0)
+        ok, last, err, reason = self._set_object_pose_steady(
             object_name,
             float(target_pos[0]), float(target_pos[1]), float(target_pos[2]),
-            quat=airsim.to_quaternion(0, 0, 0),
-            retries=2,
+            quat=quat,
             tol=1.0,
         )
+        if ok:
+            return True
+
+        def respawn(x, y, z):
+            return self._spawn_named_object(
+                object_name, asset_name, object_scale, x, y, z
+            )
+
+        ok, last, err, recovery = self._recover_object_pose(
+            object_name,
+            float(target_pos[0]), float(target_pos[1]), float(target_pos[2]),
+            quat,
+            respawn,
+            tol=1.0,
+        )
+        if ok:
+            safe_log(
+                f"⚠ Recovered object {object_name} via {recovery} after {reason}",
+                scene_id=self.scene_id,
+            )
+            return True
+
         if not ok:
             if last is not None:
                 safe_log(
                     f"⚠ move object failed {object_name}: target=({float(target_pos[0]):.2f},{float(target_pos[1]):.2f},{float(target_pos[2]):.2f}) "
-                    f"current=({last[0]:.2f},{last[1]:.2f},{last[2]:.2f}) err={err:.2f}m",
+                    f"current=({last[0]:.2f},{last[1]:.2f},{last[2]:.2f}) err={err:.2f}m; "
+                    f"initial={reason}; recovery={recovery}",
                     scene_id=self.scene_id,
                 )
             else:
                 safe_log(
-                    f"⚠ move object failed {object_name}: target=({float(target_pos[0]):.2f},{float(target_pos[1]):.2f},{float(target_pos[2]):.2f})",
+                    f"⚠ move object failed {object_name}: target=({float(target_pos[0]):.2f},{float(target_pos[1]):.2f},{float(target_pos[2]):.2f}); "
+                    f"initial={reason}; recovery={recovery}",
                     scene_id=self.scene_id,
                 )
+        return False
 
     def move_jammer_object(self, jammer_pos):
         if not self.jammer_enabled or jammer_pos is None:
@@ -3150,6 +3854,41 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
         elif self.jammer_enabled and jammer_traj is not None and len(jammer_traj) > 0:
             j0 = jammer_traj[0]
             self.teleport_jammer_to_start(j0[0], j0[1], j0[2])
+
+    def initialize_scene_objects_only(self, target_traj, jammer_trajs_by_id=None):
+        """Initialize tracked scene objects without touching the physical multirotor."""
+        self.connect()
+        self._safe_sim_pause(True)
+
+        if target_traj is None or len(target_traj) == 0:
+            raise ValueError("target trajectory is empty")
+        t0 = target_traj[0]
+        if not self.teleport_object_to_start(t0[0], t0[1], t0[2]):
+            raise RuntimeError(
+                "target object initialization failed: "
+                f"target=({float(t0[0]):.2f}, {float(t0[1]):.2f}, {float(t0[2]):.2f})"
+            )
+
+        if self.jammer_enabled and jammer_trajs_by_id:
+            for did, traj in jammer_trajs_by_id.items():
+                if traj is None or len(traj) == 0:
+                    continue
+                did = str(did)
+                object_name = self._jammer_object_names_by_id.get(did, self.jammer_object_name)
+                asset_name = self._jammer_asset_names_by_id.get(did, self.jammer_asset_name)
+                j0 = traj[0]
+                if not self._teleport_named_object_to_start(
+                    object_name,
+                    asset_name,
+                    self.jammer_object_scale,
+                    j0[0], j0[1], j0[2],
+                ):
+                    raise RuntimeError(
+                        f"jammer {did} initialization failed: "
+                        f"target=({float(j0[0]):.2f}, {float(j0[1]):.2f}, {float(j0[2]):.2f})"
+                    )
+
+        self._safe_sim_pause(True)
 
     def _move_to_target_frame(self, u_target, t_target, i, num_steps, yaw_rate=None, jump_threshold=1.5, j_target=None, j_targets_by_id=None, planned_yaw=None):
         try:
@@ -3380,6 +4119,151 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
         }
         merged_trajectory_data.append(frame_data)
 
+    def _process_frame_camera_only(
+        self,
+        i,
+        u_target,
+        t_target,
+        trajectory_name,
+        num_steps,
+        save_dataset,
+        dataset_dir,
+        merged_trajectory_data,
+        pbar,
+        planned_yaw,
+        yaw_rate_to_apply,
+        target_traj,
+        target_trajectory_airsim=None,
+        j_target=None,
+        jammer_trajectory_airsim=None,
+        j_targets_by_id=None,
+        jammer_trajectories_airsim_by_id=None,
+    ):
+        uav_state = self._camera_only_state(
+            u_target,
+            t_target,
+            planned_yaw,
+            yaw_rate_to_apply,
+            i,
+        )
+        self.set_external_camera_pose_from_state(uav_state)
+        self.move_target_object(t_target)
+
+        if j_targets_by_id:
+            for did, jpos in j_targets_by_id.items():
+                did = str(did)
+                self.move_named_object(
+                    self._jammer_object_names_by_id.get(did, self.jammer_object_name),
+                    self._jammer_asset_names_by_id.get(did, self.jammer_asset_name),
+                    self.jammer_object_scale,
+                    jpos,
+                )
+        elif j_target is not None:
+            self.move_jammer_object(j_target)
+
+        # A newly spawned target needs one initial CustomDepth warmup tick. This is
+        # outside the steady-state capture cadence; every subsequent step uses one tick.
+        if i == 0:
+            self._set_target_segmentation_id(self.target_segmentation_id)
+            self._safe_continue_for_frames(1)
+
+        # Camera and all tracked objects become visible in the same rendered frame.
+        self._safe_continue_for_frames(1)
+
+        cur1_pos = np.asarray(u_target, dtype=np.float32)
+        pos2_now = np.asarray(t_target, dtype=np.float32)
+        jammer_positions_now_by_id = {
+            str(did): np.asarray(pos, dtype=np.float32)
+            for did, pos in (j_targets_by_id or {}).items()
+        }
+        jammer_pos_now = np.asarray(j_target, dtype=np.float32) if j_target is not None else None
+        if jammer_pos_now is None and jammer_positions_now_by_id:
+            primary_id = str(self._primary_jammer_id) if self._primary_jammer_id is not None else None
+            jammer_pos_now = jammer_positions_now_by_id.get(primary_id)
+            if jammer_pos_now is None:
+                jammer_pos_now = next(iter(jammer_positions_now_by_id.values()))
+
+        distance = float(np.linalg.norm(cur1_pos - pos2_now))
+        jammer_distance = (
+            float(np.linalg.norm(cur1_pos - jammer_pos_now))
+            if jammer_pos_now is not None
+            else None
+        )
+        postfix = (
+            f"i={i}/{num_steps-1} "
+            f"CAM=({cur1_pos[0]:.1f},{cur1_pos[1]:.1f},{-cur1_pos[2]:.1f}) "
+            f"T=({pos2_now[0]:.1f},{pos2_now[1]:.1f},{-pos2_now[2]:.1f}) "
+            f"dist={distance:.1f}m"
+        )
+        if jammer_pos_now is not None:
+            postfix += (
+                f" J=({jammer_pos_now[0]:.1f},{jammer_pos_now[1]:.1f},{-jammer_pos_now[2]:.1f})"
+                f" jdist={jammer_distance:.1f}m"
+            )
+        pbar.set_postfix_str(postfix, refresh=False)
+
+        if save_dataset:
+            rgb_img, depth_img = self.get_camera_images()
+            if i == 0 and bool(getattr(self, "save_target_segmentation", False)):
+                color = np.asarray(self._target_segmentation_color, dtype=np.uint8)
+                for _ in range(2):
+                    segmentation = getattr(self, "_last_target_segmentation", None)
+                    visible_pixels = 0
+                    if segmentation is not None:
+                        visible_pixels = int(
+                            np.all(
+                                np.asarray(segmentation, dtype=np.uint8) == color[None, None, :],
+                                axis=2,
+                            ).sum()
+                        )
+                    if visible_pixels >= 8:
+                        break
+                    self._safe_continue_for_frames(1)
+                    rgb_img, depth_img = self.get_camera_images()
+            response_position = getattr(self, "_last_camera_response_position", None)
+            if response_position is None:
+                raise RuntimeError("External camera response did not include a camera position")
+            camera_error = float(np.linalg.norm(np.asarray(response_position) - cur1_pos))
+            if not np.isfinite(camera_error) or camera_error > 0.25:
+                raise RuntimeError(
+                    "External camera pose mismatch: "
+                    f"requested={cur1_pos.tolist()}, actual={np.asarray(response_position).tolist()}, "
+                    f"error={camera_error:.3f}m"
+                )
+            self.save_frame_data(i, rgb_img, depth_img, dataset_dir)
+
+        if target_trajectory_airsim is not None:
+            target_trajectory_airsim.append({
+                "x": float(pos2_now[0]),
+                "y": float(pos2_now[1]),
+                "z": float(-pos2_now[2]),
+            })
+        if jammer_trajectory_airsim is not None and jammer_pos_now is not None:
+            jammer_trajectory_airsim.append({
+                "x": float(jammer_pos_now[0]),
+                "y": float(jammer_pos_now[1]),
+                "z": float(-jammer_pos_now[2]),
+            })
+        if jammer_trajectories_airsim_by_id is not None:
+            for did, pos in jammer_positions_now_by_id.items():
+                jammer_trajectories_airsim_by_id.setdefault(did, []).append({
+                    "x": float(pos[0]),
+                    "y": float(pos[1]),
+                    "z": float(-pos[2]),
+                })
+
+        next_target_pos_airsim = None
+        if i + 1 < len(target_traj):
+            next_target_pos_airsim = np.asarray(target_traj[i + 1][:3], dtype=np.float32)
+        self._append_trajectory_data(
+            i,
+            uav_state,
+            cur1_pos,
+            pos2_now,
+            merged_trajectory_data,
+            next_target_pos_airsim=next_target_pos_airsim,
+        )
+
     def _process_frame(self, i, uav_traj, target_traj, trajectory_name, num_steps,
                       save_dataset, dataset_dir, merged_trajectory_data, pbar,
                       target_trajectory_airsim=None, jammer_traj=None, jammer_trajectory_airsim=None,
@@ -3402,6 +4286,27 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             planned_yaw = planned_uav_yaws[i]
 
         yaw_rate_to_apply = None if planned_yaw is not None else self._expert_yaw_rate_for_step(uav_traj, target_traj, i)
+        if bool(getattr(self, "camera_only_capture", False)):
+            self._process_frame_camera_only(
+                i=i,
+                u_target=u_target,
+                t_target=t_target,
+                trajectory_name=trajectory_name,
+                num_steps=num_steps,
+                save_dataset=save_dataset,
+                dataset_dir=dataset_dir,
+                merged_trajectory_data=merged_trajectory_data,
+                pbar=pbar,
+                planned_yaw=planned_yaw,
+                yaw_rate_to_apply=yaw_rate_to_apply,
+                target_traj=target_traj,
+                target_trajectory_airsim=target_trajectory_airsim,
+                j_target=j_target,
+                jammer_trajectory_airsim=jammer_trajectory_airsim,
+                j_targets_by_id=j_targets_by_id,
+                jammer_trajectories_airsim_by_id=jammer_trajectories_airsim_by_id,
+            )
+            return
         jump_threshold = getattr(self, '_jump_threshold', 10.0)
         self._move_to_target_frame(
             u_target, t_target, i, num_steps,
@@ -3699,6 +4604,11 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             temp_uav_path = dataset_path / "uav_trajectory.json.tmp"
             payload = {
                 "num_frames": num_steps,
+                "capture_mode": (
+                    "external_camera_one_frame"
+                    if bool(getattr(self, "camera_only_capture", False))
+                    else "physical_uav"
+                ),
                 "target_asset_name": selected_uav_name,
                 "system_prompt": DEFAULT_SYSTEM_PROMPT,
                 "instruction": DEFAULT_EPISODE_INSTRUCTION,
@@ -3775,7 +4685,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
             safe_log(f"⚠ planner positions load failed: {e}", scene_id=self.scene_id)
         return num_frames, positions_airsim
 
-    def execute_trajectory(self, trajectory_file, dataset_base_dir="/mnt/Data20T/ysq/OurVLN/Dataset", save_dataset=True, skip_hover=False, trajectory_index=None, total_trajectories=None, max_retries=5, jump_threshold=1.5):
+    def execute_trajectory(self, trajectory_file, dataset_base_dir=DEFAULT_DATASET_BASE_DIR, save_dataset=True, skip_hover=False, trajectory_index=None, total_trajectories=None, max_retries=5, jump_threshold=1.5):
         if not os.path.exists(trajectory_file):
             print(f"Starting trajectory execution: {trajectory_file}")
             return
@@ -3793,6 +4703,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
 
             dataset_path = Path(dataset_base_dir) / self.scene_id / trajectory_name
             rgb_dir = dataset_path / "rgb"
+            depth_dir = dataset_path / "depth"
             uav_json_file = dataset_path / "uav_trajectory.json"
             target_json_file = dataset_path / "target_trajectory.json"
             jammer_multi_json_file = dataset_path / "jammer_trajectories.json"
@@ -3818,9 +4729,57 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
                 if len(existing_frames) >= num_steps:
                     expected_frames = set(range(num_steps))
                     saved_frames = set(existing_frames)
+                    depth_complete = True
+                    if bool(getattr(self, "require_depth", True)):
+                        existing_depth_frames = []
+                        if depth_dir.exists():
+                            for frame_file in depth_dir.glob("frame_*.png"):
+                                try:
+                                    frame_num = int(frame_file.stem.split('_')[1])
+                                    existing_depth_frames.append(frame_num)
+                                except Exception:
+                                    continue
+                        depth_complete = (
+                            expected_frames.issubset(set(existing_depth_frames))
+                            and _depth_format_matches(depth_dir)
+                        )
+                    target_boxes_complete = (
+                        not bool(getattr(self, "save_target_segmentation", False))
+                        or _target_boxes_complete(
+                            dataset_path,
+                            num_steps,
+                            expected_capture_mode=(
+                                "external_camera_one_frame"
+                                if bool(getattr(self, "camera_only_capture", False))
+                                else "physical_uav"
+                            ),
+                        )
+                    )
                     if expected_frames.issubset(saved_frames):
-                        safe_log(f"⏭ [{self.scene_id}] Skipping trajectory {trajectory_name}; dataset already complete", scene_id=self.scene_id)
-                        return
+                        if depth_complete and target_boxes_complete:
+                            safe_log(f"⏭ [{self.scene_id}] Skipping trajectory {trajectory_name}; dataset already complete", scene_id=self.scene_id)
+                            return
+                        incomplete = []
+                        if not depth_complete:
+                            incomplete.append("depth")
+                        if not target_boxes_complete:
+                            incomplete.append("target_boxes")
+                        safe_log(
+                            f"🔄 [{self.scene_id}] Recollecting trajectory {trajectory_name}; "
+                            f"missing/invalid: {','.join(incomplete)}",
+                            scene_id=self.scene_id,
+                        )
+                        try:
+                            self.cleanup_old_frames(str(dataset_path))
+                            for json_file in ['uav_trajectory.json', 'target_trajectory.json', 'jammer_trajectories.json', 'instruction.json']:
+                                json_path = dataset_path / json_file
+                                if json_path.exists():
+                                    try:
+                                        json_path.unlink()
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            safe_log(f"⚠ [{self.scene_id}] Dataset cleanup warning: {e}", scene_id=self.scene_id)
             elif rgb_dir.exists() and uav_json_file.exists() and (
                 (need_multi_jammer_json and (not jammer_multi_json_file.exists()))
             ):
@@ -3920,7 +4879,21 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
         )
 
         dataset_dir = self._prepare_dataset_directory(trajectory_name, dataset_base_dir, save_dataset)
-        self._initialize_simulation(uav_traj, target_traj, jammer_traj=jammer_traj, jammer_trajs_by_id=jammer_trajs_by_id)
+        if bool(getattr(self, "camera_only_capture", False)):
+            self.use_external_camera = True
+            self.initialize_scene_objects_only(
+                target_traj,
+                jammer_trajs_by_id=jammer_trajs_by_id,
+            )
+            self._park_physical_vehicle_for_camera_capture(uav_traj[0])
+        else:
+            self._initialize_simulation(
+                uav_traj,
+                target_traj,
+                jammer_traj=jammer_traj,
+                jammer_trajs_by_id=jammer_trajs_by_id,
+            )
+        self._configure_target_segmentation()
         self._reset_collision_state()
 
         jammer_lengths = []
@@ -3935,6 +4908,7 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
         jammer_trajectories_airsim_by_id = {str(k): [] for k in jammer_trajs_by_id.keys()} if jammer_trajs_by_id else None
         planned_uav_yaws = getattr(self, "_planned_uav_yaws_airsim", None)
         self._prev_frame_data = None
+        self._camera_only_orientation = None
 
         try:
             if not self.client.isApiControlEnabled(vehicle_name=self.uav_vehicle_name):
@@ -4023,11 +4997,12 @@ class TrajectoryExecutor(BaseTrajectoryExecutor):
         try:
             if num_steps > 0:
                 self._last_uav_position = np.array([uav_traj[num_steps - 1][0], uav_traj[num_steps - 1][1], uav_traj[num_steps - 1][2]])
-                try:
-                    uav_state = self.get_uav_state()
-                    self._last_uav_position = uav_state['position']
-                except Exception:
-                    pass
+                if not bool(getattr(self, "camera_only_capture", False)):
+                    try:
+                        uav_state = self.get_uav_state()
+                        self._last_uav_position = uav_state['position']
+                    except Exception:
+                        pass
         except Exception:
             pass
 

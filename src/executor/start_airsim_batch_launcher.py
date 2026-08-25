@@ -4,13 +4,13 @@
 直接基于 TrajectoryExecutor 批量执行 AirSim 轨迹，不再依赖 batch_generate_dataset.py。
 
 默认行为：
-1. 直接导入执行器脚本（默认 /mnt/data/airsim_trajectory_executor.py）
+1. 直接导入本项目的轨迹执行器脚本
 2. 按 scene -> gpu 轮询分配
 3. 每个 GPU 一个 worker，顺序处理其分配到的 scene
 4. 每个 scene 下批量执行所有轨迹文件
 
 可直接运行：
-    python /mnt/data/start_airsim_batch_launcher.py
+    python code/src/executor/start_airsim_batch_launcher.py
 """
 
 import os
@@ -28,11 +28,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-DEFAULT_EXECUTOR_SCRIPT = "/data1/ysq/Worldmodel/code/src/executor/trajectory_executor.py"
-DEFAULT_TRAJECTORY_DIR = "/data1/ysq/Worldmodel/Plandataset"
-DEFAULT_DATASET_BASE_DIR = "/data1/ysq/Worldmodel/Dataset"
-DEFAULT_SCENES = [f"City_{i}" for i in range(1, 31)]
-DEFAULT_GPUS = [1]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_EXECUTOR_SCRIPT = str(PROJECT_ROOT / "code/src/executor/trajectory_executor.py")
+DEFAULT_TRAJECTORY_DIR = str(PROJECT_ROOT / "Plandataset")
+DEFAULT_DATASET_BASE_DIR = str(PROJECT_ROOT / "Dataset")
+DEFAULT_SCENES = [f"City_{i}" for i in range(4, 31)]
+DEFAULT_GPUS = [0]
 DEFAULT_SIM_SERVER_HOST = "127.0.0.1"
 DEFAULT_SIM_SERVER_PORT = 30000
 DEFAULT_SCENE_INDEX = 1
@@ -44,6 +45,12 @@ DEFAULT_TARGET_SCALE = (1.0, 1.0, 1.0)
 DEFAULT_TRAJECTORY_PATTERN = "trajectory_*_uav.json"
 DEFAULT_MULTI_WORKER = True
 DEFAULT_SAVE_DATASET = True
+DEFAULT_SAVE_DEPTH = False
+DEFAULT_REQUIRE_DEPTH = False
+DEFAULT_SAVE_TARGET_SEGMENTATION = True
+DEFAULT_SAVE_TARGET_MASKS = False
+DEFAULT_SAVE_TARGET_BBOX_OVERLAYS = False
+DEFAULT_CAMERA_ONLY_CAPTURE = True
 DEFAULT_SKIP_HOVER = True
 DEFAULT_RANDOM_TARGET_ASSET = True
 DEFAULT_MAX_RETRIES = 5
@@ -60,6 +67,8 @@ DEFAULT_DELETE_STEP_THRESHOLD = 1.5
 DEFAULT_CHECK_HEAD = 0
 DEFAULT_REPAIR_UNTIL_CLEAN = True
 DEFAULT_MAX_REPAIR_ROUNDS = 5
+EXPECTED_DEPTH_SCALE_M = 100.0
+EXPECTED_DEPTH_MAX_M = 655.35
 DEFAULT_EPISODE_INSTRUCTION = (
     "The target is the black UAV initially located near the image center. "
     "Keep tracking the same UAV throughout the episode."
@@ -95,6 +104,12 @@ def parse_args():
         type=str,
         default=DEFAULT_TRAJECTORY_PATTERN,
         help="轨迹文件匹配模式，通常是 trajectory_*_uav.json",
+    )
+    parser.add_argument(
+        "--max-trajectories-per-scene",
+        type=int,
+        default=0,
+        help="每个 scene 最多执行多少条轨迹；0 表示不限制",
     )
     parser.add_argument(
         "--dataset-base-dir",
@@ -213,7 +228,84 @@ def parse_args():
         action="store_false",
         help="不保存数据集",
     )
-
+    parser.add_argument(
+        "--save-depth",
+        dest="save_depth",
+        action="store_true",
+        default=DEFAULT_SAVE_DEPTH,
+        help="保存 AirSim DepthPerspective 深度图到每条轨迹的 depth/frame_*.png",
+    )
+    parser.add_argument(
+        "--no-save-depth",
+        dest="save_depth",
+        action="store_false",
+        help="不保存深度图",
+    )
+    parser.add_argument(
+        "--require-depth",
+        dest="require_depth",
+        action="store_true",
+        default=DEFAULT_REQUIRE_DEPTH,
+        help="异常检查和跳过逻辑要求 depth 帧完整；缺失则重采",
+    )
+    parser.add_argument(
+        "--no-require-depth",
+        dest="require_depth",
+        action="store_false",
+        help="异常检查不要求 depth 帧完整",
+    )
+    parser.add_argument(
+        "--save-target-segmentation",
+        dest="save_target_segmentation",
+        action="store_true",
+        default=DEFAULT_SAVE_TARGET_SEGMENTATION,
+        help="请求 AirSim 目标实例分割并保存真实可见 2D bbox JSON",
+    )
+    parser.add_argument(
+        "--no-save-target-segmentation",
+        dest="save_target_segmentation",
+        action="store_false",
+        help="不请求 AirSim Segmentation 图像",
+    )
+    parser.add_argument(
+        "--save-target-masks",
+        dest="save_target_masks",
+        action="store_true",
+        default=DEFAULT_SAVE_TARGET_MASKS,
+        help="额外保存每帧目标实例 mask；默认仅在内存中用于计算 bbox",
+    )
+    parser.add_argument(
+        "--no-save-target-masks",
+        dest="save_target_masks",
+        action="store_false",
+        help="不保存目标实例 mask",
+    )
+    parser.add_argument(
+        "--save-target-bbox-overlays",
+        dest="save_target_bbox_overlays",
+        action="store_true",
+        default=DEFAULT_SAVE_TARGET_BBOX_OVERLAYS,
+        help="额外保存带目标 mask 和 bbox 的 RGB 检查图",
+    )
+    parser.add_argument(
+        "--no-save-target-bbox-overlays",
+        dest="save_target_bbox_overlays",
+        action="store_false",
+        help="不保存目标 bbox 检查图",
+    )
+    parser.add_argument(
+        "--camera-only-capture",
+        dest="camera_only_capture",
+        action="store_true",
+        default=DEFAULT_CAMERA_ONLY_CAPTURE,
+        help="使用外部相机复现 Planner UAV 位姿，每步只集中推进一个渲染帧",
+    )
+    parser.add_argument(
+        "--physical-uav-capture",
+        dest="camera_only_capture",
+        action="store_false",
+        help="使用物理 UAV 设置和验证位姿的旧采集流程",
+    )
     parser.add_argument(
         "--skip-hover",
         dest="skip_hover",
@@ -520,6 +612,73 @@ def _check_rgb_sequence(rgb_files: List[Path], scene: str, traj: str, issues: Li
         )
 
 
+def _check_indexed_frame_sequence(
+    files: List[Path],
+    scene: str,
+    traj: str,
+    label: str,
+    issues: List[TrajectoryIssue],
+) -> None:
+    if not files:
+        issues.append(TrajectoryIssue(scene, traj, "error", f"missing_{label}", f"{label} directory has no frame_*.png files"))
+        return
+    idxs = sorted(i for i in (_parse_frame_index(p.name) for p in files) if i is not None)
+    if not idxs:
+        issues.append(TrajectoryIssue(scene, traj, "error", f"invalid_{label}_names", f"no valid frame index found in {label} filenames"))
+        return
+    gaps = []
+    for a, b in zip(idxs[:-1], idxs[1:]):
+        if b != a + 1:
+            gaps.append((a, b))
+            if len(gaps) >= 5:
+                break
+    if gaps:
+        issues.append(
+            TrajectoryIssue(
+                scene,
+                traj,
+                "warning",
+                f"{label}_index_gap",
+                f"{label} frame indices are non-contiguous, first gaps: {gaps}",
+            )
+        )
+
+
+def _check_depth_format(depth_dir: Path, scene: str, traj: str, issues: List[TrajectoryIssue], stats: Dict[str, Any]) -> None:
+    meta_path = depth_dir / "depth_format.json"
+    if not meta_path.exists():
+        issues.append(TrajectoryIssue(scene, traj, "error", "missing_depth_format", str(meta_path)))
+        return
+    try:
+        meta = _load_json(meta_path)
+    except Exception as exc:
+        issues.append(TrajectoryIssue(scene, traj, "error", "depth_format_parse_error", str(exc)))
+        return
+    scale = meta.get("scale_m_to_uint16")
+    max_depth = meta.get("max_depth_m")
+    stats["depth_scale_m_to_uint16"] = scale
+    stats["depth_max_depth_m"] = max_depth
+    try:
+        scale_ok = float(scale) == float(EXPECTED_DEPTH_SCALE_M)
+        max_ok = abs(float(max_depth) - float(EXPECTED_DEPTH_MAX_M)) < 1e-6
+    except Exception:
+        scale_ok = False
+        max_ok = False
+    if not (scale_ok and max_ok):
+        issues.append(
+            TrajectoryIssue(
+                scene,
+                traj,
+                "error",
+                "depth_format_mismatch",
+                (
+                    f"expected scale_m_to_uint16={EXPECTED_DEPTH_SCALE_M}, max_depth_m={EXPECTED_DEPTH_MAX_M}; "
+                    f"got scale_m_to_uint16={scale}, max_depth_m={max_depth}"
+                ),
+            )
+        )
+
+
 def _check_uav_step_distance(
     frames: List[Any],
     scene: str,
@@ -584,6 +743,7 @@ def check_collected_trajectory(
     scene: str,
     delete_bad_trajectories: bool,
     delete_step_threshold: float,
+    require_depth: bool,
 ) -> Tuple[List[TrajectoryIssue], Dict[str, Any]]:
     traj = trajectory_dir.name
     issues: List[TrajectoryIssue] = []
@@ -591,6 +751,7 @@ def check_collected_trajectory(
 
     uav_json = trajectory_dir / "uav_trajectory.json"
     rgb_dir = trajectory_dir / "rgb"
+    depth_dir = trajectory_dir / "depth"
     target_json = trajectory_dir / "target_trajectory.json"
     jammer_json = trajectory_dir / "jammer_trajectories.json"
 
@@ -599,6 +760,8 @@ def check_collected_trajectory(
         return issues, stats
     if not rgb_dir.exists():
         issues.append(TrajectoryIssue(scene, traj, "error", "missing_rgb_dir", str(rgb_dir)))
+    if require_depth and not depth_dir.exists():
+        issues.append(TrajectoryIssue(scene, traj, "error", "missing_depth_dir", str(depth_dir)))
 
     try:
         uav = _load_json(uav_json)
@@ -641,6 +804,14 @@ def check_collected_trajectory(
     _check_rgb_sequence(rgb_files, scene, traj, issues)
     if rgb_files and len(rgb_files) != len(frames):
         issues.append(TrajectoryIssue(scene, traj, "warning", "frame_count_mismatch", f"uav_frames={len(frames)} rgb_frames={len(rgb_files)}"))
+    if require_depth:
+        depth_files = sorted(depth_dir.glob("frame_*.png")) if depth_dir.exists() else []
+        stats["depth_frames"] = len(depth_files)
+        _check_indexed_frame_sequence(depth_files, scene, traj, "depth", issues)
+        if depth_files and len(depth_files) != len(frames):
+            issues.append(TrajectoryIssue(scene, traj, "warning", "depth_frame_count_mismatch", f"uav_frames={len(frames)} depth_frames={len(depth_files)}"))
+        if depth_dir.exists():
+            _check_depth_format(depth_dir, scene, traj, issues, stats)
 
     if target_json.exists():
         try:
@@ -731,6 +902,7 @@ def run_dataset_anomaly_check(args, scenes: Sequence[str]) -> Dict[str, Any]:
                 scene,
                 delete_bad_trajectories=bool(args.delete_bad_trajectories),
                 delete_step_threshold=float(args.delete_step_threshold),
+                require_depth=bool(args.require_depth),
             )
             all_issues.extend(issues)
             all_stats.append(stats)
@@ -881,12 +1053,21 @@ def build_executor(module, args, scene_id, gpu_id):
         jammer_object_scale=tuple(args.jammer_scale),
     )
     executor._recover_abnormal_jump = bool(args.recover_abnormal_jump)
+    executor.save_depth = bool(args.save_depth)
+    executor.require_depth = bool(args.require_depth)
+    executor.save_target_segmentation = bool(args.save_target_segmentation)
+    executor.save_target_masks = bool(args.save_target_masks)
+    executor.save_target_bbox_overlays = bool(args.save_target_bbox_overlays)
+    executor.camera_only_capture = bool(args.camera_only_capture)
+    executor.use_external_camera = bool(args.camera_only_capture)
     return executor
 
 
 def run_scene_batch(args, scene_id, gpu_id, progress_position=0):
     trajectory_root = Path(args.trajectory_dir)
     files = discover_trajectory_files(trajectory_root, scene_id, args.trajectory_pattern)
+    if int(args.max_trajectories_per_scene) > 0:
+        files = files[: int(args.max_trajectories_per_scene)]
 
     if not files:
         print(f"[WARN] scene={scene_id} 未找到轨迹文件: root={trajectory_root}, pattern={args.trajectory_pattern}")
@@ -917,6 +1098,7 @@ def run_scene_batch(args, scene_id, gpu_id, progress_position=0):
 
     executor = build_executor(module, args, scene_id, gpu_id)
     executor._progress_position = progress_position
+    target_segmentation_error = getattr(module, "TargetSegmentationError", None)
 
     try:
         total = len(files)
@@ -935,6 +1117,16 @@ def run_scene_batch(args, scene_id, gpu_id, progress_position=0):
                 )
             except Exception as exc:
                 print(f"[TRAJECTORY-ERROR] scene={scene_id} gpu={gpu_id} [{idx}/{total}] {trajectory_file}: {exc}")
+                if target_segmentation_error is not None and isinstance(exc, target_segmentation_error):
+                    print(
+                        f"[SEGMENTATION-SKIP] scene={scene_id} gpu={gpu_id} "
+                        f"keeping current AirSim scene; trajectory will be retried in the repair round"
+                    )
+                    try:
+                        executor._safe_sim_pause(True)
+                    except Exception:
+                        pass
+                    continue
                 try:
                     cleanup_executor_connections(executor)
                 except Exception:
@@ -962,7 +1154,10 @@ def count_expected_trajectories(args, scenes: Sequence[str]) -> int:
     trajectory_root = Path(args.trajectory_dir)
     total = 0
     for scene in scenes:
-        total += len(discover_trajectory_files(trajectory_root, scene, args.trajectory_pattern))
+        count = len(discover_trajectory_files(trajectory_root, scene, args.trajectory_pattern))
+        if int(args.max_trajectories_per_scene) > 0:
+            count = min(count, int(args.max_trajectories_per_scene))
+        total += count
     return total
 
 
@@ -988,6 +1183,7 @@ def print_config(args, gpu_assignment):
     print(f"executor script  : {args.executor_script}")
     print(f"trajectory dir   : {args.trajectory_dir}")
     print(f"trajectory patt. : {args.trajectory_pattern}")
+    print(f"trajectory limit : {args.max_trajectories_per_scene or 'ALL'} per scene")
     print(f"dataset base dir : {args.dataset_base_dir}")
     print(f"scene ids        : {args.scene_id}")
     print(f"gpu ids          : {normalize_gpu_ids(args.gpu_id)}")
@@ -1005,6 +1201,12 @@ def print_config(args, gpu_assignment):
     print(f"camera name      : {args.camera_name}")
     print(f"multi worker     : {args.multi_worker}")
     print(f"save dataset     : {args.save_dataset}")
+    print(f"save depth       : {args.save_depth}")
+    print(f"require depth    : {args.require_depth}")
+    print(f"target seg/bbox  : {args.save_target_segmentation}")
+    print(f"save target mask : {args.save_target_masks}")
+    print(f"save bbox overlay: {args.save_target_bbox_overlays}")
+    print(f"camera-only mode : {args.camera_only_capture}")
     print(f"skip hover       : {args.skip_hover}")
     print(f"max retries      : {args.max_retries}")
     print(f"jump threshold   : {args.jump_threshold}")

@@ -1,7 +1,7 @@
 {
   "SettingsVersion": 1.2,
   "SimMode": "Multirotor",
-  "ClockSpeed": 10,
+  "ClockSpeed": 10.0,
   "ViewMode": "NoDisplay",
   "Vehicles": {
     "Drone_1": {
@@ -18,6 +18,12 @@
       },
       {
         "ImageType": 2,
+        "Width": 640,
+        "Height": 640,
+        "FOV_Degrees": 90
+      },
+      {
+        "ImageType": 5,
         "Width": 640,
         "Height": 640,
         "FOV_Degrees": 90
@@ -41,6 +47,12 @@
         },
         {
           "ImageType": 2,
+          "Width": 640,
+          "Height": 640,
+          "FOV_Degrees": 90
+        },
+        {
+          "ImageType": 5,
           "Width": 640,
           "Height": 640,
           "FOV_Degrees": 90

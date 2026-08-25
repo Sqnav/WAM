@@ -10,9 +10,11 @@ import threading
 import argparse
 import json
 import re
+import shlex
 from pathlib import Path
 
 CWD_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CWD_DIR.parents[2]
 
 
 def pid_exists(pid):
@@ -128,20 +130,70 @@ def KillPorts(ports) -> None:
         thread.join()
 
 
-_global_root_path = "/mnt/Data20T/ysq/OurVLN"
+_global_root_path = str(PROJECT_ROOT)
 _global_port = 30000
 _global_gpu_ids = [0]
+_global_graphics_adapter_map = {}
+_active_event_handler = None
+
+
+def _normalize_pci_bus_id(bus_id: str) -> str:
+    text = str(bus_id).strip().lower()
+    if text.startswith("00000000:"):
+        text = "0000:" + text.split(":", 1)[1]
+    return text
+
+
+def _query_nvidia_gpu_bus_id(gpu_id):
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,pci.bus_id",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    target = str(int(gpu_id))
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2 and parts[0] == target:
+            return _normalize_pci_bus_id(parts[1])
+    return None
+
+
+def _parse_graphics_adapter_map(value):
+    mapping = {}
+    text = str(value or "").strip()
+    if not text:
+        return mapping
+    for item in re.split(r"[,;\s]+", text):
+        if not item:
+            continue
+        if ":" not in item and "=" not in item:
+            continue
+        left, right = re.split(r"[:=]", item, maxsplit=1)
+        try:
+            mapping[int(left.strip())] = int(right.strip())
+        except Exception:
+            continue
+    return mapping
 
 
 def create_drones(port: int) -> dict:
+    clock_speed = float(os.environ.get("AIRSIM_CLOCK_SPEED", "10"))
     capture_settings = [
         {"ImageType": 0, "Width": 640, "Height": 640, "FOV_Degrees": 90},
         {"ImageType": 2, "Width": 640, "Height": 640, "FOV_Degrees": 90},
+        {"ImageType": 5, "Width": 640, "Height": 640, "FOV_Degrees": 90},
     ]
     return {
         "SettingsVersion": 1.2,
         "SimMode": "Multirotor",
-        "ClockSpeed": 10,
+        "ClockSpeed": clock_speed,
         "ViewMode": "NoDisplay",
         "Vehicles": {
             "Drone_1": {"VehicleType": "SimpleFlight"}
@@ -179,9 +231,9 @@ def _get_env_exec_path_dict(root_path: str) -> dict:
                 candidate_roots.append(sibling_ourvln)
     except Exception:
         pass
-    legacy_root = Path("/mnt/Data20T/ysq/OurVLN")
-    if legacy_root not in candidate_roots:
-        candidate_roots.append(legacy_root)
+    sibling_ourvln = PROJECT_ROOT.parent / "OurVLN"
+    if sibling_ourvln not in candidate_roots:
+        candidate_roots.append(sibling_ourvln)
 
     result = {}
     for candidate_root in candidate_roots:
@@ -245,7 +297,7 @@ class EventHandler(object):
 
     def _kill_untracked_scene_processes_for_gpus_locked(self, gpu_ids) -> None:
         target_adapters = {
-            str(int(gpu_id))
+            str(int(_global_graphics_adapter_map.get(int(gpu_id), int(gpu_id))))
             for gpu_id in gpu_ids
         }
         if not target_adapters:
@@ -323,7 +375,7 @@ class EventHandler(object):
                     match = re.search(r'(\d+)', str(scen_id))
                     if match:
                         scene_number = int(match.group(1))
-                        port = 30000 + scene_number
+                        port = int(_global_port) + scene_number
                     else:
                         raise ValueError("Failed to extract numeric id from scene_id")
                 except Exception:
@@ -426,14 +478,27 @@ class EventHandler(object):
                 except Exception as e:
                     raise Exception(f"Scene script not executable: {env_path}; failed to chmod +x: {e}")
 
-            graphics_adapter_id = int(gpu_id)
+            nvidia_gpu_id = int(gpu_id)
+            graphics_adapter_id = int(_global_graphics_adapter_map.get(nvidia_gpu_id, nvidia_gpu_id))
+            vk_device_bus_id = _query_nvidia_gpu_bus_id(nvidia_gpu_id)
+            vk_device_select_prefix = (
+                f"export MESA_VK_DEVICE_SELECT={vk_device_bus_id} && "
+                if vk_device_bus_id
+                else ""
+            )
             settings_path = str(settings_dir / 'settings.json')
+            unreal_extra_args = " ".join(
+                shlex.quote(item)
+                for item in shlex.split(os.environ.get("UNREAL_EXTRA_ARGS", ""))
+            )
+            if unreal_extra_args:
+                unreal_extra_args = f" {unreal_extra_args}"
             import getpass
             current_user = getpass.getuser()
             if current_user == 'root':
-                subprocess_execute = f'runuser -l ysq -c "export CUDA_VISIBLE_DEVICES={gpu_id} && bash {env_path} -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter={graphics_adapter_id} -settings=\'{settings_path}\'"'
+                subprocess_execute = f'runuser -l ysq -c "export CUDA_VISIBLE_DEVICES={nvidia_gpu_id} && {vk_device_select_prefix}bash {env_path} -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter={graphics_adapter_id}{unreal_extra_args} -settings=\'{settings_path}\'"'
             else:
-                subprocess_execute = f'CUDA_VISIBLE_DEVICES={gpu_id} bash {env_path} -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter={graphics_adapter_id} -settings=\'{settings_path}\''
+                subprocess_execute = f'CUDA_VISIBLE_DEVICES={nvidia_gpu_id} {vk_device_select_prefix}bash {env_path} -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter={graphics_adapter_id}{unreal_extra_args} -settings=\'{settings_path}\''
 
             time.sleep(1)
             print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tScene {scen_id} start cmd: {subprocess_execute}")
@@ -464,7 +529,7 @@ class EventHandler(object):
                     self.scene_processes[scen_id] = {'process': p, 'port': ports[index], 'gpu_id': gpu_id}
                     if ports[index] not in self.scene_used_ports:
                         self.scene_used_ports.append(ports[index])
-                print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tScene {scen_id} starting, GPU {gpu_id}, GraphicsAdapter {graphics_adapter_id}, log: {log_file_path}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\tScene {scen_id} starting, GPU {nvidia_gpu_id}, GraphicsAdapter {graphics_adapter_id}, MESA_VK_DEVICE_SELECT={vk_device_bus_id}, log: {log_file_path}")
             except Exception as e:
                 raise Exception(f"Failed to start scene: {e}")
 
@@ -545,15 +610,19 @@ def serve_background(server, daemon=False):
     return t
 
 
-def serve(root_path, port, gpu_ids, daemon=False):
-    global _global_root_path, _global_port, _global_gpu_ids
+def serve(root_path, port, gpu_ids, graphics_adapter_map=None, daemon=False):
+    global _global_root_path, _global_port, _global_gpu_ids, _global_graphics_adapter_map
+    global _active_event_handler
     _global_root_path = root_path
     _global_port = port
     _global_gpu_ids = gpu_ids
+    _global_graphics_adapter_map = dict(graphics_adapter_map or {})
 
     try:
         import msgpackrpc
-        server = msgpackrpc.Server(EventHandler())
+        handler = EventHandler()
+        _active_event_handler = handler
+        server = msgpackrpc.Server(handler)
         addr = msgpackrpc.Address('127.0.0.1', port)
         server.listen(addr)
         thread = serve_background(server, daemon)
@@ -566,9 +635,21 @@ def serve(root_path, port, gpu_ids, daemon=False):
         raise
 
 
+def _cleanup_active_scenes(reason: str) -> None:
+    handler = _active_event_handler
+    if handler is None:
+        return
+    try:
+        print(f"Cleaning up managed AirSim scenes: reason={reason}", flush=True)
+        handler.close_scenes("127.0.0.1")
+    except Exception as exc:
+        print(f"Failed to clean up managed AirSim scenes: {exc}", flush=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpus', type=str, default='1')
+    parser.add_argument('--graphics-adapter-map', type=str, default=os.environ.get('UNREAL_GRAPHICS_ADAPTER_MAP', ''))
     parser.add_argument('--port', type=int, default=30000, help='server port')
     # /code/src/envs -> project root should be ../../../
     default_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
@@ -578,10 +659,19 @@ if __name__ == '__main__':
     gpu_list = [int(g.strip()) for g in str(args.gpus).split(',') if g.strip()]
     if not gpu_list:
         gpu_list = [0]
+    graphics_adapter_map = _parse_graphics_adapter_map(args.graphics_adapter_map)
+
+    def _handle_shutdown(signum, _frame):
+        _cleanup_active_scenes(signal.Signals(signum).name)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
 
     try:
-        addr, server, thread = serve(args.root_path, args.port, gpu_list)
+        addr, server, thread = serve(args.root_path, args.port, gpu_list, graphics_adapter_map=graphics_adapter_map)
         print(f"start listening {addr._host}:{addr._port}")
+        print(f"gpus={gpu_list} graphics_adapter_map={graphics_adapter_map}")
         time.sleep(0.1)
         try:
             thread.join()
@@ -590,3 +680,5 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Startup failed: {e}")
         sys.exit(1)
+    finally:
+        _cleanup_active_scenes("server_exit")

@@ -1,7 +1,7 @@
 {
   "SettingsVersion": 1.2,
   "SimMode": "Multirotor",
-  "ClockSpeed": 10,
+  "ClockSpeed": 10.0,
   "ViewMode": "NoDisplay",
   "Vehicles": {
     "Drone_1": {
@@ -21,8 +21,44 @@
         "Width": 640,
         "Height": 640,
         "FOV_Degrees": 90
+      },
+      {
+        "ImageType": 5,
+        "Width": 640,
+        "Height": 640,
+        "FOV_Degrees": 90
       }
     ]
+  },
+  "ExternalCameras": {
+    "0": {
+      "X": 0,
+      "Y": 0,
+      "Z": -10,
+      "Pitch": 0,
+      "Roll": 0,
+      "Yaw": 0,
+      "CaptureSettings": [
+        {
+          "ImageType": 0,
+          "Width": 640,
+          "Height": 640,
+          "FOV_Degrees": 90
+        },
+        {
+          "ImageType": 2,
+          "Width": 640,
+          "Height": 640,
+          "FOV_Degrees": 90
+        },
+        {
+          "ImageType": 5,
+          "Width": 640,
+          "Height": 640,
+          "FOV_Degrees": 90
+        }
+      ]
+    }
   },
   "ApiServerPort": 30002
 }

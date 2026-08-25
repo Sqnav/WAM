@@ -2,12 +2,79 @@ from __future__ import annotations
 
 import os
 import sys
+import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from .config import ModelConfig
+from .config import ModelConfig, PROJECT_ROOT
+
+
+def crop_reference_by_heatmap(
+    images: torch.Tensor,
+    heatmap: torch.Tensor,
+    context_scale: float = 3.0,
+    min_side_fraction: float = 0.20,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Crop and enlarge a masked reference while preserving its heatmap grid."""
+    if images.ndim != 4 or images.size(1) != 3:
+        raise ValueError("reference images must have shape [B,3,H,W].")
+    hm = heatmap
+    if hm.ndim == 4 and hm.size(1) == 1:
+        hm = hm[:, 0]
+    if hm.ndim == 2:
+        side = int(round(math.sqrt(int(hm.size(-1)))))
+        if side * side != int(hm.size(-1)):
+            raise ValueError(f"cannot infer heatmap grid from shape {tuple(hm.shape)}")
+        hm = hm.reshape(hm.size(0), side, side)
+    if hm.ndim != 3 or hm.size(0) != images.size(0):
+        raise ValueError("reference heatmap must have shape [B,Hg,Wg], [B,1,Hg,Wg], or [B,N].")
+
+    _, _, image_h, image_w = images.shape
+    _, grid_h, grid_w = hm.shape
+    context_scale = max(float(context_scale), 1.0)
+    min_side_fraction = min(max(float(min_side_fraction), 0.05), 1.0)
+    crops = []
+    crop_heatmaps = []
+    for idx in range(int(images.size(0))):
+        score = hm[idx].detach().float()
+        max_score = float(score.max().item()) if score.numel() else 0.0
+        support = score >= max(max_score * 0.10, 1.0e-8)
+        points = support.nonzero(as_tuple=False)
+        if points.numel() == 0:
+            y0, y1, x0, x1 = 0, grid_h, 0, grid_w
+        else:
+            y_min = int(points[:, 0].min().item())
+            y_max = int(points[:, 0].max().item()) + 1
+            x_min = int(points[:, 1].min().item())
+            x_max = int(points[:, 1].max().item()) + 1
+            center_y = 0.5 * float(y_min + y_max)
+            center_x = 0.5 * float(x_min + x_max)
+            min_side = max(int(math.ceil(min(grid_h, grid_w) * min_side_fraction)), 2)
+            side = max(int(math.ceil(max(y_max - y_min, x_max - x_min) * context_scale)), min_side)
+            side = min(side, grid_h, grid_w)
+            y0 = int(round(center_y - side * 0.5))
+            x0 = int(round(center_x - side * 0.5))
+            y0 = min(max(y0, 0), max(grid_h - side, 0))
+            x0 = min(max(x0, 0), max(grid_w - side, 0))
+            y1, x1 = y0 + side, x0 + side
+
+        iy0 = int(math.floor(float(y0) / max(grid_h, 1) * image_h))
+        iy1 = int(math.ceil(float(y1) / max(grid_h, 1) * image_h))
+        ix0 = int(math.floor(float(x0) / max(grid_w, 1) * image_w))
+        ix1 = int(math.ceil(float(x1) / max(grid_w, 1) * image_w))
+        iy0, ix0 = max(iy0, 0), max(ix0, 0)
+        iy1, ix1 = min(max(iy1, iy0 + 1), image_h), min(max(ix1, ix0 + 1), image_w)
+        crop = images[idx : idx + 1, :, iy0:iy1, ix0:ix1]
+        crop = F.interpolate(crop.float(), size=(image_h, image_w), mode="bilinear", align_corners=False)
+        crop_hm = hm[idx : idx + 1, y0:y1, x0:x1].unsqueeze(1).float()
+        crop_hm = F.interpolate(crop_hm, size=(grid_h, grid_w), mode="bilinear", align_corners=False)[:, 0]
+        crop_hm = crop_hm / crop_hm.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0e-8)
+        crops.append(crop.to(device=images.device, dtype=images.dtype))
+        crop_heatmaps.append(crop_hm.to(device=hm.device, dtype=hm.dtype))
+    return torch.cat(crops, dim=0), torch.cat(crop_heatmaps, dim=0)
 
 
 class MLP(nn.Module):
@@ -275,6 +342,66 @@ class Wan22VAEImageEncoder(nn.Module):
             raise ValueError("Wan22VAEImageEncoder.forward expects [B,C,H,W].")
         pooled, tokens = self.encode_video(images.unsqueeze(1))
         return pooled[:, 0], tokens[:, 0]
+
+
+class DinoV2PatchEncoder(nn.Module):
+    """Frozen DINOv2 patch encoder returned as [B, C, T, H, W] features."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        try:
+            from transformers import AutoModel
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("DINOv2 patch encoding requires transformers.") from exc
+        model_name = str(getattr(cfg, "dinov2_model_name", PROJECT_ROOT / "model/dinov2-base"))
+        local_files_only = bool(getattr(cfg, "dinov2_local_files_only", True))
+        self.model = AutoModel.from_pretrained(model_name, local_files_only=local_files_only)
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.output_dim = int(getattr(self.model.config, "hidden_size", getattr(cfg, "image_encoder_dim", 768)))
+        self.patch_size = max(int(getattr(self.model.config, "patch_size", 14)), 1)
+        self.encode_batch_size = max(int(getattr(cfg, "dinov2_encode_batch_size", 32)), 1)
+        mean = torch.tensor(getattr(cfg, "image_mean", (0.485, 0.456, 0.406)), dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor(getattr(cfg, "image_std", (0.229, 0.224, 0.225)), dtype=torch.float32).view(1, 3, 1, 1)
+        self.register_buffer("mean", mean, persistent=False)
+        self.register_buffer("std", std, persistent=False)
+
+    def train(self, mode: bool = True) -> "DinoV2PatchEncoder":
+        super().train(mode)
+        self.model.eval()
+        return self
+
+    @torch.no_grad()
+    def encode_video_latents(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 5:
+            raise ValueError("DINOv2 images must have shape [B, T, C, H, W].")
+        b, t, c, h, w = images.shape
+        if c != 3:
+            raise ValueError(f"DINOv2 expects RGB images, got C={c}.")
+        if next(self.model.parameters()).device != images.device:
+            self.model.to(images.device)
+        flat = images.reshape(b * t, c, h, w).to(device=images.device, dtype=torch.float32)
+        if flat.numel() > 0 and float(flat.detach().amax().cpu()) > 1.5:
+            flat = flat / 255.0
+        flat = (flat - self.mean.to(flat.device)) / self.std.to(flat.device).clamp_min(1.0e-6)
+
+        chunks = []
+        for chunk in flat.split(self.encode_batch_size, dim=0):
+            out = self.model(pixel_values=chunk, interpolate_pos_encoding=True, return_dict=True)
+            chunks.append(out.last_hidden_state[:, 1:, :].float())
+        tokens = torch.cat(chunks, dim=0)
+        n = int(tokens.size(1))
+        gh = int(round(math.sqrt(n)))
+        gw = gh
+        if gh * gw != n:
+            gh = max(int(h) // self.patch_size, 1)
+            gw = max(int(w) // self.patch_size, 1)
+            n_grid = gh * gw
+            if n_grid > n:
+                raise RuntimeError(f"Cannot reshape DINOv2 tokens: tokens={n}, inferred_grid={gh}x{gw}.")
+            tokens = tokens[:, :n_grid]
+        return tokens.reshape(b, t, gh, gw, tokens.size(-1)).permute(0, 4, 1, 2, 3).contiguous()
 
 
 class TargetTokenEncoder(nn.Module):

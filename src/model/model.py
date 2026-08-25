@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,7 +11,6 @@ from .encoders import TargetTokenEncoder, Wan22TextEncoder, Wan22VAEImageEncoder
 from .fusion import CrossAttentionFusion
 from .heads import FastWAMHead, TeacherPredictionHeads
 from .rssm import RSSM, RSSMState
-from .target_similarity import TargetSimilarityGuidance
 
 
 def migrate_legacy_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -30,6 +29,194 @@ def migrate_legacy_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[
     return migrated
 
 
+S0_PARAMETER_PREFIXES = (
+    "tracker.",
+    "fastwam.tracker_fusion.",
+    "fastwam.current_target_localizer.",
+)
+
+
+def normalize_s0_checkpoint_state(payload: Any) -> Dict[str, torch.Tensor]:
+    """Normalize either a V5 S0 companion or a standalone UAVTracker checkpoint."""
+    raw_state = (
+        payload.get("model", payload.get("state_dict", payload))
+        if isinstance(payload, dict)
+        else payload
+    )
+    if not isinstance(raw_state, dict) or not raw_state:
+        raise ValueError("S0 checkpoint contains no model parameters.")
+    state = {
+        (key.removeprefix("module.")): value
+        for key, value in raw_state.items()
+    }
+    if all(key.startswith(S0_PARAMETER_PREFIXES) for key in state):
+        return state
+
+    tracker_markers = {"template_pos", "search_pos", "segment_embed"}
+    is_standalone_tracker = (
+        isinstance(payload, dict)
+        and "args" in payload
+        and tracker_markers.issubset(state)
+    )
+    if is_standalone_tracker:
+        return {f"tracker.{key}": value for key, value in state.items()}
+
+    invalid = sorted(key for key in state if not key.startswith(S0_PARAMETER_PREFIXES))
+    raise ValueError(f"S0 checkpoint contains non-S0 parameters: {invalid[:8]}")
+
+
+class _S0FastWAMModules(nn.Module):
+    """Namespace matching the S0 module names inside TeacherWorldModelDiT."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.tracker_fusion = None
+        self.current_target_localizer = None
+        if bool(cfg.tracker_include_box_token):
+            return
+        from .current_target_localizer import CurrentTargetLocalizer
+        from .tracker_fusion import LocalFeatureTrackerConditionFusion
+
+        hidden_dim = 1024
+        num_heads = 8
+        self.tracker_fusion = LocalFeatureTrackerConditionFusion(
+            tracker_dim=int(cfg.tracker_feature_dim),
+            action_dim=hidden_dim,
+            num_heads=num_heads,
+            head_dim=max(hidden_dim // max(num_heads, 1), 1),
+            num_layers=0,
+            start_layer=0,
+            grid_size=int(cfg.tracker_feature_grid_size),
+            use_local_position_embedding=bool(cfg.tracker_use_local_position_embedding),
+            include_box_token=False,
+            detach_tracker_inputs=False,
+            enable_cross_attention=False,
+        )
+        self.current_target_localizer = CurrentTargetLocalizer(
+            tracker_dim=int(cfg.tracker_feature_dim),
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+        )
+
+
+class S0LocalizationModel(nn.Module):
+    """Standalone current-state model using either the Tracker head or Target Query."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        from pathlib import Path
+        from tracking.model import UAVTracker
+
+        self.cfg = cfg
+        if cfg.tracker_mot_integration != "mot_tracker_finetune_local_feature":
+            raise ValueError("S0LocalizationModel requires the trainable local-feature Tracker.")
+        init_mode = str(cfg.tracker_finetune_init).strip().lower()
+        use_tracker_head = bool(cfg.tracker_include_box_token)
+        if init_mode == "uav_tracker":
+            checkpoint_path = Path(str(cfg.tracker_finetune_checkpoint).strip())
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(
+                    "S0 Tracker-head initialization requires tracker_finetune_checkpoint."
+                )
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            state = (
+                payload.get("model", payload.get("state_dict", payload))
+                if isinstance(payload, dict)
+                else payload
+            )
+            checkpoint_args = payload.get("args", {}) if isinstance(payload, dict) else {}
+            self.tracker = UAVTracker(
+                backbone=str(checkpoint_args.get("backbone", "deit_tiny_patch16_224")),
+                pretrained=False,
+                template_size=int(cfg.tracker_template_size),
+                search_size=int(cfg.tracker_search_size),
+                square_boxes=True,
+                enable_head=use_tracker_head,
+            )
+            missing, unexpected = self.tracker.load_state_dict(state, strict=False)
+            if missing or unexpected:
+                raise ValueError(
+                    "S0 pretrained Tracker is incompatible: "
+                    f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+                )
+        elif init_mode == "imagenet_deit":
+            pretrained_path = Path(str(cfg.tracker_backbone_pretrained_path).strip())
+            if not pretrained_path.is_file():
+                raise FileNotFoundError(
+                    "S0LocalizationModel requires a local tracker_backbone_pretrained_path."
+                )
+            self.tracker = UAVTracker(
+                pretrained=True,
+                pretrained_path=pretrained_path,
+                template_size=int(cfg.tracker_template_size),
+                search_size=int(cfg.tracker_search_size),
+                square_boxes=True,
+                enable_head=use_tracker_head,
+            )
+        else:
+            raise ValueError(
+                "S0LocalizationModel requires tracker_finetune_init to be "
+                "'uav_tracker' or 'imagenet_deit'."
+            )
+        self.fastwam = _S0FastWAMModules(cfg)
+
+    def forward(
+        self,
+        tracker_template: torch.Tensor,
+        tracker_search: torch.Tensor,
+        tracker_search_geometry: torch.Tensor,
+        tracker_image_size: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        tracker_param = next(self.tracker.parameters())
+        use_tracker_head = bool(self.cfg.tracker_include_box_token)
+        tracker_out = self.tracker(
+            tracker_template.to(device=tracker_param.device, dtype=tracker_param.dtype),
+            tracker_search.to(device=tracker_param.device, dtype=tracker_param.dtype),
+            return_head=use_tracker_head,
+        )
+        if use_tracker_head:
+            crop_box, confidence = self.tracker.decode_peak(tracker_out)
+            current_box = self.tracker.map_crop_boxes_to_image(
+                crop_box,
+                tracker_search_geometry.to(device=crop_box.device),
+                tracker_image_size.to(device=crop_box.device),
+            )
+            logits = tracker_out["center_logits"]
+            attention = torch.softmax(logits.float().flatten(2), dim=-1)
+            full_xy = self.tracker.full_image_grid_coordinates(
+                tracker_search_geometry.to(device=logits.device),
+                tracker_image_size.to(device=logits.device),
+                logits.size(-2),
+                logits.size(-1),
+            )
+            return {
+                "current_box": current_box,
+                "current_attention": attention,
+                "full_xy": full_xy,
+                "tracker_confidence": confidence,
+            }
+
+        template_features = tracker_out["template_features"]
+        search_features = tracker_out["search_features"].flatten(2).transpose(1, 2)
+        if self.fastwam.tracker_fusion is None or self.fastwam.current_target_localizer is None:
+            raise RuntimeError("Target Query S0 modules are unavailable.")
+        condition = self.fastwam.tracker_fusion.make_condition(
+            tracker_features=search_features,
+            tracker_bbox=None,
+            tracker_search_geometry=tracker_search_geometry,
+            tracker_image_size=tracker_image_size,
+        )
+        full_xy = self.fastwam.tracker_fusion.full_image_coordinates(
+            tracker_search_geometry.to(device=condition.device),
+            tracker_image_size.to(device=condition.device),
+        ).to(dtype=condition.dtype)
+        return self.fastwam.current_target_localizer(
+            template_features.to(device=condition.device, dtype=condition.dtype),
+            condition,
+            full_xy,
+        )
+
+
 class TeacherWorldModelDiT(nn.Module):
     """Teacher world model with Wan2.2 visual/text encoders and no state input."""
 
@@ -41,14 +228,13 @@ class TeacherWorldModelDiT(nn.Module):
         self.image_encoder = Wan22VAEImageEncoder(cfg)
         self.text_encoder = Wan22TextEncoder(cfg)
         self.target_token_encoder = TargetTokenEncoder(cfg)
-        target_context_input_dim = self._target_relative_context_input_dim(cfg)
         target_context_hidden = max(
             int(getattr(cfg, "target_relative_context_hidden_dim", cfg.text_width)),
-            int(target_context_input_dim),
+            int(cfg.target_relative_dim),
             1,
         )
         self.target_relative_context_proj = nn.Sequential(
-            nn.Linear(target_context_input_dim, target_context_hidden),
+            nn.Linear(cfg.target_relative_dim, target_context_hidden),
             nn.GELU(),
             nn.Dropout(float(getattr(cfg, "dropout", 0.0))),
             nn.Linear(target_context_hidden, cfg.text_width),
@@ -56,60 +242,87 @@ class TeacherWorldModelDiT(nn.Module):
         if not bool(getattr(cfg, "use_target_relative_context", False)):
             for p in self.target_relative_context_proj.parameters():
                 p.requires_grad_(False)
-        self.target_similarity_guidance = (
-            TargetSimilarityGuidance(cfg) if bool(getattr(cfg, "use_target_similarity_guidance", False)) else None
+        tracker_context_hidden = max(
+            int(getattr(cfg, "tracker_center_context_hidden_dim", 256)), 2
         )
+        self.tracker_center_context_proj = nn.Sequential(
+            nn.Linear(2, tracker_context_hidden),
+            nn.SiLU(),
+            nn.Dropout(float(getattr(cfg, "dropout", 0.0))),
+            nn.Linear(tracker_context_hidden, cfg.text_width),
+            nn.LayerNorm(cfg.text_width),
+        )
+        self.tracker_center_missing_token = nn.Parameter(torch.zeros(1, 1, cfg.text_width))
+        nn.init.normal_(self.tracker_center_missing_token, std=0.02)
+        if not bool(getattr(cfg, "use_tracker_center_context", False)):
+            for p in self.tracker_center_context_proj.parameters():
+                p.requires_grad_(False)
+            self.tracker_center_missing_token.requires_grad_(False)
         self.fusion = CrossAttentionFusion(cfg)
         self.rssm = RSSM(cfg) if cfg.use_rssm else None
         self.prediction_heads = TeacherPredictionHeads(cfg)
         self.fastwam = FastWAMHead(cfg) if bool(cfg.use_fastwam_mot) else None
         if self.fastwam is None:
             raise RuntimeError("Legacy MLP/DiT actors were removed; set cfg.use_fastwam_mot=True.")
-        self._target_similarity_memory: Optional[Dict[str, torch.Tensor]] = None
+        self.tracker = None
+        if cfg.tracker_mot_integration == "mot_tracker_finetune_local_feature":
+            from pathlib import Path
+            from tracking.model import UAVTracker
 
-    def reset_target_similarity_memory(self) -> None:
-        self._target_similarity_memory = None
-
-    def initialize_target_similarity_from_heatmap(self, heatmap: torch.Tensor) -> None:
-        self._target_similarity_memory = {"init_heatmap": heatmap.detach()}
-
-    def initialize_target_similarity_from_box(
-        self,
-        box_xyxy: torch.Tensor,
-        image_hw: Tuple[int, int],
-    ) -> None:
-        if box_xyxy.ndim != 2 or box_xyxy.size(-1) != 4:
-            raise ValueError("box_xyxy must have shape [B, 4].")
-        h, w = image_hw
-        device = box_xyxy.device
-        dtype = box_xyxy.dtype if box_xyxy.is_floating_point() else torch.float32
-        patch = max(int(getattr(self.cfg, "target_similarity_patch_size", 16)), 1)
-        source = str(getattr(self.cfg, "target_similarity_feature_source", "wan_vae_latent")).lower()
-        if source in {"wan_vae_latent", "vae_latent", "latent"}:
-            downsample = max(int(getattr(self.cfg, "target_similarity_vae_downsample_factor", 8)), 1)
-            gh = max(int(h) // downsample, 1)
-            gw = max(int(w) // downsample, 1)
-        else:
-            gh = max(int(h) // patch, 1)
-            gw = max(int(w) // patch, 1)
-        xs = torch.linspace(0.0, 1.0, gw, device=device, dtype=dtype)
-        ys = torch.linspace(0.0, 1.0, gh, device=device, dtype=dtype)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        box = box_xyxy.to(device=device, dtype=dtype)
-        if float(box.detach().amax().cpu()) > 2.0:
-            scale = torch.tensor(
-                [max(w - 1, 1), max(h - 1, 1), max(w - 1, 1), max(h - 1, 1)],
-                device=device,
-                dtype=dtype,
-            )
-            box = box / scale
-        x1, y1, x2, y2 = box.unbind(dim=-1)
-        cx = ((x1 + x2) * 0.5).clamp(0.0, 1.0)
-        cy = ((y1 + y2) * 0.5).clamp(0.0, 1.0)
-        sigma = ((x2 - x1).abs() + (y2 - y1).abs()).mul(0.25).clamp_min(0.03)
-        dist2 = (grid_x.unsqueeze(0) - cx[:, None, None]).pow(2) + (grid_y.unsqueeze(0) - cy[:, None, None]).pow(2)
-        heatmap = torch.exp(-0.5 * dist2 / sigma[:, None, None].pow(2).clamp_min(1.0e-6))
-        self.initialize_target_similarity_from_heatmap(heatmap)
+            init_mode = str(getattr(cfg, "tracker_finetune_init", "uav_tracker")).strip().lower()
+            if init_mode == "uav_tracker":
+                checkpoint = Path(str(cfg.tracker_finetune_checkpoint))
+                if not checkpoint.is_file():
+                    raise FileNotFoundError(
+                        "mot_tracker_finetune_local_feature with tracker_finetune_init=uav_tracker "
+                        "requires tracker_finetune_checkpoint."
+                    )
+                payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+                checkpoint_args = payload.get("args", {}) if isinstance(payload, dict) else {}
+                include_tracker_head = bool(
+                    getattr(cfg, "tracker_include_box_token", True)
+                )
+                self.tracker = UAVTracker(
+                    backbone=str(
+                        checkpoint_args.get("backbone", "deit_tiny_patch16_224")
+                    ),
+                    pretrained=False,
+                    template_size=int(cfg.tracker_template_size),
+                    search_size=int(cfg.tracker_search_size),
+                    square_boxes=True,
+                    enable_head=include_tracker_head,
+                )
+                state = payload.get("model", payload.get("state_dict", payload)) if isinstance(payload, dict) else payload
+                missing, unexpected = self.tracker.load_state_dict(state, strict=False)
+                if missing or unexpected:
+                    message = (
+                        "Tracker checkpoint is incompatible: "
+                        f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+                    )
+                    if include_tracker_head:
+                        raise ValueError(message)
+                    print(f"[tracker-finetune] {message}")
+            elif init_mode == "imagenet_deit":
+                pretrained_path = Path(str(getattr(cfg, "tracker_backbone_pretrained_path", "")).strip())
+                if not pretrained_path.is_file():
+                    raise FileNotFoundError(
+                        "tracker_finetune_init=imagenet_deit requires a local "
+                        "tracker_backbone_pretrained_path."
+                    )
+                self.tracker = UAVTracker(
+                    pretrained=True,
+                    pretrained_path=pretrained_path,
+                    template_size=int(cfg.tracker_template_size),
+                    search_size=int(cfg.tracker_search_size),
+                    square_boxes=True,
+                    enable_head=bool(getattr(cfg, "tracker_include_box_token", True)),
+                )
+                print(f"[tracker-finetune] initialized DeiT backbone from {pretrained_path}")
+            else:
+                raise ValueError(
+                    "tracker_finetune_init must be 'uav_tracker' or 'imagenet_deit', "
+                    f"got {init_mode!r}."
+                )
 
     def initial_state(self, batch_size: int, device: torch.device) -> RSSMState:
         if self.rssm is None:
@@ -130,31 +343,6 @@ class TeacherWorldModelDiT(nn.Module):
             prev_dones[:, 1:] = done_2d[:, :-1]
         return prev_dones
 
-    @staticmethod
-    def _target_relative_context_input_dim(cfg: ModelConfig) -> int:
-        mode = str(getattr(cfg, "target_relative_context_input_mode", "xyz")).strip().lower()
-        if mode in {"xyz", "full", "all"}:
-            return int(cfg.target_relative_dim)
-        if mode in {"yz", "no_x", "without_x", "lateral_vertical"}:
-            if int(cfg.target_relative_dim) < 3:
-                raise ValueError("target_relative_context_input_mode='yz' requires target_relative_dim >= 3.")
-            return 2
-        raise ValueError(
-            f"Unsupported target_relative_context_input_mode={mode!r}; expected 'xyz' or 'yz'."
-        )
-
-    def _select_target_relative_context_input(self, target_relative: torch.Tensor) -> torch.Tensor:
-        mode = str(getattr(self.cfg, "target_relative_context_input_mode", "xyz")).strip().lower()
-        if mode in {"xyz", "full", "all"}:
-            return target_relative
-        if mode in {"yz", "no_x", "without_x", "lateral_vertical"}:
-            if target_relative.size(-1) < 3:
-                raise ValueError("target_relative_context_input_mode='yz' requires target_relative feature dim >= 3.")
-            return target_relative[..., 1:3]
-        raise ValueError(
-            f"Unsupported target_relative_context_input_mode={mode!r}; expected 'xyz' or 'yz'."
-        )
-
     def _make_target_relative_context_tokens(
         self,
         target_relative: torch.Tensor,
@@ -168,7 +356,6 @@ class TeacherWorldModelDiT(nn.Module):
         if target_relative.size(-1) != int(self.cfg.target_relative_dim):
             raise ValueError("target_relative feature dim must match cfg.target_relative_dim.")
         current_target = target_relative[:, 0].float()
-        current_target = self._select_target_relative_context_input(current_target)
         scale = max(float(getattr(self.cfg, "target_relative_context_scale", 1.0)), 1e-6)
         current_target = current_target / scale
         param = next(self.target_relative_context_proj.parameters())
@@ -180,6 +367,93 @@ class TeacherWorldModelDiT(nn.Module):
         mask = torch.ones(tokens.shape[:2], device=target_device, dtype=torch.bool)
         return tokens, mask
 
+    def _make_tracker_center_context_tokens(
+        self,
+        tracker_center: Optional[torch.Tensor],
+        tracker_confidence: Optional[torch.Tensor],
+        target_device: torch.device,
+        target_dtype: torch.dtype,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not bool(getattr(self.cfg, "use_tracker_center_context", False)):
+            return None, None
+        if tracker_center is None:
+            raise RuntimeError("Tracker center text context requires tracker_center.")
+        if tracker_center.ndim != 3 or tracker_center.size(-1) != 2:
+            raise ValueError("tracker_center must have shape [B, T, 2].")
+        center = tracker_center[:, 0].float().clamp(0.0, 1.0).mul(2.0).sub(1.0)
+        param = next(self.tracker_center_context_proj.parameters())
+        projected = self.tracker_center_context_proj(
+            center.to(device=param.device, dtype=param.dtype)
+        ).unsqueeze(1)
+        if tracker_confidence is None:
+            confidence = torch.ones(
+                projected.size(0), 1, 1, device=projected.device, dtype=projected.dtype
+            )
+        else:
+            if tracker_confidence.ndim not in {2, 3}:
+                raise ValueError("tracker_confidence must have shape [B, T] or [B, T, 1].")
+            confidence = tracker_confidence.reshape(tracker_confidence.size(0), -1)[:, 0]
+            confidence = confidence.to(device=projected.device, dtype=projected.dtype)
+            confidence = confidence.clamp(0.0, 1.0).view(-1, 1, 1)
+        missing = self.tracker_center_missing_token.to(
+            device=projected.device, dtype=projected.dtype
+        ).expand(projected.size(0), -1, -1)
+        tokens = confidence * projected + (1.0 - confidence) * missing
+        tokens = tokens * float(getattr(self.cfg, "tracker_center_token_scale", 1.0))
+        tokens = tokens.to(device=target_device, dtype=target_dtype)
+        mask = torch.ones(tokens.shape[:2], device=target_device, dtype=torch.bool)
+        return tokens, mask
+
+    def _first_tracker_features(
+        self,
+        tracker_features: Optional[torch.Tensor],
+        tracker_confidence: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        mode = str(getattr(self.cfg, "tracker_mot_integration", "none"))
+        condition_mode = str(getattr(self.cfg, "tracker_condition_mode", "center_features"))
+        if mode in {"none", "mot_tracker_finetune_local_feature"} or (
+            mode == "frozen_deit_tracker_fusion" and "features" not in condition_mode
+        ):
+            return None, None
+        if tracker_features is None:
+            raise RuntimeError(f"tracker_mot_integration={mode!r} requires Tracker feature tokens.")
+        if tracker_features.ndim == 4:
+            features = tracker_features[:, 0]
+        elif tracker_features.ndim == 3:
+            features = tracker_features
+        else:
+            raise ValueError("tracker_features must have shape [B,T,N,C] or [B,N,C].")
+        expected_tokens = max(int(getattr(self.cfg, "tracker_feature_grid_size", 7)), 1) ** 2
+        expected_dim = int(getattr(self.cfg, "tracker_feature_dim", 192))
+        if tuple(features.shape[1:]) != (expected_tokens, expected_dim):
+            raise ValueError(
+                "Tracker feature shape mismatch: expected "
+                f"[B,{expected_tokens},{expected_dim}], got {tuple(features.shape)}."
+            )
+        if tracker_confidence is None:
+            confidence = torch.ones(features.size(0), device=features.device, dtype=torch.float32)
+        else:
+            confidence = tracker_confidence.reshape(tracker_confidence.size(0), -1)[:, 0].float()
+            confidence = torch.nan_to_num(confidence, nan=0.0).clamp(0.0, 1.0)
+        return features, confidence
+
+    @staticmethod
+    def _first_tracker_tensor(
+        value: Optional[torch.Tensor],
+        *,
+        unbatched_ndim: int,
+        name: str,
+    ) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        if value.ndim == unbatched_ndim + 2:
+            return value[:, 0]
+        if value.ndim == unbatched_ndim + 1:
+            return value
+        raise ValueError(
+            f"{name} must have shape [B,T,...] or [B,...]; got {tuple(value.shape)}."
+        )
+
     def encode_sequence(
         self,
         images: torch.Tensor,
@@ -188,10 +462,16 @@ class TeacherWorldModelDiT(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         instructions: Optional[list[str]] = None,
         video_latents: Optional[torch.Tensor] = None,
-        target_similarity_memory: Optional[Dict[str, torch.Tensor]] = None,
-        target_similarity_init_heatmap: Optional[torch.Tensor] = None,
-        return_target_similarity_state: bool = False,
-        target_similarity_use_gt_visible_for_condition: bool = True,
+        guidance_heatmap: Optional[torch.Tensor] = None,
+        guidance_confidence: Optional[torch.Tensor] = None,
+        tracker_center: Optional[torch.Tensor] = None,
+        tracker_features: Optional[torch.Tensor] = None,
+        tracker_bbox: Optional[torch.Tensor] = None,
+        tracker_response: Optional[torch.Tensor] = None,
+        tracker_search_geometry: Optional[torch.Tensor] = None,
+        tracker_image_size: Optional[torch.Tensor] = None,
+        tracker_template: Optional[torch.Tensor] = None,
+        tracker_search: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if images.ndim != 5:
             raise ValueError("images must have shape [B, T, C, H, W].")
@@ -273,23 +553,64 @@ class TeacherWorldModelDiT(nn.Module):
         if target_context is not None and target_context_mask is not None:
             fastwam_context = torch.cat([fastwam_context, target_context], dim=1)
             fastwam_context_mask = torch.cat([fastwam_context_mask, target_context_mask], dim=1)
-
-        target_similarity_out = None
-        if self.target_similarity_guidance is not None:
-            target_similarity_out = self.target_similarity_guidance(
-                images,
-                target_relative,
-                video_latents=video_latents,
-                memory_state=target_similarity_memory,
-                init_heatmap=target_similarity_init_heatmap,
-                return_state=return_target_similarity_state,
-                use_gt_visible_for_condition=target_similarity_use_gt_visible_for_condition,
+        tracker_context, tracker_context_mask = self._make_tracker_center_context_tokens(
+            tracker_center,
+            guidance_confidence,
+            target_device=fastwam_context.device,
+            target_dtype=fastwam_context.dtype,
+        )
+        if tracker_context is not None and tracker_context_mask is not None:
+            fastwam_context = torch.cat([fastwam_context, tracker_context], dim=1)
+            fastwam_context_mask = torch.cat([fastwam_context_mask, tracker_context_mask], dim=1)
+        action_fastwam_context = fastwam_context
+        action_fastwam_context_mask = fastwam_context_mask
+        raw_tracker_features, raw_tracker_confidence = self._first_tracker_features(
+            tracker_features, guidance_confidence
+        )
+        raw_tracker_template_features = None
+        raw_tracker_bbox = self._first_tracker_tensor(
+            tracker_bbox, unbatched_ndim=1, name="tracker_bbox"
+        )
+        raw_tracker_response = self._first_tracker_tensor(
+            tracker_response, unbatched_ndim=2, name="tracker_response"
+        )
+        raw_tracker_search_geometry = self._first_tracker_tensor(
+            tracker_search_geometry,
+            unbatched_ndim=1,
+            name="tracker_search_geometry",
+        )
+        raw_tracker_image_size = self._first_tracker_tensor(
+            tracker_image_size, unbatched_ndim=1, name="tracker_image_size"
+        )
+        if self.tracker is not None:
+            if tracker_template is None or tracker_search is None:
+                raise RuntimeError("Tracker fine-tuning requires tracker_template and tracker_search.")
+            if raw_tracker_search_geometry is None or raw_tracker_image_size is None:
+                raise RuntimeError("Tracker fine-tuning requires current search geometry and image size.")
+            tracker_param = next(self.tracker.parameters())
+            tracker_template = tracker_template.to(
+                device=tracker_param.device, dtype=tracker_param.dtype
             )
-            sim_context = target_similarity_out["context_tokens"].to(device=fastwam_context.device, dtype=fastwam_context.dtype)
-            sim_mask = target_similarity_out["context_mask"].to(device=fastwam_context.device, dtype=torch.bool)
-            if sim_context.size(1) > 0:
-                fastwam_context = torch.cat([fastwam_context, sim_context], dim=1)
-                fastwam_context_mask = torch.cat([fastwam_context_mask, sim_mask], dim=1)
+            tracker_search = tracker_search.to(
+                device=tracker_param.device, dtype=tracker_param.dtype
+            )
+            include_box_token = bool(getattr(self.cfg, "tracker_include_box_token", True))
+            tracker_out = self.tracker(
+                tracker_template,
+                tracker_search,
+                return_head=include_box_token,
+            )
+            raw_tracker_template_features = tracker_out["template_features"]
+            raw_tracker_features = tracker_out["search_features"].flatten(2).transpose(1, 2)
+            if include_box_token:
+                crop_box, raw_tracker_confidence = self.tracker.decode_peak(tracker_out)
+                raw_tracker_bbox = self.tracker.map_crop_boxes_to_image(
+                    crop_box,
+                    raw_tracker_search_geometry,
+                    raw_tracker_image_size,
+                )
+            else:
+                raw_tracker_bbox = None
 
         encoded_out = {
             "obs_embed": obs_embed.view(batch_size, latent_seq_len, -1),
@@ -297,9 +618,16 @@ class TeacherWorldModelDiT(nn.Module):
             "video_latents": video_latents,
             "text_context": fastwam_context,
             "text_context_mask": fastwam_context_mask,
+            "action_text_context": action_fastwam_context,
+            "action_text_context_mask": action_fastwam_context_mask,
+            "tracker_features": raw_tracker_features,
+            "tracker_template_features": raw_tracker_template_features,
+            "tracker_feature_confidence": raw_tracker_confidence,
+            "tracker_bbox": raw_tracker_bbox,
+            "tracker_response": raw_tracker_response,
+            "tracker_search_geometry": raw_tracker_search_geometry,
+            "tracker_image_size": raw_tracker_image_size,
         }
-        if target_similarity_out is not None:
-            encoded_out["target_similarity"] = target_similarity_out
         return encoded_out
 
     def forward(
@@ -315,9 +643,27 @@ class TeacherWorldModelDiT(nn.Module):
         done: Optional[torch.Tensor] = None,
         instructions: Optional[list[str]] = None,
         video_latents: Optional[torch.Tensor] = None,
-        target_similarity_memory: Optional[Dict[str, torch.Tensor]] = None,
-        target_similarity_init_heatmap: Optional[torch.Tensor] = None,
-        return_target_similarity_state: bool = False,
+        guidance_heatmap: Optional[torch.Tensor] = None,
+        guidance_confidence: Optional[torch.Tensor] = None,
+        tracker_center: Optional[torch.Tensor] = None,
+        tracker_features: Optional[torch.Tensor] = None,
+        tracker_bbox: Optional[torch.Tensor] = None,
+        tracker_response: Optional[torch.Tensor] = None,
+        tracker_search_geometry: Optional[torch.Tensor] = None,
+        tracker_image_size: Optional[torch.Tensor] = None,
+        tracker_template: Optional[torch.Tensor] = None,
+        tracker_search: Optional[torch.Tensor] = None,
+        target_centers: Optional[torch.Tensor] = None,
+        target_boxes: Optional[torch.Tensor] = None,
+        target_center_valid: Optional[torch.Tensor] = None,
+        target_box_history: Optional[torch.Tensor] = None,
+        target_box_history_valid: Optional[torch.Tensor] = None,
+        capture_fastwam_attention: bool = False,
+        capture_fastwam_flow_predictions: bool = False,
+        fastwam_noise_video_override: Optional[torch.Tensor] = None,
+        fastwam_t_video_override: Optional[torch.Tensor] = None,
+        fastwam_noise_action_override: Optional[torch.Tensor] = None,
+        fastwam_t_action_override: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         encoded = self.encode_sequence(
             images,
@@ -326,9 +672,15 @@ class TeacherWorldModelDiT(nn.Module):
             attention_mask,
             instructions=instructions,
             video_latents=video_latents,
-            target_similarity_memory=target_similarity_memory,
-            target_similarity_init_heatmap=target_similarity_init_heatmap,
-            return_target_similarity_state=return_target_similarity_state,
+            guidance_confidence=guidance_confidence,
+            tracker_center=tracker_center,
+            tracker_features=tracker_features,
+            tracker_bbox=tracker_bbox,
+            tracker_response=tracker_response,
+            tracker_search_geometry=tracker_search_geometry,
+            tracker_image_size=tracker_image_size,
+            tracker_template=tracker_template,
+            tracker_search=tracker_search,
         )
         prev_dones = self._make_prev_dones(done)
         if self.rssm is None:
@@ -364,9 +716,6 @@ class TeacherWorldModelDiT(nn.Module):
             prior_preds = {f"prior_{k}": v for k, v in self.prediction_heads(prior_feat).items()}
         out = {
             "obs_embed": encoded["obs_embed"],
-            "fastwam_video_latents": encoded.get("video_latents"),
-            "fastwam_text_context": encoded.get("text_context"),
-            "fastwam_text_context_mask": encoded.get("text_context_mask"),
             "priors": priors,
             "posts": posts,
             "feat": feat,
@@ -374,54 +723,120 @@ class TeacherWorldModelDiT(nn.Module):
             **preds,
             **prior_preds,
         }
-        target_similarity_out = encoded.get("target_similarity")
-        if isinstance(target_similarity_out, dict):
-            out["target_similarity_heatmap"] = target_similarity_out["similarity_heatmap"]
-            out["target_similarity_raw_heatmap"] = target_similarity_out["raw_similarity_heatmap"]
-            out["target_similarity_center"] = target_similarity_out["pred_center"]
-            out["target_similarity_identity"] = target_similarity_out["identity_token"]
-            out["target_similarity_target_features"] = target_similarity_out["target_features"]
-            out["target_similarity_gt_heatmap"] = target_similarity_out["gt_heatmap"]
-            out["target_similarity_gt_center"] = target_similarity_out["gt_center"]
-            out["target_similarity_visible"] = target_similarity_out["visible"]
-            out["target_similarity_condition"] = target_similarity_out["target_condition"]
-            for key in [
-                "memory_last_good_primary",
-                "memory_last_good_velocity",
-                "memory_has_last_good",
-                "memory_lost_count",
-            ]:
-                if key in target_similarity_out:
-                    out[f"target_similarity_{key}"] = target_similarity_out[key]
-            for key in [
-                "memory_sim_prob",
-                "memory_pred_features",
-                "memory_pred_center",
-                "memory_identity_token",
-                "memory_last_good_primary",
-                "memory_last_good_velocity",
-                "memory_has_last_good",
-                "memory_lost_count",
-            ]:
-                if key in target_similarity_out:
-                    out[f"target_similarity_{key}"] = target_similarity_out[key]
         if expert_action is not None:
             if self.fastwam is not None:
                 if encoded.get("video_latents") is None or encoded.get("text_context") is None:
                     raise RuntimeError("Official FastWAM head requires Wan2.2 latents and raw text context.")
+                capture_attention = bool(capture_fastwam_attention) or bool(
+                    getattr(self.cfg, "return_gt_center_attention_for_distillation", False)
+                )
                 fastwam_out = self.fastwam.training_loss(
                     video_latents=encoded["video_latents"],
                     context=encoded["text_context"],
                     context_mask=encoded["text_context_mask"],
+                    action_context=encoded["action_text_context"],
+                    action_context_mask=encoded["action_text_context_mask"],
                     expert_action=expert_action.float(),
                     valid_mask=valid_mask,
                     target_relative=target_relative,
+                    guidance_heatmap=guidance_heatmap,
+                    guidance_confidence=guidance_confidence,
+                    gt_center_xy=tracker_center,
+                    tracker_features=encoded.get("tracker_features"),
+                    tracker_template_features=encoded.get("tracker_template_features"),
+                    tracker_confidence=encoded.get("tracker_feature_confidence"),
+                    tracker_center=tracker_center,
+                    tracker_bbox=encoded.get("tracker_bbox"),
+                    tracker_response=encoded.get("tracker_response"),
+                    tracker_search_geometry=encoded.get("tracker_search_geometry"),
+                    tracker_image_size=encoded.get("tracker_image_size"),
+                    target_box_history=target_box_history,
+                    target_box_history_valid=target_box_history_valid,
+                    target_centers=target_centers,
+                    target_boxes=target_boxes,
+                    target_center_valid=target_center_valid,
+                    capture_attention=capture_attention,
+                    return_flow_predictions=capture_fastwam_flow_predictions,
+                    noise_video_override=fastwam_noise_video_override,
+                    t_video_override=fastwam_t_video_override,
+                    noise_action_override=fastwam_noise_action_override,
+                    t_action_override=fastwam_t_action_override,
                 )
                 out["video_flow_loss"] = fastwam_out["loss_video"]
                 out["policy_flow_loss"] = fastwam_out["loss_action"]
+                out["policy_action_sequence"] = fastwam_out["pred_action_x0"]
+                out["policy_action"] = fastwam_out["pred_action_x0"][..., 0, :]
+                out["policy_flow_sequence"] = fastwam_out["pred_action_flow"]
+                if fastwam_out.get("action_valid_mask") is not None:
+                    out["policy_action_valid_mask"] = fastwam_out[
+                        "action_valid_mask"
+                    ]
+                if capture_fastwam_flow_predictions:
+                    out["video_velocity"] = fastwam_out["pred_video_velocity"]
                 out["fastwam_attention_heatmap_loss"] = fastwam_out["loss_attention_heatmap"]
-                out["policy_action_sequence"] = fastwam_out["pred_action"]
-                out["policy_action"] = fastwam_out["pred_action"][..., 0, :]
+                out["fastwam_ortrack_consistency_loss"] = fastwam_out["loss_ortrack_consistency"]
+                out["center_flow_loss"] = fastwam_out["loss_center_flow"]
+                out["current_center_loss"] = fastwam_out["loss_current_center"]
+                out["future_center_loss"] = fastwam_out["loss_future_center"]
+                out["center_transition_loss"] = fastwam_out["loss_center_transition"]
+                out["box_l1_loss"] = fastwam_out["loss_box_l1"]
+                out["box_giou_loss"] = fastwam_out["loss_box_giou"]
+                if fastwam_out.get("loss_state_flow") is not None:
+                    out["state_flow_loss"] = fastwam_out["loss_state_flow"]
+                out["current_box_loss"] = fastwam_out["loss_current_box"]
+                out["current_center_spatial_loss"] = fastwam_out[
+                    "loss_current_center_spatial"
+                ]
+                out["current_box_giou_loss"] = fastwam_out["loss_current_box_giou"]
+                out["current_attention_loss"] = fastwam_out["loss_current_attention"]
+                if fastwam_out.get("loss_capture_value") is not None:
+                    out["capture_value_loss"] = fastwam_out["loss_capture_value"]
+                for key in (
+                    "state_valid_ratio",
+                    "current_box_valid_ratio",
+                    "state_to_action_gate_mean",
+                    "current_box_action_gate_mean",
+                    "predicted_s0_box_error",
+                    "predicted_s0_center_error_pixels",
+                    "predicted_future_state_error",
+                    "pred_state_flow",
+                    "future_valid_ratio",
+                    "future_h1_center_error",
+                    "future_h1_iou",
+                    "future_h4_center_error",
+                    "future_h4_iou",
+                    "future_h8_center_error",
+                    "future_h8_iou",
+                    "capture_value_capture_loss",
+                    "capture_value_distance_loss",
+                    "capture_value_visibility_loss",
+                    "capture_value_ranking_loss",
+                    "capture_value_ranking_accuracy",
+                    "capture_value_target_capture",
+                ):
+                    if fastwam_out.get(key) is not None:
+                        out[key] = fastwam_out[key]
+                if fastwam_out.get("pred_center_flow") is not None:
+                    out["pred_center_flow"] = fastwam_out["pred_center_flow"]
+                    out["pred_state_centers"] = fastwam_out["pred_state_centers"]
+                    out["pred_future_centers"] = fastwam_out["pred_future_centers"]
+                    out["pred_state_boxes"] = fastwam_out["pred_state_boxes"]
+                    out["pred_future_boxes"] = fastwam_out["pred_future_boxes"]
+                elif fastwam_out.get("pred_state_boxes") is not None:
+                    out["pred_state_centers"] = fastwam_out["pred_state_centers"]
+                    out["pred_future_centers"] = fastwam_out["pred_future_centers"]
+                    out["pred_state_boxes"] = fastwam_out["pred_state_boxes"]
+                    out["pred_future_boxes"] = fastwam_out["pred_future_boxes"]
+                if capture_attention:
+                    out["last_action_attention"] = fastwam_out["last_action_attention"]
+                    out["last_guided_action_attention"] = fastwam_out["last_guided_action_attention"]
+                    for key in (
+                        "last_raw_action_attention_logits",
+                        "last_effective_action_attention_logits",
+                        "center_gaussian",
+                    ):
+                        if fastwam_out.get(key) is not None:
+                            out[key] = fastwam_out[key]
             elif self.cfg.use_diffusion_actor:
                 diffusion = self.actor.diffusion_loss(
                     feat,
@@ -577,6 +992,95 @@ class TeacherWorldModelDiT(nn.Module):
         }
 
     @torch.no_grad()
+    def sample_distillation_targets(
+        self,
+        images: torch.Tensor,
+        text_tokens: torch.Tensor,
+        target_relative: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        instructions: Optional[list[str]] = None,
+        video_latents: Optional[torch.Tensor] = None,
+        guidance_heatmap: Optional[torch.Tensor] = None,
+        guidance_confidence: Optional[torch.Tensor] = None,
+        tracker_center: Optional[torch.Tensor] = None,
+        tracker_features: Optional[torch.Tensor] = None,
+        tracker_bbox: Optional[torch.Tensor] = None,
+        tracker_response: Optional[torch.Tensor] = None,
+        tracker_search_geometry: Optional[torch.Tensor] = None,
+        tracker_image_size: Optional[torch.Tensor] = None,
+        num_steps: Optional[int] = None,
+        initial_action_noise: Optional[torch.Tensor] = None,
+        return_attention_maps: bool = True,
+        target_box_history: Optional[torch.Tensor] = None,
+        target_box_history_valid: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Sample frozen-teacher policy targets for a Tracker-free student."""
+        if self.fastwam is None:
+            raise RuntimeError("FastWAM is required for policy distillation targets.")
+        encoded = self.encode_sequence(
+            images=images,
+            text_tokens=text_tokens,
+            target_relative=target_relative,
+            attention_mask=attention_mask,
+            instructions=instructions,
+            video_latents=video_latents,
+            guidance_confidence=guidance_confidence,
+            tracker_center=tracker_center,
+            tracker_features=tracker_features,
+            tracker_bbox=tracker_bbox,
+            tracker_response=tracker_response,
+            tracker_search_geometry=tracker_search_geometry,
+            tracker_image_size=tracker_image_size,
+        )
+        first_frame_latents = encoded["video_latents"][:, :, :1]
+        action_horizon = max(int(self.cfg.action_sequence_horizon), 1)
+        action_sampling_kwargs = {
+            "first_frame_latents": first_frame_latents,
+            "context": encoded["text_context"],
+            "context_mask": encoded["text_context_mask"],
+            "action_context": encoded["action_text_context"],
+            "action_context_mask": encoded["action_text_context_mask"],
+            "action_horizon": action_horizon,
+            "num_steps": num_steps,
+            "guidance_heatmap": guidance_heatmap,
+            "guidance_confidence": guidance_confidence,
+            "initial_action_noise": initial_action_noise,
+            "gt_center_xy": None if tracker_center is None else tracker_center[:, 0],
+            "tracker_features": encoded.get("tracker_features"),
+            "tracker_template_features": encoded.get("tracker_template_features"),
+            "tracker_bbox": encoded.get("tracker_bbox"),
+            "tracker_response": encoded.get("tracker_response"),
+            "tracker_confidence": encoded.get("tracker_feature_confidence"),
+            "tracker_search_geometry": encoded.get("tracker_search_geometry"),
+            "tracker_image_size": encoded.get("tracker_image_size"),
+            "future_video_latent_frames": 3,
+            "target_box_history": target_box_history,
+            "target_box_history_valid": target_box_history_valid,
+        }
+        sample_out = self.fastwam.sample_action(
+            **action_sampling_kwargs,
+            return_attention_maps=return_attention_maps,
+        )
+        if isinstance(sample_out, tuple):
+            action_sequence, attention_aux = sample_out
+        else:
+            action_sequence = sample_out
+            attention_aux = None
+        result: Dict[str, torch.Tensor] = {
+            "teacher_action_sequence": action_sequence.detach(),
+        }
+        if attention_aux is not None:
+            attention = attention_aux.get("last_transformer_attention")
+            if attention is not None:
+                result["teacher_action_attention"] = attention.detach()
+            last_action_input = attention_aux.get("last_action_input")
+            last_action_timestep = attention_aux.get("last_action_timestep")
+            if last_action_input is not None and last_action_timestep is not None:
+                result["teacher_last_action_input"] = last_action_input.detach()
+                result["teacher_last_action_timestep"] = last_action_timestep.detach()
+        return result
+
+    @torch.no_grad()
     def act(
         self,
         image: torch.Tensor,
@@ -592,6 +1096,18 @@ class TeacherWorldModelDiT(nn.Module):
         save_transformer_attention: bool = False,
         save_predicted_video: bool = False,
         predicted_video_latent_frames: int = 3,
+        guidance_heatmap: Optional[torch.Tensor] = None,
+        guidance_confidence: Optional[torch.Tensor] = None,
+        tracker_center: Optional[torch.Tensor] = None,
+        tracker_features: Optional[torch.Tensor] = None,
+        tracker_bbox: Optional[torch.Tensor] = None,
+        tracker_response: Optional[torch.Tensor] = None,
+        tracker_search_geometry: Optional[torch.Tensor] = None,
+        tracker_image_size: Optional[torch.Tensor] = None,
+        tracker_template: Optional[torch.Tensor] = None,
+        tracker_search: Optional[torch.Tensor] = None,
+        target_box_history: Optional[torch.Tensor] = None,
+        target_box_history_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[RSSMState]]:
         if image.ndim != 4:
             raise ValueError("image must have shape [B, C, H, W].")
@@ -607,31 +1123,18 @@ class TeacherWorldModelDiT(nn.Module):
             target_relative_seq,
             attention_mask,
             instructions=None if instruction is None else [instruction] * batch_size,
-            target_similarity_memory=self._target_similarity_memory,
-            target_similarity_init_heatmap=(
-                self._target_similarity_memory.get("init_heatmap")
-                if isinstance(self._target_similarity_memory, dict)
-                else None
+            guidance_confidence=guidance_confidence,
+            tracker_center=(
+                None if tracker_center is None else tracker_center.unsqueeze(1)
             ),
-            return_target_similarity_state=self.target_similarity_guidance is not None,
-            target_similarity_use_gt_visible_for_condition=False,
+            tracker_features=tracker_features,
+            tracker_bbox=tracker_bbox,
+            tracker_response=tracker_response,
+            tracker_search_geometry=tracker_search_geometry,
+            tracker_image_size=tracker_image_size,
+            tracker_template=tracker_template,
+            tracker_search=tracker_search,
         )
-        target_similarity_out = encoded.get("target_similarity")
-        if isinstance(target_similarity_out, dict) and "memory_sim_prob" in target_similarity_out:
-            self._target_similarity_memory = {
-                "sim_prob": target_similarity_out["memory_sim_prob"],
-                "pred_features": target_similarity_out["memory_pred_features"],
-                "pred_center": target_similarity_out["memory_pred_center"],
-                "identity_token": target_similarity_out["memory_identity_token"],
-            }
-            for src_key, dst_key in (
-                ("memory_last_good_primary", "last_good_primary"),
-                ("memory_last_good_velocity", "last_good_velocity"),
-                ("memory_has_last_good", "has_last_good"),
-                ("memory_lost_count", "lost_count"),
-            ):
-                if src_key in target_similarity_out:
-                    self._target_similarity_memory[dst_key] = target_similarity_out[src_key]
         if self.rssm is None:
             post = None
             feat = encoded["obs_embed"].squeeze(1)
@@ -646,12 +1149,33 @@ class TeacherWorldModelDiT(nn.Module):
             candidate_info = None
             if encoded.get("video_latents") is None or encoded.get("text_context") is None:
                 raise RuntimeError("Official FastWAM head requires Wan2.2 latents and raw text context.")
+            action_horizon = max(int(self.cfg.action_sequence_horizon), 1)
+            action_sampling_kwargs = {
+                "first_frame_latents": encoded["video_latents"],
+                "context": encoded["text_context"],
+                "context_mask": encoded["text_context_mask"],
+                "action_context": encoded["action_text_context"],
+                "action_context_mask": encoded["action_text_context_mask"],
+                "action_horizon": action_horizon,
+                "num_steps": num_steps,
+                "guidance_heatmap": guidance_heatmap,
+                "guidance_confidence": guidance_confidence,
+                "initial_action_noise": None,
+                "gt_center_xy": tracker_center,
+                "tracker_features": encoded.get("tracker_features"),
+                "tracker_template_features": encoded.get("tracker_template_features"),
+                "tracker_bbox": encoded.get("tracker_bbox"),
+                "tracker_response": encoded.get("tracker_response"),
+                "tracker_confidence": encoded.get("tracker_feature_confidence"),
+                "tracker_search_geometry": encoded.get("tracker_search_geometry"),
+                "tracker_image_size": encoded.get("tracker_image_size"),
+                "future_video_latent_frames": predicted_video_latent_frames,
+                "target_box_history": target_box_history,
+                "target_box_history_valid": target_box_history_valid,
+                "previous_action": prev_action,
+            }
             sample_out = self.fastwam.sample_action(
-                first_frame_latents=encoded["video_latents"],
-                context=encoded["text_context"],
-                context_mask=encoded["text_context_mask"],
-                action_horizon=max(int(self.cfg.action_sequence_horizon), 1),
-                num_steps=num_steps,
+                **action_sampling_kwargs,
                 return_attention_maps=save_transformer_attention,
             )
             attention_aux = None
@@ -661,7 +1185,14 @@ class TeacherWorldModelDiT(nn.Module):
                 action_sequence_norm = sample_out
             action_norm = action_sequence_norm[:, 0]
             predicted_video_latents = None
-            if save_predicted_video:
+            joint_future_video = (
+                None
+                if attention_aux is None
+                else attention_aux.get("future_video_latents")
+            )
+            if save_predicted_video and joint_future_video is not None:
+                predicted_video_latents = joint_future_video
+            elif save_predicted_video:
                 predicted_video_latents = self.fastwam.sample_video(
                     first_frame_latents=encoded["video_latents"],
                     context=encoded["text_context"],
@@ -699,29 +1230,90 @@ class TeacherWorldModelDiT(nn.Module):
         )
         heads = self.prediction_heads(feat)
         out = {"action": action_physical, "action_norm": action_norm, "action_physical": action_physical, **heads}
-        if isinstance(target_similarity_out, dict):
-            out["target_similarity_heatmap"] = target_similarity_out["similarity_heatmap"]
-            out["target_similarity_raw_heatmap"] = target_similarity_out["raw_similarity_heatmap"]
-            out["target_similarity_center"] = target_similarity_out["pred_center"]
-            out["target_similarity_identity"] = target_similarity_out["identity_token"]
-            out["target_similarity_target_features"] = target_similarity_out["target_features"]
-            out["target_similarity_gt_heatmap"] = target_similarity_out["gt_heatmap"]
-            out["target_similarity_gt_center"] = target_similarity_out["gt_center"]
-            out["target_similarity_visible"] = target_similarity_out["visible"]
-            out["target_similarity_condition"] = target_similarity_out["target_condition"]
         if action_sequence_norm is not None:
             out["action_sequence_norm"] = action_sequence_norm
         if self.fastwam is not None and "predicted_video_latents" in locals() and predicted_video_latents is not None:
             out["predicted_video_latents"] = predicted_video_latents
         if self.fastwam is not None and "attention_aux" in locals() and attention_aux is not None:
+            for key in (
+                "capture_value_candidates",
+                "capture_value_scores",
+                "capture_value_selected_index",
+                "capture_value_raw_selected_index",
+                "capture_value_score_advantage",
+                "capture_value_used_fallback",
+                "capture_value_recenter_costs",
+                "capture_value_pursuit_costs",
+                "capture_value_smooth_costs",
+                "capture_value_consensus_costs",
+                "capture_value_observed_center_velocity",
+                "capture_value_selected_final_center_error",
+                "capture_value_selected_final_box_size",
+                "capture_value_selected_capture_probability",
+                "capture_value_selected_final_distance",
+                "capture_value_selected_visibility",
+                "capture_action_prior_mean",
+                "capture_action_prior_std",
+            ):
+                if attention_aux.get(key) is not None:
+                    out[key] = attention_aux[key]
+            future_target_centers = attention_aux.get("future_target_centers")
+            if future_target_centers is not None:
+                out["future_target_centers"] = future_target_centers
+            target_state_centers = attention_aux.get("target_state_centers")
+            if target_state_centers is not None:
+                out["target_state_centers"] = target_state_centers
+            future_target_boxes = attention_aux.get("future_target_boxes")
+            if future_target_boxes is not None:
+                out["future_target_boxes"] = future_target_boxes
+            target_state_boxes = attention_aux.get("target_state_boxes")
+            if target_state_boxes is not None:
+                out["target_state_boxes"] = target_state_boxes
+            pred_state_flow = attention_aux.get("pred_state_flow")
+            if pred_state_flow is not None:
+                out["pred_state_flow"] = pred_state_flow
             attn = attention_aux.get("last_transformer_attention")
             grid_size = attention_aux.get("video_grid_size")
             if attn is not None and grid_size is not None:
                 _, grid_h, grid_w = grid_size
                 first_frame_tokens = int(grid_h) * int(grid_w)
-                attn_map = attn[..., :first_frame_tokens].mean(dim=(1, 2)).reshape(attn.size(0), int(grid_h), int(grid_w))
-                out["last_transformer_attention_map"] = attn_map
+                spatial = attn[..., :first_frame_tokens].float().clamp_min(1.0e-8)
+                spatial_normalized = spatial / spatial.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+                per_query = spatial.sum(dim=1)
+                per_query = per_query / per_query.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+                out["last_transformer_attention_per_query_maps"] = per_query.reshape(
+                    attn.size(0), attn.size(2), int(grid_h), int(grid_w)
+                )
+                out["last_transformer_attention_all_queries_map"] = spatial_normalized.mean(dim=(1, 2)).reshape(
+                    attn.size(0), int(grid_h), int(grid_w)
+                )
+                query0 = spatial[:, :, 0].sum(dim=1)
+                query0 = query0 / query0.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+                out["last_transformer_attention_query0_map"] = query0.reshape(
+                    attn.size(0), int(grid_h), int(grid_w)
+                )
+                out["last_transformer_attention_map"] = out["last_transformer_attention_query0_map"]
+                out["last_transformer_attention_unnormalized_map"] = spatial.mean(dim=(1, 2)).reshape(
+                    attn.size(0), int(grid_h), int(grid_w)
+                )
                 out["last_transformer_attention_raw"] = attn
+                for source_key, output_key in (
+                    ("last_transformer_raw_attention", "last_transformer_raw_attention"),
+                    ("last_transformer_raw_attention_logits", "last_transformer_raw_attention_logits"),
+                    (
+                        "last_transformer_effective_attention_logits",
+                        "last_transformer_effective_attention_logits",
+                    ),
+                ):
+                    value = attention_aux.get(source_key)
+                    if value is not None:
+                        out[output_key] = value
+            tracker_attention = attention_aux.get("last_tracker_cross_attention")
+            if tracker_attention is not None:
+                out["last_tracker_cross_attention"] = tracker_attention
+        tracker_confidence_out = encoded.get("tracker_feature_confidence")
+        if tracker_confidence_out is not None:
+            out["tracker_confidence"] = tracker_confidence_out
         if candidate_info is not None:
             out.update(candidate_info)
         return out, post
