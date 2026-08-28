@@ -148,6 +148,8 @@ class ModelConfig:
     target_history_hidden_dim: int = 256
     target_history_num_layers: int = 2
     target_history_num_heads: int = 8
+    target_history_action_layers: tuple[int, ...] = (26,)
+    target_history_future_center_loss_weight: float = 0.2
     target_history_tracker_cache_root: str = ""
     target_conditioning_adapter_only: bool = False
     # Capture-value reranking for FastWAM/FasterWAM Current Box policies.

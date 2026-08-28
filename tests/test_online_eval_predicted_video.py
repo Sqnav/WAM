@@ -15,8 +15,84 @@ from eval.online_eval_teacher import (
     _predicted_video_assets_complete,
     _predicted_video_enabled_for_key,
     save_target_crop_action_overlay,
+    tracker_detection_missed_for_fallback,
 )
 from eval.postprocess_online_eval_visuals import postprocess_trajectory
+
+
+class TrackerActionFallbackTests(unittest.TestCase):
+    def test_confidence_signal_preserves_existing_threshold_behavior(self) -> None:
+        relative = np.array([10.0, 0.0, 0.0], dtype=np.float32)
+
+        self.assertTrue(
+            tracker_detection_missed_for_fallback(
+                signal="confidence",
+                confidence=0.49,
+                confidence_threshold=0.5,
+                relative_target_body=relative,
+                fov_deg=90.0,
+            )
+        )
+        self.assertFalse(
+            tracker_detection_missed_for_fallback(
+                signal="confidence",
+                confidence=0.5,
+                confidence_threshold=0.5,
+                relative_target_body=relative,
+                fov_deg=90.0,
+            )
+        )
+
+    def test_model_confidence_uses_the_same_threshold_behavior(self) -> None:
+        relative = np.array([10.0, 0.0, 0.0], dtype=np.float32)
+
+        self.assertTrue(
+            tracker_detection_missed_for_fallback(
+                signal="model_confidence",
+                confidence=0.2,
+                confidence_threshold=0.5,
+                relative_target_body=relative,
+                fov_deg=90.0,
+            )
+        )
+        self.assertFalse(
+            tracker_detection_missed_for_fallback(
+                signal="model_confidence",
+                confidence=0.8,
+                confidence_threshold=0.5,
+                relative_target_body=relative,
+                fov_deg=90.0,
+            )
+        )
+        self.assertFalse(
+            tracker_detection_missed_for_fallback(
+                signal="model_confidence",
+                confidence=None,
+                confidence_threshold=0.5,
+                relative_target_body=relative,
+                fov_deg=90.0,
+            )
+        )
+
+    def test_geometry_signal_is_an_oracle_visibility_check(self) -> None:
+        self.assertFalse(
+            tracker_detection_missed_for_fallback(
+                signal="geometry_visibility",
+                confidence=1.0,
+                confidence_threshold=0.5,
+                relative_target_body=np.array([10.0, 0.0, 0.0], dtype=np.float32),
+                fov_deg=90.0,
+            )
+        )
+        self.assertTrue(
+            tracker_detection_missed_for_fallback(
+                signal="geometry_visibility",
+                confidence=1.0,
+                confidence_threshold=0.5,
+                relative_target_body=np.array([1.0, 2.0, 0.0], dtype=np.float32),
+                fov_deg=90.0,
+            )
+        )
 
 
 class ModelDrivenSearchTests(unittest.TestCase):

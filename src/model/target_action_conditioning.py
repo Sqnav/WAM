@@ -103,7 +103,7 @@ def make_online_target_box_history(
 
 
 class HistoricalTargetMemory(nn.Module):
-    """Encode previous 2D Tracker states plus the observed current b0."""
+    """Encode target motion relative to the observed current b0."""
 
     def __init__(
         self,
@@ -152,6 +152,12 @@ class HistoricalTargetMemory(nn.Module):
         )
         self.horizon_attention = nn.MultiheadAttention(
             self.memory_dim, int(num_heads), dropout=0.0, batch_first=True
+        )
+        self.previous_action_encoder = nn.Sequential(
+            nn.Linear(4, self.memory_dim),
+            nn.SiLU(),
+            nn.Linear(self.memory_dim, self.memory_dim),
+            nn.LayerNorm(self.memory_dim),
         )
         self.output = nn.Sequential(
             nn.Linear(self.memory_dim, self.action_hidden_dim),
@@ -207,7 +213,18 @@ class HistoricalTargetMemory(nn.Module):
             dim=1,
         )
         box = raw[..., :4].clamp(0.0, 1.0)
-        state = torch.cat([box[..., :2], box[..., 2:4].clamp_min(1.0e-6).log()], dim=-1)
+        current_center = current[:, None, :2]
+        current_log_size = current[:, None, 2:4].clamp_min(1.0e-6).log()
+        # Absolute b0 is already supplied by CurrentBoxActionConditioner.  The
+        # history branch should describe motion around that anchor instead of
+        # learning a second, potentially conflicting copy of b0.
+        state = torch.cat(
+            [
+                box[..., :2] - current_center,
+                box[..., 2:4].clamp_min(1.0e-6).log() - current_log_size,
+            ],
+            dim=-1,
+        )
         delta = torch.zeros_like(state)
         delta[:, 1:] = state[:, 1:] - state[:, :-1]
         delta_valid = torch.zeros_like(valid)
@@ -226,6 +243,7 @@ class HistoricalTargetMemory(nn.Module):
         previous_valid: torch.Tensor,
         current_box: torch.Tensor,
         current_confidence: Optional[torch.Tensor] = None,
+        previous_action: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         features, valid = self._features(
             previous_history, previous_valid, current_box, current_confidence
@@ -238,6 +256,15 @@ class HistoricalTargetMemory(nn.Module):
         encoded = self.state_encoder(features) + self.history_position.to(features)
         encoded = self.temporal_encoder(encoded, src_key_padding_mask=~valid)
         query = self.horizon_query.to(encoded).expand(encoded.size(0), -1, -1)
+        if previous_action is None:
+            action = torch.zeros(
+                encoded.size(0), 4, device=encoded.device, dtype=encoded.dtype
+            )
+        else:
+            if previous_action.shape != (encoded.size(0), 4):
+                raise ValueError("Previous executed action must have shape [B,4].")
+            action = previous_action.to(device=encoded.device, dtype=encoded.dtype)
+        query = query + self.previous_action_encoder(action)[:, None]
         horizons, _ = self.horizon_attention(
             query, encoded, encoded, key_padding_mask=~valid, need_weights=False
         )
@@ -284,9 +311,13 @@ class TargetActionConditioning(nn.Module):
         memory_dim: int,
         memory_layers: int,
         memory_heads: int,
+        layers: tuple[int, ...],
     ) -> None:
         super().__init__()
         self.horizon = int(horizon)
+        self.layers = tuple(sorted({int(layer) for layer in layers}))
+        if not self.layers or min(self.layers) < 0:
+            raise ValueError("Historical target injection layers must be non-negative.")
         self.history_memory = HistoricalTargetMemory(
             action_hidden_dim=action_hidden_dim,
             history_length=history_length,
@@ -296,6 +327,12 @@ class TargetActionConditioning(nn.Module):
             num_heads=memory_heads,
         )
         self.history_adapter = _ZeroResidualAdapter(action_hidden_dim)
+        self.next_center_delta_head = nn.Sequential(
+            nn.LayerNorm(action_hidden_dim),
+            nn.Linear(action_hidden_dim, action_hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(action_hidden_dim // 2, 2),
+        )
 
     @property
     def history_length(self) -> int:
@@ -308,15 +345,29 @@ class TargetActionConditioning(nn.Module):
         previous_valid: torch.Tensor,
         current_box: torch.Tensor,
         current_confidence: Optional[torch.Tensor],
+        previous_action: Optional[torch.Tensor],
     ) -> Dict[str, Optional[torch.Tensor]]:
         history = self.history_memory(
-            previous_history, previous_valid, current_box, current_confidence
+            previous_history,
+            previous_valid,
+            current_box,
+            current_confidence,
+            previous_action,
         )
-        return {"history": history}
+        return {
+            "history": history,
+            "next_center_delta": self.next_center_delta_head(history[:, 0]),
+        }
+
+    def enabled_at(self, layer_idx: int) -> bool:
+        return int(layer_idx) in self.layers
 
     def residual(
         self,
         action_hidden: torch.Tensor,
         conditions: Dict[str, Optional[torch.Tensor]],
     ) -> torch.Tensor:
-        return self.history_adapter(action_hidden, conditions["history"])
+        history = conditions.get("history")
+        if history is None:
+            raise RuntimeError("Historical target condition is missing.")
+        return self.history_adapter(action_hidden, history)

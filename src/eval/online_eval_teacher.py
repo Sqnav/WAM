@@ -26,6 +26,7 @@ from scipy.spatial.transform import Rotation as R
 from torchvision import transforms
 
 from data.action_mapping import clamp_physical_action_speed, norm_action_to_physical
+from eval.public_policy_baselines import make_public_policy
 from eval.ortrack_target_heatmap import (
     ORTrack640,
     _bbox_from_target_center,
@@ -1670,6 +1671,29 @@ def is_visible_by_geometry(rel_body: np.ndarray, fov_deg: float = 90.0) -> bool:
     return h_ang <= fov_deg / 2.0 and v_ang <= fov_deg / 2.0
 
 
+def tracker_detection_missed_for_fallback(
+    *,
+    signal: str,
+    confidence: Optional[float],
+    confidence_threshold: float,
+    relative_target_body: np.ndarray,
+    fov_deg: float,
+) -> bool:
+    """Decide whether the cached-action fallback should activate.
+
+    ``geometry_visibility`` is an oracle diagnostic for isolating the fallback
+    policy. It is not a deployable target-loss signal.
+    """
+    if signal in {"confidence", "model_confidence"}:
+        return bool(
+            confidence is not None
+            and float(confidence) < float(confidence_threshold)
+        )
+    if signal == "geometry_visibility":
+        return not is_visible_by_geometry(relative_target_body, fov_deg=fov_deg)
+    raise ValueError(f"Unsupported tracker fallback loss signal: {signal!r}")
+
+
 def _delta_xyz_to_dict(delta: Optional[np.ndarray]) -> Optional[Dict[str, float]]:
     if delta is None:
         return None
@@ -2305,7 +2329,7 @@ def _save_trajectory_3d_plot(out_dir: Path, steps: List[Dict[str, Any]]) -> None
 
 @torch.no_grad()
 def run_online_trajectory(
-    model: TeacherWorldModelDiT,
+    model: Optional[TeacherWorldModelDiT],
     cfg: ModelConfig,
     tokenizer,
     transform,
@@ -2313,6 +2337,7 @@ def run_online_trajectory(
     traj: OnlineTrajectory,
     args: argparse.Namespace,
     device: torch.device,
+    public_policy=None,
 ) -> Dict[str, Any]:
     out_dir = Path(args.output_dir) / traj.scene_id / traj.trajectory_name
     rgb_out_dir = out_dir / "rgb"
@@ -2464,6 +2489,9 @@ def run_online_trajectory(
     prev_uav_after_state: Optional[Dict[str, Any]] = None
     target_history_boxes: List[np.ndarray] = []
     target_history_confidences: List[float] = []
+    previous_action_physical = np.zeros(4, dtype=np.float32)
+    if public_policy is not None:
+        public_policy.reset()
 
     iterator: Iterable[int] = range(num_steps)
     if tqdm is not None:
@@ -2591,7 +2619,13 @@ def run_online_trajectory(
         if t + 1 < num_steps:
             next_rel_body = compute_target_relative_body(executor, uav_state_before, traj.target_traj_airsim[t + 1])
 
-        if getattr(args, "force_live_instruction", False):
+        if public_policy is not None and traj.saved_instructions and t < len(traj.saved_instructions):
+            instruction = traj.saved_instructions[t]
+        elif public_policy is not None and traj.saved_instructions:
+            instruction = traj.saved_instructions[0]
+        elif public_policy is not None:
+            instruction = "Track and approach the target UAV while avoiding collisions."
+        elif getattr(args, "force_live_instruction", False):
             instruction = instruction_from_relative(rel_body, next_rel_body)
         elif traj.saved_instructions and t < len(traj.saved_instructions):
             instruction = traj.saved_instructions[t]
@@ -2729,6 +2763,7 @@ def run_online_trajectory(
         action_sequence_physical = None
         capture_value_diagnostics = None
         action_overlay_metadata = None
+        model_tracker_confidence = None
         ortrack_bbox = (
             None
             if ortrack_result is None or ortrack_result.get("bbox") is None
@@ -2827,8 +2862,17 @@ def run_online_trajectory(
             )
         tracker_detection_missed = bool(
             args.reuse_last_confident_action_sequence
-            and ortrack_confidence is not None
-            and ortrack_confidence < float(args.tracker_detection_confidence_threshold)
+            and tracker_detection_missed_for_fallback(
+                signal=str(args.tracker_fallback_loss_signal),
+                confidence=(
+                    None
+                    if str(args.tracker_fallback_loss_signal) == "model_confidence"
+                    else ortrack_confidence
+                ),
+                confidence_threshold=float(args.tracker_detection_confidence_threshold),
+                relative_target_body=rel_body,
+                fov_deg=float(args.fov_deg),
+            )
         )
         reused_action_sequence_index = None
         profile_planner_done = time.perf_counter()
@@ -2859,7 +2903,45 @@ def run_online_trajectory(
                     sequence_len - 1,
                 )
             action_source = "last_confident_action_sequence"
+        elif public_policy is not None:
+            policy_actions = public_policy.infer(
+                rgb=rgb_array,
+                instruction=instruction,
+                previous_action_physical=previous_action_physical,
+                scene_id=traj.scene_id,
+                trajectory_name=traj.trajectory_name,
+                step=t,
+            )
+            if args.policy_backend == "random":
+                action_sequence_norm = np.asarray(policy_actions, dtype=np.float32)
+                action_sequence_physical = norm_action_to_physical(
+                    action_sequence_norm,
+                    max_vel=cfg.max_vel,
+                    max_yaw_rate=cfg.max_yaw_rate,
+                    max_speed_norm=cfg.max_speed_norm,
+                )
+            else:
+                action_sequence_physical = clamp_physical_action_speed(
+                    np.asarray(policy_actions, dtype=np.float32),
+                    max_speed_norm=cfg.max_speed_norm,
+                )
+                action_sequence_physical[..., 3] = np.clip(
+                    action_sequence_physical[..., 3],
+                    -float(cfg.max_yaw_rate),
+                    float(cfg.max_yaw_rate),
+                )
+                action_sequence_norm = np.stack(
+                    [
+                        physical_action_to_norm(action, cfg.max_vel, cfg.max_yaw_rate)
+                        for action in action_sequence_physical
+                    ],
+                    axis=0,
+                )
+            action_norm = action_sequence_norm[0].copy()
+            action_physical = action_sequence_physical[0].copy()
+            action_source = str(args.policy_backend)
         else:
+            assert model is not None
             image_t = rgb_to_model_tensor(rgb_img, transform, device)
             if cfg.use_wan22_encoders:
                 text_tokens = torch.zeros(1, 1, dtype=torch.long, device=device)
@@ -2906,6 +2988,21 @@ def run_online_trajectory(
                 target_box_history=target_box_history_t,
                 target_box_history_valid=target_box_history_valid_t,
             )
+            if pred.get("tracker_confidence") is not None:
+                model_tracker_confidence = float(
+                    pred["tracker_confidence"].detach().view(-1)[0].cpu().item()
+                )
+            if (
+                args.reuse_last_confident_action_sequence
+                and str(args.tracker_fallback_loss_signal) == "model_confidence"
+            ):
+                tracker_detection_missed = tracker_detection_missed_for_fallback(
+                    signal="model_confidence",
+                    confidence=model_tracker_confidence,
+                    confidence_threshold=float(args.tracker_detection_confidence_threshold),
+                    relative_target_body=rel_body,
+                    fov_deg=float(args.fov_deg),
+                )
             state_centers = pred.get("target_state_centers")
             state_boxes = pred.get("target_state_boxes")
             if state_centers is not None:
@@ -2944,8 +3041,8 @@ def run_online_trajectory(
                     raise RuntimeError("Target-history baseline did not return current Tracker b0.")
                 target_history_boxes.append(predicted_current_tracker_box.copy())
                 target_history_confidences.append(
-                    float(pred["tracker_confidence"].detach().view(-1)[0].cpu().item())
-                    if pred.get("tracker_confidence") is not None
+                    model_tracker_confidence
+                    if model_tracker_confidence is not None
                     else 0.0
                 )
                 keep = max(int(getattr(cfg, "target_history_length", 8)) - 1, 0)
@@ -3059,15 +3156,39 @@ def run_online_trajectory(
                     max_yaw_rate=cfg.max_yaw_rate,
                     max_speed_norm=cfg.max_speed_norm,
                 )
-                if (
-                    args.reuse_last_confident_action_sequence
-                    and ortrack_confidence is not None
-                    and ortrack_confidence >= float(args.tracker_detection_confidence_threshold)
-                    and len(action_sequence_norm) > 0
-                ):
-                    last_confident_action_sequence_norm = action_sequence_norm.copy()
-                    last_confident_action_sequence_physical = action_sequence_physical.copy()
-                    last_confident_action_sequence_index = min(1, len(action_sequence_norm) - 1)
+                if args.reuse_last_confident_action_sequence and len(action_sequence_norm) > 0:
+                    if tracker_detection_missed and last_confident_action_sequence_norm is not None:
+                        sequence_len = int(last_confident_action_sequence_norm.shape[0])
+                        if args.tracker_fallback_action_mode == "first_action":
+                            reused_action_sequence_index = 0
+                        else:
+                            reused_action_sequence_index = min(
+                                last_confident_action_sequence_index, sequence_len - 1
+                            )
+                        action_norm = last_confident_action_sequence_norm[
+                            reused_action_sequence_index
+                        ].copy()
+                        action_physical = last_confident_action_sequence_physical[
+                            reused_action_sequence_index
+                        ].copy()
+                        action_sequence_norm = last_confident_action_sequence_norm[
+                            reused_action_sequence_index:
+                        ].copy()
+                        action_sequence_physical = last_confident_action_sequence_physical[
+                            reused_action_sequence_index:
+                        ].copy()
+                        if args.tracker_fallback_action_mode == "remaining_sequence":
+                            last_confident_action_sequence_index = min(
+                                last_confident_action_sequence_index + 1,
+                                sequence_len - 1,
+                            )
+                        action_source = "last_confident_action_sequence"
+                    elif not tracker_detection_missed:
+                        last_confident_action_sequence_norm = action_sequence_norm.copy()
+                        last_confident_action_sequence_physical = action_sequence_physical.copy()
+                        last_confident_action_sequence_index = min(
+                            1, len(action_sequence_norm) - 1
+                        )
             if "capture_value_selected_index" in pred:
                 capture_value_diagnostics = {
                     "selected_index": int(
@@ -3240,6 +3361,8 @@ def run_online_trajectory(
         if ortrack_bbox is not None:
             step_record["ortrack_bbox_xywh"] = ortrack_bbox
             step_record["ortrack_confidence"] = ortrack_confidence
+        if model_tracker_confidence is not None:
+            step_record["model_tracker_confidence"] = model_tracker_confidence
         if predicted_current_tracker_center is not None:
             step_record["current_target_center_xy"] = (
                 predicted_current_tracker_center.astype(float).tolist()
@@ -3266,13 +3389,14 @@ def run_online_trajectory(
                 step_record["model_driven_search_geometry"] = [
                     int(value) for value in ortrack_result["search_crop_xy_size"]
                 ]
-        if tracker_runtime_enabled and ortrack_confidence is not None:
+        if args.reuse_last_confident_action_sequence:
             step_record["tracker_detection_confidence_threshold"] = float(
                 args.tracker_detection_confidence_threshold
             )
-            step_record["tracker_target_detected"] = bool(
-                ortrack_confidence >= float(args.tracker_detection_confidence_threshold)
+            step_record["tracker_fallback_loss_signal"] = str(
+                args.tracker_fallback_loss_signal
             )
+            step_record["tracker_target_detected"] = not tracker_detection_missed
         if reused_action_sequence_index is not None:
             step_record["reused_action_sequence_index"] = int(reused_action_sequence_index)
         if attention_map_relpath is not None:
@@ -3309,6 +3433,7 @@ def run_online_trajectory(
         steps.append(step_record)
 
         prev_action = torch.from_numpy(action_norm).view(1, -1).to(device).float()
+        previous_action_physical = np.asarray(action_physical, dtype=np.float32).copy()
 
         # The requested success metric is an end-of-trajectory metric: only the
         # final frame counts. Therefore, do not mark prev_done or stop early just
@@ -3422,6 +3547,11 @@ def run_online_trajectory(
         ),
         "tracker_fallback_action_mode": (
             str(args.tracker_fallback_action_mode)
+            if args.reuse_last_confident_action_sequence
+            else None
+        ),
+        "tracker_fallback_loss_signal": (
+            str(args.tracker_fallback_loss_signal)
             if args.reuse_last_confident_action_sequence
             else None
         ),
@@ -3572,7 +3702,12 @@ def parse_args() -> argparse.Namespace:
 
     # Paths
     parser.add_argument("--dataset-root", type=str, required=True, help=f"Collected Dataset root, e.g. {PROJECT_ROOT / 'Dataset'}")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="",
+        help="FastWAM checkpoint. Required only when --policy-backend=fastwam.",
+    )
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--executor-script", type=str, default=str(PROJECT_ROOT / "code/src/executor/trajectory_executor.py"))
     parser.add_argument("--start-sim-server", action="store_true", default=False, help="Start sim_server.py inside this script after the model is loaded.")
@@ -3592,6 +3727,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--summary-shard-id", type=str, default="")
     parser.add_argument("--eval-semantic-signature", type=str, default="standard")
+    parser.add_argument(
+        "--policy-backend",
+        choices=["fastwam", "random", "pi05"],
+        default="fastwam",
+        help="Action policy used by the shared online evaluation environment.",
+    )
+    parser.add_argument("--public-action-horizon", type=int, default=8)
+    parser.add_argument("--pi05-policy-host", type=str, default="127.0.0.1")
+    parser.add_argument("--pi05-policy-port", type=int, default=8000)
 
     # Model config
     parser.add_argument("--tokenizer-name", type=str, default=LOCAL_CLIP_MODEL_PATH)
@@ -3866,6 +4010,16 @@ def parse_args() -> argparse.Namespace:
             "or repeatedly execute its first action."
         ),
     )
+    parser.add_argument(
+        "--tracker-fallback-loss-signal",
+        choices=["confidence", "model_confidence", "geometry_visibility"],
+        default="confidence",
+        help=(
+            "Signal used to activate cached actions. model_confidence uses the "
+            "current model's Tracker detection head; geometry_visibility uses "
+            "simulator state and is only an oracle diagnostic."
+        ),
+    )
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -3898,11 +4052,29 @@ def main() -> None:
     print(f"[device] {device}")
     print(f"[DAGGER_MULTI_WORKER] {os.environ.get('DAGGER_MULTI_WORKER')}")
     print(f"[dataset-root] {args.dataset_root}")
-    print(f"[checkpoint] {args.checkpoint}")
+    print(f"[policy-backend] {args.policy_backend}")
+    print(f"[checkpoint] {args.checkpoint or 'none'}")
 
-    model, cfg = load_model(args, device)
+    public_policy = make_public_policy(args)
+    if args.policy_backend == "fastwam":
+        if not args.checkpoint:
+            raise SystemExit("--checkpoint is required when --policy-backend=fastwam")
+        model, cfg = load_model(args, device)
+    else:
+        model = None
+        cfg = dataclasses.replace(
+            DEFAULT_MODEL_CFG,
+            image_size=int(args.image_size),
+            action_dim=4,
+            action_sequence_horizon=int(args.public_action_horizon),
+            max_vel=float(args.max_vel),
+            max_yaw_rate=float(args.max_yaw_rate),
+            max_speed_norm=float(args.max_speed_norm),
+            use_wan22_encoders=False,
+            use_fastwam_mot=False,
+        )
     tokenizer = None
-    if not cfg.use_wan22_encoders:
+    if args.policy_backend == "fastwam" and not cfg.use_wan22_encoders:
         if CLIPTokenizerFast is None:
             raise ImportError("transformers.CLIPTokenizerFast is required for online instruction tokenization")
         tokenizer = CLIPTokenizerFast.from_pretrained(args.tokenizer_name, local_files_only=True)
@@ -3914,7 +4086,8 @@ def main() -> None:
     # Finish lazy Inductor/CUDA Graph compilation before opening an Unreal scene.
     # Otherwise the first non-attention trajectory compiles while AirSim is live
     # and can starve the camera renderer when both processes share a GPU.
-    warmup_compiled_action_sampler(model, cfg, tokenizer, args, device)
+    if model is not None:
+        warmup_compiled_action_sampler(model, cfg, tokenizer, args, device)
 
     # IMPORTANT: start sim_server/AirSim only after model loading and compile warmup.
     sim_server_proc = start_sim_server_after_model_if_needed(args)
@@ -3984,7 +4157,15 @@ def main() -> None:
             print(f"frames={traj.num_frames}, target_asset={traj.target_asset_name}, jammers={list(traj.jammer_trajs_airsim.keys())}")
             try:
                 summary = run_online_trajectory(
-                    model, cfg, tokenizer, transform, executor, traj, args, device
+                    model,
+                    cfg,
+                    tokenizer,
+                    transform,
+                    executor,
+                    traj,
+                    args,
+                    device,
+                    public_policy=public_policy,
                 )
             except Exception as exc:
                 error_type = type(exc).__name__

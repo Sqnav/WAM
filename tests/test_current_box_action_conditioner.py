@@ -134,6 +134,7 @@ class CurrentBoxActionConditionerTests(unittest.TestCase):
             memory_dim=8,
             memory_layers=1,
             memory_heads=2,
+            layers=(1,),
         )
         head._mot_attention_context_without_ffn = (
             lambda block, attention_io, mixed, context: mixed

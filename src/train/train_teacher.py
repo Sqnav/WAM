@@ -1085,6 +1085,8 @@ def _format_metrics(metrics: Dict[str, float]) -> str:
         "predicted_s0_center_error_pixels",
         "state_to_action_gate_mean",
         "current_box_action_gate_mean",
+        "history_future_center",
+        "history_future_center_error",
         "capture_value",
         "capture_value_ranking_accuracy",
         "capture_value_target_capture",
@@ -1147,6 +1149,8 @@ def _tqdm_train_postfix(avg: Dict[str, float]) -> Dict[str, str]:
         (("predicted_s0_box_error",), "s0_err", False),
         (("state_to_action_gate_mean",), "s2a_gate", False),
         (("current_box_action_gate_mean",), "b0a_gate", False),
+        (("history_future_center",), "hctr", False),
+        (("history_future_center_error",), "hctr_err", False),
         (("capture_value",), "value", False),
         (("capture_value_ranking_accuracy",), "value_acc", False),
         (("fastwam_attention_heatmap",), "hm", False),
@@ -1195,6 +1199,7 @@ def _freeze_for_target_conditioning_adapter_training(
     stage_prefixes = (
         f"{root}history_memory.",
         f"{root}history_adapter.",
+        f"{root}next_center_delta_head.",
     )
     inherited = set(inherited_parameter_names)
     adapter_names = set()
@@ -1246,15 +1251,31 @@ def _wan_latent_cache_stats(
     cache_root: str,
     seq_len: int,
     action_video_freq_ratio: int = 1,
+    max_sample_records: int = 128,
 ) -> Optional[Dict[str, int]]:
     if not cache_root:
         return None
     root = Path(cache_root)
     if not root.exists():
-        return {"records": len(records), "windows": 0, "hits": 0}
+        return {
+            "records": len(records),
+            "sampled_records": 0,
+            "windows": 0,
+            "hits": 0,
+        }
+    sample_count = min(len(records), max(int(max_sample_records), 1))
+    if sample_count < len(records):
+        sample_indices = [
+            (index * (len(records) - 1)) // (sample_count - 1)
+            for index in range(sample_count)
+        ] if sample_count > 1 else [0]
+        sampled_records = [records[index] for index in sample_indices]
+    else:
+        sampled_records = records
+
     windows = 0
     hits = 0
-    for record in records:
+    for record in sampled_records:
         rgb_paths = record.get("rgb_paths") or []
         length = len(rgb_paths)
         starts = range(0, length - seq_len + 1) if length >= seq_len else range(0, 1)
@@ -1269,7 +1290,12 @@ def _wan_latent_cache_stats(
             path = root / scene / traj / f"seq{seq_len}{suffix}_start{start:04d}_end{end:04d}.pt"
             if path.exists():
                 hits += 1
-    return {"records": len(records), "windows": windows, "hits": hits}
+    return {
+        "records": len(records),
+        "sampled_records": len(sampled_records),
+        "windows": windows,
+        "hits": hits,
+    }
 
 
 def _ddp_is_initialized() -> bool:
@@ -1949,6 +1975,17 @@ def main() -> None:
         default=_DEFAULT_CFG.target_history_num_heads,
     )
     parser.add_argument(
+        "--target-history-action-layers",
+        type=int,
+        nargs="+",
+        default=list(_DEFAULT_CFG.target_history_action_layers),
+    )
+    parser.add_argument(
+        "--target-history-future-center-loss-weight",
+        type=float,
+        default=_DEFAULT_CFG.target_history_future_center_loss_weight,
+    )
+    parser.add_argument(
         "--target-history-tracker-cache-root",
         type=str,
         default=_DEFAULT_CFG.target_history_tracker_cache_root,
@@ -2189,6 +2226,12 @@ def main() -> None:
         target_history_hidden_dim=args.target_history_hidden_dim,
         target_history_num_layers=args.target_history_num_layers,
         target_history_num_heads=args.target_history_num_heads,
+        target_history_action_layers=tuple(
+            int(value) for value in args.target_history_action_layers
+        ),
+        target_history_future_center_loss_weight=(
+            args.target_history_future_center_loss_weight
+        ),
         target_history_tracker_cache_root=args.target_history_tracker_cache_root,
         target_conditioning_adapter_only=args.target_conditioning_adapter_only,
         use_capture_value_reranking=args.use_capture_value_reranking,
@@ -2333,7 +2376,9 @@ def main() -> None:
             ratio = (hits / windows) if windows else 0.0
             print(
                 f"[wan-latents] cache_root={args.wan_latent_cache_root} "
-                f"seq_len={args.seq_len} video_ratio={action_video_freq_ratio} hits={hits}/{windows} ({ratio:.1%})"
+                f"seq_len={args.seq_len} video_ratio={action_video_freq_ratio} "
+                f"sampled_records={cache_stats['sampled_records']}/{cache_stats['records']} "
+                f"hits={hits}/{windows} ({ratio:.1%})"
             )
             if windows > 0 and hits == 0:
                 print("[wan-latents] WARNING: no matching cached latents; training will encode RGB videos online.")
@@ -2406,6 +2451,10 @@ def main() -> None:
         require_target_boxes=(
             (cfg.tracker_future_target_alignment and cfg.tracker_center_flow_supervision)
             or cfg.use_future_state_dit
+            or (
+                cfg.use_historical_target_memory
+                and cfg.target_history_future_center_loss_weight > 0.0
+            )
         ),
         tracker_search_crop_jitter=cfg.tracker_search_crop_jitter,
         tracker_search_center_jitter_std=cfg.tracker_search_center_jitter_std,
@@ -2517,6 +2566,10 @@ def main() -> None:
             require_target_boxes=(
                 (cfg.tracker_future_target_alignment and cfg.tracker_center_flow_supervision)
                 or cfg.use_future_state_dit
+                or (
+                    cfg.use_historical_target_memory
+                    and cfg.target_history_future_center_loss_weight > 0.0
+                )
             ),
             tracker_search_crop_jitter=False,
             tracker_search_center_jitter_std=cfg.tracker_search_center_jitter_std,

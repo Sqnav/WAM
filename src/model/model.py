@@ -752,6 +752,7 @@ class TeacherWorldModelDiT(nn.Module):
                     tracker_image_size=encoded.get("tracker_image_size"),
                     target_box_history=target_box_history,
                     target_box_history_valid=target_box_history_valid,
+                    previous_action=prev_actions[:, 0].float(),
                     target_centers=target_centers,
                     target_boxes=target_boxes,
                     target_center_valid=target_center_valid,
@@ -789,6 +790,13 @@ class TeacherWorldModelDiT(nn.Module):
                 ]
                 out["current_box_giou_loss"] = fastwam_out["loss_current_box_giou"]
                 out["current_attention_loss"] = fastwam_out["loss_current_attention"]
+                if fastwam_out.get("loss_history_future_center") is not None:
+                    out["history_future_center_loss"] = fastwam_out[
+                        "loss_history_future_center"
+                    ]
+                    out["history_future_center_error"] = fastwam_out[
+                        "history_future_center_error"
+                    ]
                 if fastwam_out.get("loss_capture_value") is not None:
                     out["capture_value_loss"] = fastwam_out["loss_capture_value"]
                 for key in (

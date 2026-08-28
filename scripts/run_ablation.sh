@@ -65,6 +65,16 @@ eval_root="${EVAL_OUTPUT_ROOT:-$exp_root/online_eval}"
 eval_log_dir="${EVAL_LOG_DIR:-$exp_root/eval_logs}"
 mkdir -p "$exp_root" "$model_root" "$log_dir" "$eval_root" "$eval_log_dir"
 
+# Only one runner may write this experiment tree at a time. Child evaluation
+# workers inherit the descriptor and keep the lock until the run fully exits.
+run_lock_path="$exp_root/.run_ablation.lock"
+exec {run_lock_fd}>"$run_lock_path"
+if ! flock -n "$run_lock_fd"; then
+  echo "[ERROR] Another run_ablation.sh is already using $exp_root" >&2
+  echo "[ERROR] Stop the existing runner instead of launching duplicate validation shards." >&2
+  exit 1
+fi
+
 RUN_TEACHER_ABLATIONS="${RUN_TEACHER_ABLATIONS:-true}"
 RUN_ONLINE_EVAL="${RUN_ONLINE_EVAL:-true}"
 DRY_RUN="${DRY_RUN:-false}"
@@ -90,10 +100,11 @@ CHECKPOINT_SAVE_EVERY_EPOCHS="${CHECKPOINT_SAVE_EVERY_EPOCHS:-1}"
 SAVE_BEST_CHECKPOINT="${SAVE_BEST_CHECKPOINT:-true}"
 SAVE_OPTIMIZER_STATE="${SAVE_OPTIMIZER_STATE:-false}"
 
-EXPERIMENTS="${EXPERIMENTS-fastwam,fastwam_video_current_box_action_aligned,fastwam_current_box_historical_target_memory,fastwam_current_box_capture_value_reranking,fasterwam,fasterwam_video_current_box_action_aligned,fasterwam_current_box_historical_target_memory,fasterwam_current_box_capture_value_reranking}"
+EXPERIMENTS="${EXPERIMENTS-fastwam,fastwam_video_current_box_action_aligned,fastwam_current_box_historical_target_memory,fastwam_current_box_capture_value_reranking,fasterwam}"
 EVAL_EXTRA_EXPERIMENTS="${EVAL_EXTRA_EXPERIMENTS-}"
 SKIP_EXISTING_TRAIN="${SKIP_EXISTING_TRAIN:-true}"
 SKIP_EXISTING_EVAL="${SKIP_EXISTING_EVAL:-true}"
+EVAL_SHARD_RETRIES="${EVAL_SHARD_RETRIES:-3}"
 # The conditioned comparisons use a strict Current Box -> V1 -> V2 hierarchy.
 # Existing checkpoints are reused by default. Set this explicitly to true only
 # when starting a deliberately new retraining generation.
@@ -152,7 +163,7 @@ capture_value_selection_margin="${CAPTURE_VALUE_SELECTION_MARGIN:-0.0}"
 capture_value_min_center_error="${CAPTURE_VALUE_MIN_CENTER_ERROR:-0.30}"
 seq_len="${SEQ_LEN:-9}"
 image_size="${IMAGE_SIZE:-224}"
-num_workers="${NUM_WORKERS:-0}"
+num_workers="${NUM_WORKERS:-4}"
 teacher_lr="${TEACHER_LR:-1e-4}"
 teacher_weight_decay="${TEACHER_WEIGHT_DECAY:-1e-4}"
 
@@ -228,6 +239,7 @@ target_history_length="${TARGET_HISTORY_LENGTH:-8}"
 target_history_hidden_dim="${TARGET_HISTORY_HIDDEN_DIM:-256}"
 target_history_num_layers="${TARGET_HISTORY_NUM_LAYERS:-2}"
 target_history_num_heads="${TARGET_HISTORY_NUM_HEADS:-8}"
+target_history_future_center_loss_weight="${TARGET_HISTORY_FUTURE_CENTER_LOSS_WEIGHT:-0.2}"
 target_history_partial_probability="${TARGET_HISTORY_PARTIAL_PROBABILITY:-0.5}"
 target_history_center_jitter_std="${TARGET_HISTORY_CENTER_JITTER_STD:-0.01}"
 target_history_log_size_jitter_std="${TARGET_HISTORY_LOG_SIZE_JITTER_STD:-0.05}"
@@ -267,7 +279,7 @@ AUTO_SELECT_EVAL_GPUS="${AUTO_SELECT_EVAL_GPUS:-false}"
 TRAIN_GPU_MIN_FREE_MEM_GB="${TRAIN_GPU_MIN_FREE_MEM_GB:-40}"
 EVAL_GPU_MIN_FREE_MEM_GB="${EVAL_GPU_MIN_FREE_MEM_GB:-40}"
 GPU_EXCLUDE_IDS="${GPU_EXCLUDE_IDS:-4,5}"
-EVAL_PARALLEL_JOBS="${EVAL_PARALLEL_JOBS:-4}"
+EVAL_PARALLEL_JOBS="${EVAL_PARALLEL_JOBS:-6}"
 
 select_gpus_by_free_memory() {
   local min_free_gb="$1"
@@ -312,7 +324,7 @@ if [[ -z "$EVAL_GPU_IDS" ]]; then
       exit 1
     fi
   else
-    EVAL_GPU_IDS="0,1,2,3"
+    EVAL_GPU_IDS="0,1,2,3,4,5"
   fi
 fi
 IFS=',' read -ra EVAL_GPU_POOL <<< "$EVAL_GPU_IDS"
@@ -382,6 +394,7 @@ eval_target_crop_action_overlay_output_name="${EVAL_TARGET_CROP_ACTION_OVERLAY_O
 eval_reuse_tracker_action_sequence="${EVAL_REUSE_TRACKER_ACTION_SEQUENCE:-true}"
 eval_tracker_detection_confidence_threshold="${EVAL_TRACKER_DETECTION_CONFIDENCE_THRESHOLD:-0.5}"
 eval_tracker_fallback_action_mode="${EVAL_TRACKER_FALLBACK_ACTION_MODE:-remaining_sequence}"
+eval_tracker_fallback_loss_signal="${EVAL_TRACKER_FALLBACK_LOSS_SIGNAL:-model_confidence}"
 eval_validate_camera_freshness="${EVAL_VALIDATE_CAMERA_FRESHNESS:-true}"
 eval_camera_max_vehicle_distance="${EVAL_CAMERA_MAX_VEHICLE_DISTANCE:-5.0}"
 eval_camera_render_frames="${EVAL_CAMERA_RENDER_FRAMES:-1}"
@@ -537,8 +550,8 @@ experiment_uses_historical_target_memory() {
 
 experiment_uses_target_conditioning_adapter_only() {
   case "$1" in
-    fasterwam_current_box_historical_target_memory) echo "true" ;;
-    fastwam|fastwam_video_current_box_action_aligned|fastwam_current_box_historical_target_memory|fastwam_current_box_capture_value_reranking|fasterwam|fasterwam_video_current_box_action_aligned|fasterwam_current_box_capture_value_reranking) echo "false" ;;
+    fastwam_current_box_historical_target_memory|fasterwam_current_box_historical_target_memory) echo "true" ;;
+    fastwam|fastwam_video_current_box_action_aligned|fastwam_current_box_capture_value_reranking|fasterwam|fasterwam_video_current_box_action_aligned|fasterwam_current_box_capture_value_reranking) echo "false" ;;
     *) validate_experiment_name "$1" ;;
   esac
 }
@@ -560,7 +573,13 @@ experiment_eval_semantic_signature() {
       fi
       echo "capture_actionprior_v12_history_multiaxis_${capture_value_score_mode}_n${capture_value_candidate_count}_m${capture_value_selection_margin}_e${capture_value_min_center_error}_w${capture_action_prior_dimension_weights// /_}_p${prior_fingerprint}"
       ;;
-    fastwam|fastwam_video_current_box_action_aligned|fastwam_current_box_historical_target_memory|fasterwam|fasterwam_video_current_box_action_aligned|fasterwam_current_box_historical_target_memory) echo "standard" ;;
+    fastwam|fastwam_video_current_box_action_aligned|fastwam_current_box_historical_target_memory|fasterwam|fasterwam_video_current_box_action_aligned|fasterwam_current_box_historical_target_memory)
+      if [[ "$(experiment_uses_tracker_fallback "$1")" == "true" ]]; then
+        echo "standard_trackerfallback_${eval_tracker_fallback_loss_signal}_t${eval_tracker_detection_confidence_threshold}_${eval_tracker_fallback_action_mode}"
+      else
+        echo "standard"
+      fi
+      ;;
     *) validate_experiment_name "$1" ;;
   esac
 }
@@ -608,11 +627,21 @@ experiment_tracker_cache_root() {
 
 experiment_init_checkpoint() {
   case "$1" in
-    fastwam|fastwam_video_current_box_action_aligned|fastwam_current_box_historical_target_memory|fasterwam) echo "" ;;
+    fastwam|fastwam_video_current_box_action_aligned|fasterwam) echo "" ;;
+    fastwam_current_box_historical_target_memory) echo "$model_root/fastwam_video_current_box_action_aligned/best.pt" ;;
     fastwam_current_box_capture_value_reranking) echo "$model_root/fastwam_current_box_historical_target_memory/best.pt" ;;
     fasterwam_video_current_box_action_aligned) echo "$model_root/fasterwam/best.pt" ;;
     fasterwam_current_box_historical_target_memory) echo "$model_root/fasterwam_video_current_box_action_aligned/best.pt" ;;
     fasterwam_current_box_capture_value_reranking) echo "$model_root/fasterwam_current_box_historical_target_memory/best.pt" ;;
+    *) validate_experiment_name "$1" ;;
+  esac
+}
+
+experiment_target_history_action_layers() {
+  case "$1" in
+    fastwam_current_box_historical_target_memory|fastwam_current_box_capture_value_reranking) echo "26" ;;
+    fasterwam_current_box_historical_target_memory|fasterwam_current_box_capture_value_reranking) echo "0" ;;
+    fastwam|fastwam_video_current_box_action_aligned|fasterwam|fasterwam_video_current_box_action_aligned) echo "26" ;;
     *) validate_experiment_name "$1" ;;
   esac
 }
@@ -749,6 +778,7 @@ checkpoint_matches_train_config() {
   local expected_model_driven_search="$(experiment_uses_model_driven_tracker_search "$name")"
   local expected_search_jitter="$(experiment_uses_tracker_search_crop_jitter "$name")"
   local expected_box_layers="$(experiment_current_box_action_layers "$name")"
+  local expected_history_action_layers="$(experiment_target_history_action_layers "$name")"
   local expected_batch_size="$(experiment_teacher_batch_size "$name")"
   local expected_init_checkpoint="$(experiment_init_checkpoint "$name")"
 
@@ -761,7 +791,8 @@ checkpoint_matches_train_config() {
     "$action_sequence_horizon" "$action_video_freq_ratio" \
     "$action_yaw_loss_weight" "$target_history_length" \
     "$target_history_hidden_dim" "$target_history_num_layers" \
-    "$target_history_num_heads" "$expected_init_checkpoint" <<'PY'
+    "$target_history_num_heads" "$expected_history_action_layers" \
+    "$target_history_future_center_loss_weight" "$expected_init_checkpoint" <<'PY'
 import math
 import sys
 from pathlib import Path
@@ -791,7 +822,9 @@ expected = {
     "history_dim": int(sys.argv[20]),
     "history_layers": int(sys.argv[21]),
     "history_heads": int(sys.argv[22]),
-    "init_checkpoint": sys.argv[23],
+    "history_action_layers": [int(value) for value in sys.argv[23].split()],
+    "history_center_weight": float(sys.argv[24]),
+    "init_checkpoint": sys.argv[25],
 }
 if not path.is_file():
     raise SystemExit(1)
@@ -854,6 +887,9 @@ if expected["history"]:
         int(cfg.get("target_history_hidden_dim", -1)) == expected["history_dim"],
         int(cfg.get("target_history_num_layers", -1)) == expected["history_layers"],
         int(cfg.get("target_history_num_heads", -1)) == expected["history_heads"],
+        list(cfg.get("target_history_action_layers", []))
+        == expected["history_action_layers"],
+        same_float("target_history_future_center_loss_weight", expected["history_center_weight"]),
         str(Path(str(cfg.get("target_history_tracker_cache_root", ""))).expanduser().resolve())
         == str(Path(expected["tracker_cache"]).expanduser().resolve()),
     ])
@@ -1125,7 +1161,7 @@ main_experiments=${EXPERIMENTS}
 eval_extra_experiments=${EVAL_EXTRA_EXPERIMENTS}
 fastwam=official 30-layer Video DiT + 30-layer Action DiT with MoT mixed attention
 fastwam_video_current_box_action_aligned=independently trained FastWAM plus frozen complete Tracker b0 injected into Action layers 18/23/26/29
-fastwam_current_box_historical_target_memory=independently trained FastWAM with Current Box and horizon-aligned historical target memory
+fastwam_current_box_historical_target_memory=FastWAM Current Box parent plus relative historical target motion, previous-action conditioning, single-layer injection, and next-center auxiliary supervision
 fastwam_current_box_capture_value_reranking=training-free FastWAM shared-KV candidates selected by the frozen CaptureActionPrior
 fasterwam=30-layer FastWAM Video DiT hub + KV-Fusion/RoPE-aligned single-layer DoT Action Head
 fasterwam_video_current_box_action_aligned=Faster-WAM plus frozen complete Tracker b0 injected as an ungated Action-layer-0 residual
@@ -1190,6 +1226,7 @@ target_history_length=${target_history_length}
 target_history_hidden_dim=${target_history_hidden_dim}
 target_history_num_layers=${target_history_num_layers}
 target_history_num_heads=${target_history_num_heads}
+target_history_future_center_loss_weight=${target_history_future_center_loss_weight}
 target_history_partial_probability=${target_history_partial_probability}
 target_history_center_jitter_std=${target_history_center_jitter_std}
 target_history_log_size_jitter_std=${target_history_log_size_jitter_std}
@@ -1289,6 +1326,8 @@ _run_teacher_stage() {
   fi
   local -a current_box_action_layers
   read -r -a current_box_action_layers <<< "$(experiment_current_box_action_layers "$name")"
+  local -a current_target_history_action_layers
+  read -r -a current_target_history_action_layers <<< "$(experiment_target_history_action_layers "$name")"
   local current_tracker_alignment_version
   current_tracker_alignment_version="$(experiment_tracker_alignment_version "$name")"
   local use_tracker_spatial_cross_attention
@@ -1493,6 +1532,8 @@ _run_teacher_stage() {
     --target-history-hidden-dim "$target_history_hidden_dim" \
     --target-history-num-layers "$target_history_num_layers" \
     --target-history-num-heads "$target_history_num_heads" \
+    --target-history-action-layers "${current_target_history_action_layers[@]}" \
+    --target-history-future-center-loss-weight "$target_history_future_center_loss_weight" \
     --target-history-tracker-cache-root "$target_history_tracker_cache_root" \
     --target-history-partial-probability "$target_history_partial_probability" \
     --target-history-center-jitter-std "$target_history_center_jitter_std" \
@@ -1889,6 +1930,7 @@ PY
     extra_eval_args+=(--reuse-last-confident-action-sequence)
     extra_eval_args+=(--tracker-detection-confidence-threshold "$eval_tracker_detection_confidence_threshold")
     extra_eval_args+=(--tracker-fallback-action-mode "$eval_tracker_fallback_action_mode")
+    extra_eval_args+=(--tracker-fallback-loss-signal "$eval_tracker_fallback_loss_signal")
   fi
   if [[ "$eval_camera_only_virtual_uav" == "true" || "$eval_camera_only_virtual_uav" == "1" ]]; then
     extra_eval_args+=(--camera-only-virtual-uav)
@@ -1939,6 +1981,7 @@ PY
   echo "reuse_last_confident_action_sequence=${use_tracker_fallback}" | tee -a "$log_file"
   echo "tracker_detection_confidence_threshold=${eval_tracker_detection_confidence_threshold}" | tee -a "$log_file"
   echo "tracker_fallback_action_mode=${eval_tracker_fallback_action_mode}" | tee -a "$log_file"
+  echo "tracker_fallback_loss_signal=${eval_tracker_fallback_loss_signal}" | tee -a "$log_file"
   echo "camera=$(if [[ "$eval_use_external_camera" == "true" || "$eval_use_external_camera" == "1" ]]; then echo external; else echo onboard; fi)" | tee -a "$log_file"
   echo "validate_camera_freshness=${eval_validate_camera_freshness}" | tee -a "$log_file"
   echo "camera_max_vehicle_distance=${eval_camera_max_vehicle_distance}" | tee -a "$log_file"
@@ -2681,9 +2724,8 @@ prepare_online_eval() {
     eval_gpu_count="$EVAL_PARALLEL_JOBS"
   fi
   IFS=',' read -ra eval_city_merge_order <<< "$eval_scene_list"
-  # Put the longest city shards in the same parallel batch. This keeps the
-  # evaluation set and merged-summary ordering unchanged while preventing the
-  # three 500-trajectory unseen cities from occupying two sequential batches.
+  # Longest-processing-time-first keeps the dynamic GPU queue balanced: long
+  # unseen-city shards start immediately while freed slots consume short cities.
   mapfile -t eval_city_pool < <(
     for city in "${eval_city_merge_order[@]}"; do
       city_range="$(eval_trajectory_range_for_city "$city")"
@@ -2730,20 +2772,26 @@ evaluate_model_online() {
     echo "[eval-skip] ${name}: complete merged summary exists"
     return 0
   fi
-  for ((batch_start=0; batch_start<${#eval_city_pool[@]}; batch_start+=eval_gpu_count)); do
-    eval_pids=()
-    eval_names=()
-    for ((slot=0; slot<eval_gpu_count && batch_start+slot<${#eval_city_pool[@]}; slot++)); do
-      city="${eval_city_pool[batch_start+slot]}"
-      gpu_id="${EVAL_GPU_POOL[slot]}"
-      city_trajectory_range="$(eval_trajectory_range_for_city "$city")"
-      # AirSim scenes occupy 30001, 30002, ... based on the City number.
-      # Keep manager ports in separate 1000-port blocks to avoid colliding
-      # with those scene processes during parallel evaluation.
-      eval_port="$((sim_server_port + slot * 1000))"
-      echo "[eval-dispatch] model=${name} city=${city} range=${city_trajectory_range} gpu=${gpu_id} manager_port=${eval_port}"
-      (
-        run_online_eval \
+  local next_city_index=0
+  local eval_failed=0
+  local -a eval_active_pids=()
+  local -A eval_pid_slots=()
+  local -A eval_pid_names=()
+
+  launch_eval_city() {
+    local slot="$1"
+    local city="$2"
+    local gpu_id="${EVAL_GPU_POOL[slot]}"
+    local city_trajectory_range
+    city_trajectory_range="$(eval_trajectory_range_for_city "$city")"
+    # A GPU slot keeps a stable manager port. run_online_eval stops its AirSim
+    # server before returning, so the next city can safely reuse both resources.
+    local eval_port="$((sim_server_port + slot * 1000))"
+    echo "[eval-dispatch] model=${name} city=${city} range=${city_trajectory_range} gpu=${gpu_id} manager_port=${eval_port}"
+    (
+      local attempt
+      for ((attempt=1; attempt<=EVAL_SHARD_RETRIES; attempt++)); do
+        if run_online_eval \
           "$name" \
           "$ckpt" \
           "$(experiment_uses_diffusion "$name")" \
@@ -2754,22 +2802,68 @@ evaluate_model_online() {
           "$city_trajectory_range" \
           "$gpu_id" \
           "$eval_port" \
-          "$city"
-      ) &
-      eval_pids+=("$!")
-      eval_names+=("${name}/${city}:${city_trajectory_range}")
-    done
-    eval_failed=0
-    for ((job=0; job<${#eval_pids[@]}; job++)); do
-      if ! wait "${eval_pids[job]}"; then
-        echo "[ERROR] Online eval failed: ${eval_names[job]}" >&2
-        eval_failed=1
-      fi
-    done
-    if [[ "$eval_failed" == "1" ]]; then
+          "$city"; then
+          exit 0
+        fi
+        if (( attempt < EVAL_SHARD_RETRIES )); then
+          echo "[eval-shard-retry] ${name}/${city}:${city_trajectory_range} attempt=$((attempt + 1))/${EVAL_SHARD_RETRIES} after failure"
+          sleep 10
+        fi
+      done
+      exit 1
+    ) &
+    local pid="$!"
+    eval_active_pids+=("$pid")
+    eval_pid_slots["$pid"]="$slot"
+    eval_pid_names["$pid"]="${name}/${city}:${city_trajectory_range}"
+  }
+
+  local slot
+  while (( next_city_index < ${#eval_city_pool[@]} && next_city_index < eval_gpu_count )); do
+    slot="$next_city_index"
+    launch_eval_city "$slot" "${eval_city_pool[next_city_index]}"
+    next_city_index=$((next_city_index + 1))
+  done
+
+  while (( ${#eval_active_pids[@]} > 0 )); do
+    local completed_pid=""
+    local completed_status=0
+    if wait -n -p completed_pid "${eval_active_pids[@]}"; then
+      completed_status=0
+    else
+      completed_status="$?"
+    fi
+    if [[ -z "$completed_pid" || -z "${eval_pid_slots[$completed_pid]+x}" ]]; then
+      echo "[ERROR] Dynamic eval scheduler lost a child process." >&2
       return 1
     fi
+    slot="${eval_pid_slots[$completed_pid]}"
+    if (( completed_status != 0 )); then
+      echo "[ERROR] Online eval failed: ${eval_pid_names[$completed_pid]}" >&2
+      eval_failed=1
+    else
+      echo "[eval-slot-free] gpu=${EVAL_GPU_POOL[slot]} completed=${eval_pid_names[$completed_pid]}"
+    fi
+
+    local -a remaining_pids=()
+    local active_pid
+    for active_pid in "${eval_active_pids[@]}"; do
+      if [[ "$active_pid" != "$completed_pid" ]]; then
+        remaining_pids+=("$active_pid")
+      fi
+    done
+    eval_active_pids=("${remaining_pids[@]}")
+    unset 'eval_pid_slots[$completed_pid]' 'eval_pid_names[$completed_pid]'
+
+    if (( next_city_index < ${#eval_city_pool[@]} )); then
+      launch_eval_city "$slot" "${eval_city_pool[next_city_index]}"
+      next_city_index=$((next_city_index + 1))
+    fi
   done
+  unset -f launch_eval_city
+  if (( eval_failed != 0 )); then
+    return 1
+  fi
   merge_city_eval_shards "$eval_root/$name" "$eval_trajectory_range" "${eval_city_merge_order[@]}"
   if ! "$PYTHON_BIN" - "$eval_root/$name/summary.json" <<'PY'
 import json

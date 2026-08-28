@@ -12,6 +12,8 @@ from model.target_action_conditioning import (
     augment_target_box_history,
     make_online_target_box_history,
 )
+from model.config import ModelConfig
+from model.losses import world_model_dit_loss
 from train.train_teacher import _freeze_for_target_conditioning_adapter_training
 
 
@@ -36,6 +38,7 @@ class TargetActionConditioningTests(unittest.TestCase):
             memory_dim=8,
             memory_layers=2,
             memory_heads=2,
+            layers=(3,),
         )
 
     def test_online_history_is_right_aligned_and_excludes_current_box(self) -> None:
@@ -86,6 +89,7 @@ class TargetActionConditioningTests(unittest.TestCase):
             previous_valid=self.valid,
             current_box=self.current_box,
             current_confidence=self.current_confidence,
+            previous_action=torch.zeros(self.batch_size, 4),
         )
 
         self.assertEqual(conditions["history"].shape, (self.batch_size, 8, 16))
@@ -99,6 +103,7 @@ class TargetActionConditioningTests(unittest.TestCase):
             previous_valid=self.valid,
             current_box=self.current_box,
             current_confidence=self.current_confidence,
+            previous_action=torch.zeros(self.batch_size, 4),
         )
         hidden = torch.randn(self.batch_size, self.horizon, 16)
         residual = conditioner.residual(hidden, conditions)
@@ -106,6 +111,50 @@ class TargetActionConditioningTests(unittest.TestCase):
         self.assertEqual(conditions["history"].dtype, torch.bfloat16)
         self.assertEqual(residual.dtype, hidden.dtype)
         self.assertTrue(torch.isfinite(residual).all())
+
+    def test_history_features_are_relative_to_current_box(self) -> None:
+        memory = HistoricalTargetMemory(
+            action_hidden_dim=16,
+            history_length=8,
+            horizon=8,
+            memory_dim=8,
+            num_layers=1,
+            num_heads=2,
+        )
+        previous = torch.zeros(1, 7, 5)
+        previous[0, -1] = torch.tensor([0.4, 0.6, 0.2, 0.3, 0.9])
+        valid = torch.zeros(1, 7, dtype=torch.bool)
+        valid[0, -1] = True
+        features, _ = memory._features(
+            previous,
+            valid,
+            torch.tensor([[0.5, 0.7, 0.2, 0.3]]),
+            torch.tensor([[0.8]]),
+        )
+
+        torch.testing.assert_close(features[0, -1, :4], torch.zeros(4))
+        torch.testing.assert_close(
+            features[0, -2, :2], torch.tensor([-0.1, -0.1])
+        )
+
+    def test_previous_action_changes_history_condition(self) -> None:
+        conditioner = self.make_conditioner()
+        common = {
+            "previous_history": self.history,
+            "previous_valid": self.valid,
+            "current_box": self.current_box,
+            "current_confidence": self.current_confidence,
+        }
+        zero = conditioner.build_conditions(
+            **common, previous_action=torch.zeros(self.batch_size, 4)
+        )["history"]
+        moving = conditioner.build_conditions(
+            **common, previous_action=torch.ones(self.batch_size, 4)
+        )["history"]
+
+        self.assertFalse(torch.allclose(zero, moving))
+        self.assertFalse(conditioner.enabled_at(2))
+        self.assertTrue(conditioner.enabled_at(3))
 
     def test_history_augmentation_preserves_padding(self) -> None:
         history = self.history.clone()
@@ -138,6 +187,7 @@ class TargetActionConditioningTests(unittest.TestCase):
         self.assertTrue(
             all(
                 "history_memory." in name or "history_adapter." in name
+                or "next_center_delta_head." in name
                 for name in trainable
             )
         )
@@ -148,6 +198,25 @@ class TargetActionConditioningTests(unittest.TestCase):
                 if name.startswith("inherited_policy.")
             )
         )
+
+    def test_future_center_auxiliary_is_added_to_fastwam_loss(self) -> None:
+        cfg = ModelConfig(
+            use_fastwam_mot=True,
+            use_historical_target_memory=True,
+            target_history_future_center_loss_weight=0.2,
+            x0_action_loss_weight=0.0,
+        )
+        outputs = {
+            "feat": torch.zeros(1),
+            "video_flow_loss": torch.tensor(2.0),
+            "policy_flow_loss": torch.tensor(3.0),
+            "history_future_center_loss": torch.tensor(0.5),
+        }
+        batch = {"expert_action": torch.zeros(1, 2, 4)}
+
+        losses = world_model_dit_loss(outputs, batch, cfg)
+
+        torch.testing.assert_close(losses["total"], torch.tensor(5.1))
 
 if __name__ == "__main__":
     unittest.main()

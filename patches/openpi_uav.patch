@@ -1,0 +1,616 @@
+diff --git a/examples/uav/compute_uav_norm_stats.py b/examples/uav/compute_uav_norm_stats.py
+new file mode 100644
+index 0000000..ef4ab19
+--- /dev/null
++++ b/examples/uav/compute_uav_norm_stats.py
+@@ -0,0 +1,90 @@
++"""Compute UAV state/action normalization stats without decoding RGB images."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import numpy as np
++import pyarrow.parquet as pq
++import tyro
++
++from openpi.shared import normalize
++
++
++def _fixed_size_list_to_numpy(column, width: int) -> np.ndarray:
++    values = column.combine_chunks().values.to_numpy(zero_copy_only=False)
++    return np.asarray(values, dtype=np.float32).reshape(-1, width)
++
++
++def main(
++    dataset_dir: str,
++    output_dir: str,
++    *,
++    action_horizon: int = 8,
++    batch_size: int = 48,
++) -> None:
++    dataset_path = Path(dataset_dir).expanduser().resolve()
++    parquet_files = sorted((dataset_path / "data").rglob("*.parquet"))
++    if not parquet_files:
++        raise FileNotFoundError(f"No parquet episodes found under {dataset_path / 'data'}")
++
++    stats = {
++        "state": normalize.RunningStats(),
++        "actions": normalize.RunningStats(),
++    }
++    state_buffer: list[np.ndarray] = []
++    action_buffer: list[np.ndarray] = []
++    buffered = 0
++    processed_frames = 0
++
++    def flush_full_batches() -> None:
++        nonlocal state_buffer, action_buffer, buffered
++        if buffered < batch_size:
++            return
++        states = np.concatenate(state_buffer, axis=0)
++        actions = np.concatenate(action_buffer, axis=0)
++        full_count = states.shape[0] // batch_size * batch_size
++        for start in range(0, full_count, batch_size):
++            stop = start + batch_size
++            stats["state"].update(states[start:stop])
++            stats["actions"].update(actions[start:stop])
++        state_buffer = [states[full_count:]] if full_count < states.shape[0] else []
++        action_buffer = [actions[full_count:]] if full_count < actions.shape[0] else []
++        buffered = states.shape[0] - full_count
++
++    for episode_index, path in enumerate(parquet_files):
++        table = pq.read_table(path, columns=["state", "action"])
++        states = _fixed_size_list_to_numpy(table.column("state"), 4)
++        actions = _fixed_size_list_to_numpy(table.column("action"), 4)
++        if states.shape[0] == 0:
++            continue
++        horizon_indices = np.minimum(
++            np.arange(states.shape[0])[:, None] + np.arange(action_horizon)[None, :],
++            states.shape[0] - 1,
++        )
++        action_chunks = actions[horizon_indices]
++        state_buffer.append(states)
++        action_buffer.append(action_chunks)
++        buffered += states.shape[0]
++        processed_frames += states.shape[0]
++        flush_full_batches()
++        if (episode_index + 1) % 1000 == 0:
++            print(
++                f"[uav-norm] episodes={episode_index + 1}/{len(parquet_files)} "
++                f"frames={processed_frames}",
++                flush=True,
++            )
++
++    # Match OpenPI's TorchDataLoader behavior: it uses len(dataset) // batch_size
++    # complete batches and drops the final incomplete batch.
++    norm_stats = {key: value.get_statistics() for key, value in stats.items()}
++    normalize.save(Path(output_dir).expanduser().resolve(), norm_stats)
++    print(
++        f"[uav-norm] complete episodes={len(parquet_files)} "
++        f"frames={processed_frames} dropped_tail={buffered} output={output_dir}",
++        flush=True,
++    )
++
++
++if __name__ == "__main__":
++    tyro.cli(main)
+diff --git a/examples/uav/convert_uav_data_to_lerobot.py b/examples/uav/convert_uav_data_to_lerobot.py
+new file mode 100644
+index 0000000..b68ab64
+--- /dev/null
++++ b/examples/uav/convert_uav_data_to_lerobot.py
+@@ -0,0 +1,225 @@
++"""Convert the Worldmodel UAV pursuit demonstrations to LeRobot format."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import shutil
++
++from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
++from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
++from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
++import numpy as np
++import tyro
++
++
++REPO_ID = "worldmodel/uav_pursuit_city1_27_train"
++
++
++def _action(frame: dict) -> np.ndarray:
++    delta = frame["body_frame_delta"]
++    return np.asarray(
++        [delta["x"], delta["y"], delta["z"], frame["body_frame_yaw_delta"]],
++        dtype=np.float32,
++    )
++
++
++def _open_for_append(repo_id: str, output_path: Path) -> LeRobotDataset:
++    """Open a locally recorded dataset without rescanning embedded image bytes."""
++    dataset = LeRobotDataset.__new__(LeRobotDataset)
++    dataset.meta = LeRobotDatasetMetadata(repo_id=repo_id, root=output_path)
++    dataset.repo_id = repo_id
++    dataset.root = output_path
++    dataset.revision = None
++    dataset.tolerance_s = 1e-4
++    dataset.image_writer = None
++    dataset.episodes = None
++    dataset.hf_dataset = dataset.create_hf_dataset()
++    dataset.image_transforms = None
++    dataset.delta_timestamps = None
++    dataset.delta_indices = None
++    dataset.episode_data_index = None
++    dataset.video_backend = None
++    dataset.episode_buffer = dataset.create_episode_buffer()
++    return dataset
++
++
++def main(
++    dataset_root: str,
++    *,
++    scene_start: int = 1,
++    scene_end: int = 27,
++    trajectory_start: int = 1,
++    trajectory_end: int = 450,
++    repo_id: str = REPO_ID,
++    overwrite: bool = False,
++    resume: bool = False,
++) -> None:
++    dataset_root_path = Path(dataset_root).expanduser().resolve()
++    output_path = HF_LEROBOT_HOME / repo_id
++    completion_path = output_path / ".worldmodel_complete.json"
++    progress_path = output_path / ".worldmodel_progress.json"
++    if overwrite and resume:
++        raise ValueError("--overwrite and --resume are mutually exclusive")
++
++    skipped_trajectories: list[str] = []
++    source_cursor = 0
++    if output_path.exists():
++        if completion_path.is_file() and not overwrite:
++            print(f"[uav-convert] reuse existing dataset: {output_path}")
++            return
++        if resume:
++            if progress_path.is_file():
++                progress = json.loads(progress_path.read_text(encoding="utf-8"))
++                skipped_trajectories = list(progress.get("skipped_trajectories", []))
++                source_cursor = int(progress.get("source_cursor", 0))
++            dataset = _open_for_append(repo_id, output_path)
++            # Metadata is committed after every parquet file. It is therefore
++            # authoritative if the process stopped after saving an episode but
++            # before updating the lightweight source progress marker.
++            source_cursor = max(
++                source_cursor,
++                dataset.meta.total_episodes + len(skipped_trajectories),
++            )
++            dataset.episode_buffer = dataset.create_episode_buffer()
++            print(
++                f"[uav-convert] resume output={output_path} "
++                f"episodes={dataset.meta.total_episodes} source_cursor={source_cursor}",
++                flush=True,
++            )
++        elif not overwrite:
++            raise RuntimeError(
++                f"Incomplete UAV LeRobot dataset exists at {output_path}; "
++                "rerun with --resume or --overwrite."
++            )
++        else:
++            shutil.rmtree(output_path)
++
++    if not output_path.exists():
++        dataset = LeRobotDataset.create(
++            repo_id=repo_id,
++            robot_type="uav_body_velocity",
++            fps=1,
++            features={
++                "image": {
++                    "dtype": "image",
++                    "shape": (640, 640, 3),
++                    "names": ["height", "width", "channel"],
++                },
++                "state": {
++                    "dtype": "float32",
++                    "shape": (4,),
++                    "names": ["previous_vx", "previous_vy", "previous_vz", "previous_yaw_rate"],
++                },
++                "action": {
++                    "dtype": "float32",
++                    "shape": (4,),
++                    "names": ["vx", "vy", "vz", "yaw_rate"],
++                },
++            },
++            image_writer_threads=16,
++            image_writer_processes=8,
++        )
++
++    episode_count = dataset.meta.total_episodes
++    frame_count = dataset.meta.total_frames
++    source_ordinal = 0
++    for city_index in range(scene_start, scene_end + 1):
++        scene_id = f"City_{city_index}"
++        for trajectory_index in range(trajectory_start, trajectory_end + 1):
++            trajectory_dir = dataset_root_path / scene_id / f"trajectory_{trajectory_index:04d}"
++            if source_ordinal < source_cursor:
++                source_ordinal += 1
++                continue
++            trajectory_path = trajectory_dir / "uav_trajectory.json"
++            instruction_path = trajectory_dir / "instruction.json"
++            if not trajectory_path.is_file():
++                raise FileNotFoundError(trajectory_path)
++            trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
++            instruction = (
++                json.loads(instruction_path.read_text(encoding="utf-8"))
++                if instruction_path.is_file()
++                else trajectory
++            )
++            prompt = str(
++                instruction.get("instruction")
++                or instruction.get("instructions")
++                or "Track and approach the target UAV while avoiding collisions."
++            )
++            frames = trajectory["trajectory"]
++            previous_action = np.zeros(4, dtype=np.float32)
++            episode_buffer = dataset.create_episode_buffer()
++            for frame_index, frame in enumerate(frames):
++                # The terminal frame has no transition to supervise. Excluding it
++                # avoids teaching an artificial stop action at every episode end.
++                if frame.get("body_frame_delta") is None or frame.get("body_frame_yaw_delta") is None:
++                    continue
++                image_path = trajectory_dir / "rgb" / f"frame_{frame_index:05d}.png"
++                if not image_path.is_file():
++                    raise FileNotFoundError(image_path)
++                action = _action(frame)
++                local_frame_index = int(episode_buffer["size"])
++                episode_buffer["frame_index"].append(local_frame_index)
++                episode_buffer["timestamp"].append(local_frame_index / dataset.fps)
++                episode_buffer["image"].append(str(image_path))
++                episode_buffer["state"].append(previous_action.copy())
++                episode_buffer["action"].append(action)
++                episode_buffer["task"].append(prompt)
++                episode_buffer["size"] += 1
++                previous_action = action
++                frame_count += 1
++            if int(episode_buffer["size"]) == 0:
++                trajectory_key = f"{scene_id}/{trajectory_dir.name}"
++                skipped_trajectories.append(trajectory_key)
++                source_ordinal += 1
++                source_cursor = source_ordinal
++                tmp_path = progress_path.with_suffix(".json.tmp")
++                tmp_path.write_text(
++                    json.dumps(
++                        {
++                            "source_cursor": source_cursor,
++                            "episodes": episode_count,
++                            "frames": frame_count,
++                            "skipped_trajectories": skipped_trajectories,
++                        },
++                        indent=2,
++                    ),
++                    encoding="utf-8",
++                )
++                tmp_path.replace(progress_path)
++                print(f"[uav-convert] skip empty trajectory: {trajectory_key}", flush=True)
++                continue
++            # The Hugging Face image feature embeds these source paths directly
++            # into parquet. Avoiding an intermediate decoded/re-encoded PNG copy
++            # materially reduces conversion time and temporary disk usage.
++            dataset.episode_buffer = episode_buffer
++            dataset.save_episode()
++            episode_count += 1
++            source_ordinal += 1
++            source_cursor = source_ordinal
++            if episode_count % 100 == 0:
++                print(
++                    f"[uav-convert] episodes={episode_count} frames={frame_count} "
++                    f"last={scene_id}/{trajectory_dir.name}",
++                    flush=True,
++                )
++
++    completion_path.write_text(
++        json.dumps(
++            {
++                "scene_range": [scene_start, scene_end],
++                "trajectory_range": [trajectory_start, trajectory_end],
++                "episodes": episode_count,
++                "frames": frame_count,
++                "source_trajectories": source_cursor,
++                "skipped_trajectories": skipped_trajectories,
++            },
++            indent=2,
++        ),
++        encoding="utf-8",
++    )
++    print(f"[uav-convert] complete output={output_path} episodes={episode_count} frames={frame_count}")
++
++
++if __name__ == "__main__":
++    tyro.cli(main)
+diff --git a/src/openpi/policies/uav_policy.py b/src/openpi/policies/uav_policy.py
+new file mode 100644
+index 0000000..755cd4e
+--- /dev/null
++++ b/src/openpi/policies/uav_policy.py
+@@ -0,0 +1,52 @@
++import dataclasses
++
++import numpy as np
++
++from openpi import transforms
++from openpi.models import model as _model
++
++
++def _parse_image(image) -> np.ndarray:
++    image = np.asarray(image)
++    if np.issubdtype(image.dtype, np.floating):
++        image = np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
++    if image.ndim != 3:
++        raise ValueError(f"UAV RGB observation must be HWC or CHW, got {image.shape}")
++    if image.shape[0] == 3 and image.shape[-1] != 3:
++        image = np.moveaxis(image, 0, -1)
++    if image.shape[-1] != 3:
++        raise ValueError(f"UAV RGB observation must have three channels, got {image.shape}")
++    return image.astype(np.uint8, copy=False)
++
++
++@dataclasses.dataclass(frozen=True)
++class UAVInputs(transforms.DataTransformFn):
++    model_type: _model.ModelType
++
++    def __call__(self, data: dict) -> dict:
++        image = _parse_image(data["observation/image"])
++        state = np.asarray(data["observation/state"], dtype=np.float32).reshape(4)
++        inputs = {
++            "state": state,
++            "image": {
++                "base_0_rgb": image,
++                "left_wrist_0_rgb": np.zeros_like(image),
++                "right_wrist_0_rgb": np.zeros_like(image),
++            },
++            "image_mask": {
++                "base_0_rgb": np.True_,
++                "left_wrist_0_rgb": np.False_,
++                "right_wrist_0_rgb": np.False_,
++            },
++        }
++        if "actions" in data:
++            inputs["actions"] = np.asarray(data["actions"], dtype=np.float32)
++        if "prompt" in data:
++            inputs["prompt"] = str(data["prompt"])
++        return inputs
++
++
++@dataclasses.dataclass(frozen=True)
++class UAVOutputs(transforms.DataTransformFn):
++    def __call__(self, data: dict) -> dict:
++        return {"actions": np.asarray(data["actions"], dtype=np.float32)[..., :4]}
+diff --git a/src/openpi/shared/download.py b/src/openpi/shared/download.py
+index 582f839..70990d1 100644
+--- a/src/openpi/shared/download.py
++++ b/src/openpi/shared/download.py
+@@ -9,6 +9,7 @@ import stat
+ import subprocess
+ import time
+ import urllib.parse
++import urllib.request
+ 
+ import filelock
+ import fsspec
+@@ -129,9 +130,107 @@ def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
+         total_size = fs.du(url)
+     else:
+         total_size = info["size"]
++    def download() -> None:
++        if not is_dir:
++            fs.get(url, local_path, recursive=False)
++            return
++
++        remote_root = f"{urllib.parse.urlparse(url).netloc}/{urllib.parse.urlparse(url).path.strip('/')}"
++        entries = fs.find(url, detail=True)
++        workers = max(1, int(os.getenv("OPENPI_DOWNLOAD_WORKERS", "24")))
++        segment_size = max(1024 * 1024, int(os.getenv("OPENPI_DOWNLOAD_SEGMENT_BYTES", str(8 * 1024 * 1024))))
++        segmented_files: list[tuple[pathlib.Path, pathlib.Path, int, int]] = []
++        segment_sources: list[tuple[str, pathlib.Path, int, int]] = []
++
++        def download_segment(remote_path: str, part_path: pathlib.Path, start: int, end: int) -> None:
++            expected_size = end - start
++            if part_path.is_file() and part_path.stat().st_size == expected_size:
++                return
++            data = None
++            for attempt in range(5):
++                try:
++                    if urllib.parse.urlparse(url).scheme == "gs":
++                        bucket, object_path = remote_path.split("/", 1)
++                        object_url = f"https://{bucket}.storage.googleapis.com/{urllib.parse.quote(object_path)}"
++                        request = urllib.request.Request(
++                            object_url,
++                            headers={"Range": f"bytes={start}-{end - 1}"},
++                        )
++                        with urllib.request.urlopen(request, timeout=120) as response:
++                            data = response.read()
++                    else:
++                        data = fs.cat_file(remote_path, start=start, end=end)
++                    if len(data) != expected_size:
++                        raise IOError(
++                            f"Short ranged download for {remote_path}: "
++                            f"expected {expected_size} bytes, got {len(data)}"
++                        )
++                    break
++                except Exception:
++                    if attempt == 4:
++                        raise
++                    time.sleep(2**attempt)
++            assert data is not None
++            part_path.write_bytes(data)
++
++        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
++            futures = []
++            for remote_path, info in entries.items():
++                if info.get("type") == "directory":
++                    continue
++                relative_path = pathlib.PurePosixPath(remote_path).relative_to(remote_root)
++                destination = local_path / pathlib.Path(*relative_path.parts)
++                destination.parent.mkdir(parents=True, exist_ok=True)
++                expected_size = int(info.get("size", -1))
++                if destination.is_file() and destination.stat().st_size == expected_size:
++                    continue
++                if destination.exists():
++                    destination.unlink()
++                if expected_size <= segment_size:
++                    futures.append(pool.submit(fs.get_file, remote_path, destination))
++                    continue
++                parts_dir = destination.with_name(f"{destination.name}.parts")
++                parts_dir.mkdir(parents=True, exist_ok=True)
++                segment_count = (expected_size + segment_size - 1) // segment_size
++                segmented_files.append((destination, parts_dir, segment_count, expected_size))
++                segment_sources.append((remote_path, parts_dir, segment_count, expected_size))
++
++            # Interleave objects so per-object throttling cannot serialize a
++            # multi-object checkpoint download.
++            max_segment_count = max((item[2] for item in segment_sources), default=0)
++            for segment_index in range(max_segment_count):
++                for remote_path, parts_dir, segment_count, expected_size in segment_sources:
++                    if segment_index >= segment_count:
++                        continue
++                    start = segment_index * segment_size
++                    end = min(start + segment_size, expected_size)
++                    futures.append(
++                        pool.submit(
++                            download_segment,
++                            remote_path,
++                            parts_dir / f"{segment_index:06d}.part",
++                            start,
++                            end,
++                        )
++                    )
++            for future in concurrent.futures.as_completed(futures):
++                future.result()
++
++        for destination, parts_dir, segment_count, expected_size in segmented_files:
++            with destination.open("wb") as output_file:
++                for segment_index in range(segment_count):
++                    with (parts_dir / f"{segment_index:06d}.part").open("rb") as part_file:
++                        shutil.copyfileobj(part_file, output_file)
++            if destination.stat().st_size != expected_size:
++                raise IOError(
++                    f"Merged download for {destination} has {destination.stat().st_size} bytes, "
++                    f"expected {expected_size}"
++                )
++            shutil.rmtree(parts_dir)
++
+     with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024) as pbar:
+         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+-        future = executor.submit(fs.get, url, local_path, recursive=is_dir)
++        future = executor.submit(download)
+         while not future.done():
+             current_size = sum(f.stat().st_size for f in [*local_path.rglob("*"), local_path] if f.is_file())
+             pbar.update(current_size - pbar.n)
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..4c86ac4 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -5,6 +5,7 @@ from collections.abc import Sequence
+ import dataclasses
+ import difflib
+ import logging
++import os
+ import pathlib
+ from typing import Any, Literal, Protocol, TypeAlias
+ 
+@@ -20,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
+ import openpi.policies.aloha_policy as aloha_policy
+ import openpi.policies.droid_policy as droid_policy
+ import openpi.policies.libero_policy as libero_policy
++import openpi.policies.uav_policy as uav_policy
+ import openpi.shared.download as _download
+ import openpi.shared.normalize as _normalize
+ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+@@ -355,6 +357,39 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
+         )
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class LeRobotUAVDataConfig(DataConfigFactory):
++    """Current FPV RGB + previous executed action -> UAV action chunk."""
++
++    action_sequence_keys: Sequence[str] = ("action",)
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        repack_transform = _transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "observation/image": "image",
++                        "observation/state": "state",
++                        "actions": "action",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++        data_transforms = _transforms.Group(
++            inputs=[uav_policy.UAVInputs(model_type=model_config.model_type)],
++            outputs=[uav_policy.UAVOutputs()],
++        )
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=repack_transform,
++            data_transforms=data_transforms,
++            model_transforms=ModelTransformFactory()(model_config),
++            action_sequence_keys=self.action_sequence_keys,
++        )
++
++
+ @dataclasses.dataclass(frozen=True)
+ class RLDSDroidDataConfig(DataConfigFactory):
+     """
+@@ -761,6 +796,49 @@ _CONFIGS = [
+         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+         num_train_steps=30_000,
+     ),
++    TrainConfig(
++        name="pi05_uav_lora",
++        project_name="openpi-uav",
++        assets_base_dir=os.environ.get("OPENPI_UAV_ASSETS_DIR", "./assets"),
++        checkpoint_base_dir=os.environ.get("OPENPI_UAV_CHECKPOINT_DIR", "./checkpoints"),
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_dim=32,
++            action_horizon=8,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        data=LeRobotUAVDataConfig(
++            repo_id="worldmodel/uav_pursuit_city1_27_train",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            "gs://openpi-assets/checkpoints/pi05_base/params"
++        ),
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_dim=32,
++            action_horizon=8,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=30_000,
++            decay_lr=5e-6,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        ema_decay=None,
++        batch_size=48,
++        num_workers=8,
++        num_train_steps=30_000,
++        log_interval=50,
++        save_interval=5_000,
++        keep_period=10_000,
++        wandb_enabled=False,
++        policy_metadata={"platform": "uav", "action_dim": 4, "action_horizon": 8},
++    ),
+     #
+     # Fine-tuning Aloha configs.
+     #

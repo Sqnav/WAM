@@ -176,6 +176,12 @@ def world_model_dit_loss(
     losses["current_center"] = outputs.get("current_center_loss", z)
     losses["future_center"] = outputs.get("future_center_loss", z)
     losses["center_transition"] = outputs.get("center_transition_loss", z)
+    losses["history_future_center"] = outputs.get(
+        "history_future_center_loss", z
+    )
+    losses["history_future_center_error"] = outputs.get(
+        "history_future_center_error", z
+    )
     losses["box_l1"] = outputs.get("box_l1_loss", z)
     losses["box_giou"] = outputs.get("box_giou_loss", z)
     losses["state_flow"] = outputs.get("state_flow_loss", z)
@@ -292,6 +298,10 @@ def world_model_dit_loss(
             total = total + float(getattr(cfg, "fastwam_lambda_action", 1.0)) * losses["action"]
             total = total + float(getattr(cfg, "fastwam_lambda_video", 1.0)) * losses["video"]
             total = total + float(getattr(cfg, "x0_action_loss_weight", 0.0)) * losses["x0_action"]
+            if bool(getattr(cfg, "use_historical_target_memory", False)):
+                total = total + float(
+                    getattr(cfg, "target_history_future_center_loss_weight", 0.2)
+                ) * losses["history_future_center"]
             if bool(getattr(cfg, "tracker_center_flow_supervision", False)):
                 total = total + float(getattr(cfg, "tracker_center_flow_loss_weight", 0.1)) * losses["center_flow"]
         if bool(getattr(cfg, "use_capture_value_reranking", False)):

@@ -1011,7 +1011,23 @@ class FastWAMHead(nn.Module):
                 memory_dim=int(getattr(cfg, "target_history_hidden_dim", 256)),
                 memory_layers=int(getattr(cfg, "target_history_num_layers", 2)),
                 memory_heads=int(getattr(cfg, "target_history_num_heads", 8)),
+                layers=tuple(
+                    int(layer)
+                    for layer in getattr(cfg, "target_history_action_layers", (26,))
+                ),
             ).to(dtype=self.torch_dtype)
+            if self.dot is not None:
+                if self.target_action_conditioning.layers != (0,):
+                    raise ValueError(
+                        "FasterWAM Historical Target Memory must inject at DoT layer 0."
+                    )
+            elif not set(self.target_action_conditioning.layers).issubset(
+                set(self.current_box_action_conditioner.layers)
+            ):
+                raise ValueError(
+                    "FastWAM historical injection layers must be a subset of "
+                    "current_box_action_layers."
+                )
         if self.capture_value_reranking_enabled:
             if self.current_box_action_conditioner is None:
                 raise ValueError(
@@ -1751,7 +1767,10 @@ class FastWAMHead(nn.Module):
                 action_mid = action_mid + self.current_box_action_conditioner.delta(
                     layer_idx, action_mid, box_feature
                 )
-                if self.target_action_conditioning is not None:
+                if (
+                    self.target_action_conditioning is not None
+                    and self.target_action_conditioning.enabled_at(layer_idx)
+                ):
                     if target_conditions is None:
                         raise RuntimeError(
                             "Historical Target Memory conditions were not constructed."
@@ -2252,6 +2271,7 @@ class FastWAMHead(nn.Module):
         tracker_image_size: Optional[torch.Tensor] = None,
         target_box_history: Optional[torch.Tensor] = None,
         target_box_history_valid: Optional[torch.Tensor] = None,
+        previous_action: Optional[torch.Tensor] = None,
         target_centers: Optional[torch.Tensor] = None,
         target_boxes: Optional[torch.Tensor] = None,
         target_center_valid: Optional[torch.Tensor] = None,
@@ -2498,6 +2518,7 @@ class FastWAMHead(nn.Module):
                 previous_valid=target_box_history_valid,
                 current_box=current_target["current_box"],
                 current_confidence=tracker_confidence,
+                previous_action=previous_action,
             )
         if self.dot is not None:
             if capture_attention:
@@ -2527,7 +2548,10 @@ class FastWAMHead(nn.Module):
                     delta = self.current_box_action_conditioner.delta(
                         0, hidden, box_feature
                     )
-                    if self.target_action_conditioning is not None:
+                    if (
+                        self.target_action_conditioning is not None
+                        and self.target_action_conditioning.enabled_at(0)
+                    ):
                         assert target_conditions is not None
                         delta = delta + self.target_action_conditioning.residual(
                             hidden, target_conditions
@@ -2678,6 +2702,56 @@ class FastWAMHead(nn.Module):
         predicted_s0_box_error = video_latents.sum() * 0.0
         predicted_s0_center_error_pixels = video_latents.sum() * 0.0
         predicted_future_state_error = video_latents.sum() * 0.0
+        loss_history_future_center = video_latents.sum() * 0.0
+        history_future_center_error = video_latents.sum() * 0.0
+        if self.target_action_conditioning is not None:
+            if target_conditions is None:
+                raise RuntimeError("Historical target conditions were not constructed.")
+            predicted_delta = target_conditions.get("next_center_delta")
+            if predicted_delta is None or predicted_delta.shape != (b, 2):
+                raise RuntimeError("Historical target next-center prediction is invalid.")
+            if (
+                target_boxes is None
+                or target_boxes.ndim != 3
+                or target_boxes.size(0) != b
+                or target_boxes.size(1) < 2
+                or target_boxes.size(2) != 4
+            ):
+                raise ValueError(
+                    "Historical target auxiliary supervision requires at least two "
+                    "normalized target boxes [B,T,4]."
+                )
+            if (
+                target_center_valid is None
+                or target_center_valid.ndim not in (2, 3)
+                or target_center_valid.size(0) != b
+                or target_center_valid.size(1) < 2
+            ):
+                raise ValueError(
+                    "Historical target auxiliary supervision requires target validity [B,T]."
+                )
+            target_delta = (
+                target_boxes[:, 1, :2] - target_boxes[:, 0, :2]
+            ).to(predicted_delta)
+            center_valid = target_center_valid
+            if center_valid.ndim == 3:
+                center_valid = center_valid[..., 0]
+            center_valid = center_valid[:, 0].bool() & center_valid[:, 1].bool()
+            if valid_mask is not None:
+                if valid_mask.ndim != 2 or valid_mask.size(1) < 2:
+                    raise ValueError("Historical target loss requires valid_mask [B,T>=2].")
+                center_valid = center_valid & valid_mask[:, 0].bool() & valid_mask[:, 1].bool()
+            valid_float = center_valid.to(predicted_delta)
+            per_sample = F.smooth_l1_loss(
+                predicted_delta.float(), target_delta.float(), reduction="none"
+            ).mean(dim=-1)
+            loss_history_future_center = (
+                per_sample * valid_float.float()
+            ).sum() / valid_float.float().sum().clamp_min(1.0)
+            absolute_error = (predicted_delta.float() - target_delta.float()).abs().mean(dim=-1)
+            history_future_center_error = (
+                absolute_error * valid_float.float()
+            ).sum() / valid_float.float().sum().clamp_min(1.0)
         predicted_state_boxes_v4 = None
         predicted_relative_states = None
         if self.state_expert is not None:
@@ -2827,6 +2901,8 @@ class FastWAMHead(nn.Module):
             "loss_current_center_spatial": loss_current_center_spatial,
             "loss_current_box_giou": loss_current_box_giou,
             "loss_current_attention": loss_current_attention,
+            "loss_history_future_center": loss_history_future_center,
+            "history_future_center_error": history_future_center_error,
             "current_box_valid_ratio": current_box_valid_ratio,
             "predicted_s0_box_error": predicted_s0_box_error,
             "predicted_s0_center_error_pixels": predicted_s0_center_error_pixels,
@@ -3165,7 +3241,10 @@ class FastWAMHead(nn.Module):
                 action_mid = action_mid + self.current_box_action_conditioner.delta(
                     layer_idx, action_mid, box_feature
                 )
-                if self.target_action_conditioning is not None:
+                if (
+                    self.target_action_conditioning is not None
+                    and self.target_action_conditioning.enabled_at(layer_idx)
+                ):
                     if target_conditions is None:
                         raise RuntimeError(
                             "Historical Target Memory conditions were not constructed."
@@ -3726,6 +3805,7 @@ class FastWAMHead(nn.Module):
                 previous_valid=target_box_history_valid,
                 current_box=current_target["current_box"],
                 current_confidence=tracker_confidence,
+                previous_action=previous_action,
             )
             extra_candidate_count = candidate_count - 1
             if extra_candidate_count > 0:
@@ -3782,6 +3862,7 @@ class FastWAMHead(nn.Module):
                                 hidden, candidate_conditions
                             )
                             if self.target_action_conditioning is not None
+                            and self.target_action_conditioning.enabled_at(0)
                             else torch.zeros_like(hidden)
                         )
                     ),
@@ -3863,11 +3944,17 @@ class FastWAMHead(nn.Module):
                 )
 
                 extra_timestep = step_t.expand(b * extra_count)
+                extra_action_context = action_context.repeat_interleave(
+                    extra_count, dim=0
+                )
+                extra_action_context_mask = action_context_mask.repeat_interleave(
+                    extra_count, dim=0
+                )
                 extra_pre = self.action_expert.pre_dit(
                     action_tokens=extra_action,
                     timestep=extra_timestep,
-                    context=action_context,
-                    context_mask=action_context_mask,
+                    context=extra_action_context,
+                    context_mask=extra_action_context_mask,
                 )
                 extra_box_feature = current_box_feature.repeat_interleave(
                     extra_count, dim=0
@@ -3970,6 +4057,7 @@ class FastWAMHead(nn.Module):
                                     target_conditions,
                                 )
                                 if self.target_action_conditioning is not None
+                                and self.target_action_conditioning.enabled_at(0)
                                 else torch.zeros_like(hidden)
                             )
                         )
